@@ -43,22 +43,32 @@ pub struct IcebergConnector {
 }
 
 impl IcebergConnector {
-    /// `location` is a `*.metadata.json` file (what a REST catalog's
-    /// `metadata-location` points at) or a table directory, in which case the
-    /// newest `metadata/*.metadata.json` is used.
+    /// `location` is a `*.metadata.json` file or a table directory, in which
+    /// case the newest `metadata/*.metadata.json` is used.
     ///
     /// ponytail: the snapshot is pinned at registration; re-register to see
-    /// new commits. Upgrade path: re-resolve via the REST catalog per query.
+    /// new commits. Tables served by a REST catalog are re-resolved per query
+    /// instead (server `lakehouse` module, via [`Self::from_metadata`]).
     pub async fn try_new(
         name: impl Into<String>,
         location: &str,
         state: &dyn Session,
     ) -> Result<Self, ConnectorError> {
-        let name = name.into();
         let metadata_path = resolve_metadata(location, state).await?;
         let raw = read(&metadata_path, state).await?;
         let meta: Json = serde_json::from_slice(&raw).map_err(|e| invalid(&metadata_path, e))?;
-        let table = IcebergTable::from_metadata(&name, &metadata_path, &meta)?;
+        Self::from_metadata(name, &metadata_path, &meta)
+    }
+
+    /// From metadata already in hand, e.g. a REST catalog `loadTable`
+    /// response. `location` is only used in error messages.
+    pub fn from_metadata(
+        name: impl Into<String>,
+        location: &str,
+        metadata: &Json,
+    ) -> Result<Self, ConnectorError> {
+        let name = name.into();
+        let table = IcebergTable::from_metadata(&name, location, metadata)?;
         Ok(Self {
             name,
             table: Arc::new(table),

@@ -4,13 +4,8 @@
 //! their metadata", never reads data files. Endpoints follow the Iceberg REST
 //! OpenAPI spec (`/v1/{prefix}/namespaces/...`).
 //!
-//! ponytail: only the trait, the config, URL building and an in-memory
-//! implementation exist. The HTTP implementation is deliberately absent to keep
-//! `reqwest` + TLS out of the dependency tree until the real Iceberg
-//! TableProvider lands (see ROADMAP "next PR"). Upgrade path: a `RestCatalog`
-//! that issues `GET` on the URLs built by [`CatalogConfig`] with
-//! [`CatalogConfig::bearer_token`], and deserializes the JSON bodies into the
-//! types below (shapes already match the spec's response fields).
+//! [`crate::rest::RestCatalog`] is the HTTP implementation; [`InMemoryCatalog`]
+//! serves tests and local development.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -23,6 +18,9 @@ use async_trait::async_trait;
 pub const ENV_URI: &str = "PLIMSOLL_CATALOG_URI";
 pub const ENV_WAREHOUSE: &str = "PLIMSOLL_CATALOG_WAREHOUSE";
 pub const ENV_TOKEN: &str = "PLIMSOLL_CATALOG_TOKEN";
+/// OAuth2 client credentials as `client_id:client_secret` (Polaris).
+pub const ENV_CREDENTIAL: &str = "PLIMSOLL_CATALOG_CREDENTIAL";
+pub const ENV_SCOPE: &str = "PLIMSOLL_CATALOG_SCOPE";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CatalogError {
@@ -32,6 +30,14 @@ pub enum CatalogError {
     NamespaceNotFound(Namespace),
     #[error("table not found: {0}")]
     TableNotFound(TableIdent),
+    #[error("catalog unreachable: {0}")]
+    Http(String),
+    #[error("catalog authentication failed: {0}")]
+    Auth(String),
+    #[error("catalog returned {status}: {message}")]
+    Status { status: u16, message: String },
+    #[error("unexpected catalog response: {0}")]
+    Protocol(String),
 }
 
 /// Multi-level namespace, e.g. `["gold", "finance"]`.
@@ -96,22 +102,37 @@ pub trait Catalog: Send + Sync {
 pub struct CatalogConfig {
     /// Base URI without the `/v1` suffix, e.g. `http://polaris:8181/api/catalog`.
     pub uri: String,
-    /// Warehouse / Polaris catalog name. Used as the URL `prefix`.
-    /// ponytail: the spec lets `GET /v1/config` override the prefix; Polaris
-    /// returns the catalog name, which is what we use directly.
-    pub warehouse: String,
-    pub bearer_token: Option<String>,
+    /// Sent as `?warehouse=` to `/v1/config` (Polaris: the catalog name).
+    pub warehouse: Option<String>,
+    pub auth: CatalogAuth,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum CatalogAuth {
+    None,
+    /// Static bearer token.
+    Token(String),
+    /// OAuth2 client-credentials exchanged at `{uri}/v1/oauth/tokens`.
+    ClientCredentials {
+        client_id: String,
+        client_secret: String,
+        scope: String,
+    },
 }
 
 impl fmt::Debug for CatalogConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let auth = match &self.auth {
+            CatalogAuth::None => "none".to_owned(),
+            CatalogAuth::Token(_) => "token <redacted>".to_owned(),
+            CatalogAuth::ClientCredentials {
+                client_id, scope, ..
+            } => format!("client {client_id} <redacted> scope {scope}"),
+        };
         f.debug_struct("CatalogConfig")
             .field("uri", &self.uri)
             .field("warehouse", &self.warehouse)
-            .field(
-                "bearer_token",
-                &self.bearer_token.as_ref().map(|_| "<redacted>"),
-            )
+            .field("auth", &auth)
             .finish()
     }
 }
@@ -123,7 +144,8 @@ impl CatalogConfig {
     pub fn from_lookup(
         lookup: impl Fn(&str) -> Option<String>,
     ) -> Result<Option<Self>, CatalogError> {
-        let Some(uri) = lookup(ENV_URI) else {
+        let get = |k| lookup(k).filter(|v: &String| !v.is_empty());
+        let Some(uri) = get(ENV_URI) else {
             return Ok(None);
         };
         if !(uri.starts_with("http://") || uri.starts_with("https://")) {
@@ -131,52 +153,37 @@ impl CatalogConfig {
                 "{ENV_URI} must start with http:// or https://"
             )));
         }
-        let warehouse = lookup(ENV_WAREHOUSE)
-            .filter(|w| !w.is_empty())
-            .ok_or_else(|| CatalogError::Config(format!("{ENV_WAREHOUSE} is required")))?;
+        let auth = match (get(ENV_TOKEN), get(ENV_CREDENTIAL)) {
+            (Some(_), Some(_)) => {
+                return Err(CatalogError::Config(format!(
+                    "set either {ENV_TOKEN} or {ENV_CREDENTIAL}, not both"
+                )));
+            }
+            (Some(token), None) => CatalogAuth::Token(token),
+            (None, Some(cred)) => {
+                let (id, secret) = cred.split_once(':').ok_or_else(|| {
+                    CatalogError::Config(format!(
+                        "{ENV_CREDENTIAL} must be client_id:client_secret"
+                    ))
+                })?;
+                CatalogAuth::ClientCredentials {
+                    client_id: id.to_owned(),
+                    client_secret: secret.to_owned(),
+                    scope: get(ENV_SCOPE).unwrap_or_else(|| "PRINCIPAL_ROLE:ALL".to_owned()),
+                }
+            }
+            (None, None) => CatalogAuth::None,
+        };
         Ok(Some(Self {
             uri: uri.trim_end_matches('/').to_owned(),
-            warehouse,
-            bearer_token: lookup(ENV_TOKEN).filter(|t| !t.is_empty()),
+            warehouse: get(ENV_WAREHOUSE),
+            auth,
         }))
     }
-
-    /// `GET /v1/config?warehouse=...`
-    pub fn config_url(&self) -> String {
-        format!(
-            "{}/v1/config?warehouse={}",
-            self.uri,
-            encode(&self.warehouse)
-        )
-    }
-
-    /// `GET /v1/{prefix}/namespaces`
-    pub fn namespaces_url(&self) -> String {
-        format!("{}/v1/{}/namespaces", self.uri, encode(&self.warehouse))
-    }
-
-    /// `GET /v1/{prefix}/namespaces/{namespace}/tables`
-    pub fn tables_url(&self, ns: &Namespace) -> String {
-        format!("{}/{}/tables", self.namespaces_url(), encode_namespace(ns))
-    }
-
-    /// `GET /v1/{prefix}/namespaces/{namespace}/tables/{table}`
-    pub fn table_url(&self, ident: &TableIdent) -> String {
-        format!(
-            "{}/{}",
-            self.tables_url(&ident.namespace),
-            encode(&ident.name)
-        )
-    }
-}
-
-/// Multi-level namespaces are joined by the unit separator (0x1F) per spec.
-fn encode_namespace(ns: &Namespace) -> String {
-    encode(&ns.0.join("\u{1f}"))
 }
 
 /// Percent-encodes everything outside RFC 3986 "unreserved".
-fn encode(s: &str) -> String {
+pub(crate) fn encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
@@ -199,10 +206,15 @@ impl InMemoryCatalog {
         self.lock().entry(ns).or_default();
     }
 
-    pub fn put_table(&self, ident: TableIdent, metadata: serde_json::Value) {
+    pub fn put_table(
+        &self,
+        ident: TableIdent,
+        metadata_location: Option<String>,
+        metadata: serde_json::Value,
+    ) {
         let table = LoadedTable {
             ident: ident.clone(),
-            metadata_location: None,
+            metadata_location,
             metadata,
         };
         self.lock()
@@ -260,28 +272,27 @@ mod tests {
     fn config_absent_is_none_and_invalid_fails_fast() {
         assert_eq!(CatalogConfig::from_lookup(env(&[])).unwrap(), None);
         assert!(CatalogConfig::from_lookup(env(&[(ENV_URI, "polaris:8181")])).is_err());
-        assert!(CatalogConfig::from_lookup(env(&[(ENV_URI, "http://p")])).is_err());
+        assert!(CatalogConfig::from_lookup(env(&[(ENV_URI, "http://p")])).is_ok());
     }
 
     #[test]
-    fn builds_spec_urls_and_redacts_token() {
-        let cfg = CatalogConfig::from_lookup(env(&[
-            (ENV_URI, "http://polaris:8181/api/catalog/"),
-            (ENV_WAREHOUSE, "lake"),
-            (ENV_TOKEN, "s3cret"),
-        ]))
-        .unwrap()
-        .unwrap();
-        let ident = TableIdent::new(Namespace::new(&["gold", "fin ance"]), "orders");
-        assert_eq!(
-            cfg.table_url(&ident),
-            "http://polaris:8181/api/catalog/v1/lake/namespaces/gold%1Ffin%20ance/tables/orders"
+    fn auth_modes_and_redaction() {
+        let cfg = |pairs: &[(&str, &str)]| {
+            let mut all = vec![(ENV_URI, "http://polaris:8181/api/catalog/")];
+            all.extend_from_slice(pairs);
+            CatalogConfig::from_lookup(env(&all))
+        };
+        let token = cfg(&[(ENV_TOKEN, "s3cret")]).unwrap().unwrap();
+        assert_eq!(token.uri, "http://polaris:8181/api/catalog");
+        assert!(!format!("{token:?}").contains("s3cret"));
+        let client = cfg(&[(ENV_CREDENTIAL, "root:s3cret")]).unwrap().unwrap();
+        assert!(
+            matches!(&client.auth, CatalogAuth::ClientCredentials { scope, .. } if scope == "PRINCIPAL_ROLE:ALL")
         );
-        assert_eq!(
-            cfg.config_url(),
-            "http://polaris:8181/api/catalog/v1/config?warehouse=lake"
-        );
-        assert!(!format!("{cfg:?}").contains("s3cret"));
+        assert!(!format!("{client:?}").contains("s3cret"));
+        assert!(cfg(&[(ENV_CREDENTIAL, "no-colon")]).is_err());
+        assert!(cfg(&[(ENV_TOKEN, "a"), (ENV_CREDENTIAL, "b:c")]).is_err());
+        assert_eq!(encode("gold\u{1f}fin ance"), "gold%1Ffin%20ance");
     }
 
     #[tokio::test]
@@ -290,7 +301,11 @@ mod tests {
         let bronze = Namespace::new(&["bronze"]);
         cat.create_namespace(Namespace::new(&["gold"]));
         let ident = TableIdent::new(bronze.clone(), "events");
-        cat.put_table(ident.clone(), serde_json::json!({"format-version": 2}));
+        cat.put_table(
+            ident.clone(),
+            None,
+            serde_json::json!({"format-version": 2}),
+        );
 
         assert_eq!(cat.list_namespaces().await.unwrap().len(), 2);
         assert_eq!(cat.list_tables(&bronze).await.unwrap(), vec![ident.clone()]);

@@ -2,7 +2,7 @@
 //!
 //! Everything here decides *whether and where* a query runs, never *how*:
 //!
-//! - [`catalog`]: Iceberg REST catalog client contract (Polaris-compatible).
+//! - [`catalog`]: Iceberg REST catalog contract; [`rest`]: its HTTP client.
 //! - [`governance`]: query registry, admission control and time limits.
 //! - [`system`]: schema + snapshot source for `system.runtime.queries`.
 //!
@@ -11,4 +11,5 @@
 
 pub mod catalog;
 pub mod governance;
+pub mod rest;
 pub mod system;

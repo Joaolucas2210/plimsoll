@@ -105,8 +105,10 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_PG_TABLES` | unset | `silver.users=public.users` (needs `PLIMSOLL_PG_URL`) |
 | `PLIMSOLL_PG_URL` | unset | Postgres connection string (secret, env only) |
 | `PLIMSOLL_CATALOG_URI` | unset | Iceberg REST base URI (e.g. Polaris `http://host:8181/api/catalog`) |
-| `PLIMSOLL_CATALOG_WAREHOUSE` | — | Required when the URI is set |
+| `PLIMSOLL_CATALOG_WAREHOUSE` | unset | Sent to `/v1/config` (Polaris: catalog name) |
 | `PLIMSOLL_CATALOG_TOKEN` | unset | Bearer token. Secrets come from env only and are never logged. |
+| `PLIMSOLL_CATALOG_CREDENTIAL` | unset | OAuth2 `client_id:client_secret` (Polaris); exclusive with the token |
+| `PLIMSOLL_CATALOG_SCOPE` | `PRINCIPAL_ROLE:ALL` | OAuth2 scope |
 
 ### SQL API
 
@@ -151,6 +153,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 - [ADR 0005 — Federation correctness](docs/adr/0005-federation-correctness.md)
 - [ADR 0006 — Pushdown policy](docs/adr/0006-pushdown-policy.md)
 - [ADR 0007 — Iceberg read path under the ceiling](docs/adr/0007-iceberg-read-path.md)
+- [ADR 0008 — Iceberg REST catalog client](docs/adr/0008-rest-catalog-client.md)
 
 Roadmap: [ROADMAP.md](ROADMAP.md).
 

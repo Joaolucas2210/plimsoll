@@ -12,9 +12,12 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
+# ADR 0008: HTTP client for the Iceberg REST catalog (rustls, no OpenSSL).
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "net"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 
 [lints]
 workspace = true

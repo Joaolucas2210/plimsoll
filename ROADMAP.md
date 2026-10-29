@@ -30,7 +30,8 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 ## Phase 3 — Control plane
 
 - [x] Iceberg REST catalog contract + in-memory implementation (`plimsoll-control::catalog`)
-- [ ] HTTP implementation of the catalog client (Polaris), `reqwest` + rustls
+- [x] HTTP implementation of the catalog client (Polaris), `reqwest` + rustls (ADR 0008)
+- [x] Catalog namespaces as schemas; tables resolved per query (fresh snapshots)
 - [x] Admission: running/queued limits globally, per resource group, per user (RAII slots)
 - [x] Query registry + per-query deadline (queue wait + execution)
 - [x] `system.runtime.queries` schema + snapshot source
@@ -40,11 +41,11 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Iceberg REST catalog over HTTP (Polaris)**: implement `Catalog` with
-`reqwest` + rustls, register `bronze`/`silver`/`gold` tables from
-`load_table` → `metadata-location` into `IcebergConnector`, and re-resolve
-the snapshot per query. Then manifest pruning (partition summaries, column
-bounds) and delete-file support (ADR 0007).
+**Object stores for the lakehouse**: register S3/GCS/ADLS stores
+(`object_store` features) with credentials from env or catalog-vended
+credentials, so Polaris tables on object storage scan under the ceiling.
+Then manifest pruning (partition summaries, column bounds) and delete-file
+support (ADR 0007).
 
 ## Later
 

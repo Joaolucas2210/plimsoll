@@ -5,6 +5,7 @@
 pub mod app;
 pub mod config;
 pub mod engine;
+pub mod lakehouse;
 pub mod metrics;
 pub mod system;
 pub mod tables;

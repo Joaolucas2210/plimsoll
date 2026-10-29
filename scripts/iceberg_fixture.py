@@ -5,22 +5,30 @@
 """Writes a small Iceberg v2 table with pyiceberg (the reference Python
 implementation) for the interop test in crates/plimsoll-connectors/tests/iceberg.rs.
 
-    uv run scripts/iceberg_fixture.py <warehouse-dir>   # prints PLIMSOLL_ICEBERG_FIXTURE=...
+    uv run scripts/iceberg_fixture.py <warehouse-dir>   # local SQL catalog
+    uv run scripts/iceberg_fixture.py http://host:8181  # via an Iceberg REST catalog
+
+Prints PLIMSOLL_ICEBERG_FIXTURE=<metadata location>.
 """
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pyarrow as pa
+from pyiceberg.catalog import load_catalog
 from pyiceberg.catalog.sql import SqlCatalog
 
-warehouse = Path(sys.argv[1]).resolve()
-warehouse.mkdir(parents=True, exist_ok=True)
-catalog = SqlCatalog(
-    "fixture",
-    uri=f"sqlite:///{warehouse}/catalog.db",
-    warehouse=f"file://{warehouse}",
-)
+target = sys.argv[1]
+if target.startswith("http"):
+    catalog = load_catalog("fixture", type="rest", uri=target)
+else:
+    warehouse = Path(target).resolve()
+    warehouse.mkdir(parents=True, exist_ok=True)
+    catalog = SqlCatalog(
+        "fixture",
+        uri=f"sqlite:///{warehouse}/catalog.db",
+        warehouse=f"file://{warehouse}",
+    )
 catalog.create_namespace_if_not_exists("bronze")
 if catalog.table_exists("bronze.trips"):
     catalog.drop_table("bronze.trips")

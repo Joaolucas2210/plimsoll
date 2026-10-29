@@ -47,7 +47,7 @@ jobs:
       - run: cargo test -p plimsoll-connectors -- --ignored
 
   iceberg-interop:
-    name: iceberg interop (pyiceberg)
+    name: iceberg interop (pyiceberg, REST catalog)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,3 +56,16 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv run scripts/iceberg_fixture.py "$RUNNER_TEMP/wh" | tail -1 >> "$GITHUB_ENV"
       - run: cargo test -p plimsoll-connectors --test iceberg -- --ignored
+      # Reference REST catalog sharing the warehouse path with the runner.
+      - name: start apache/iceberg-rest-fixture
+        run: |
+          mkdir -m 777 /tmp/iceberg_warehouse
+          docker run -d --user "$(id -u):$(id -g)" -p 8181:8181 \
+            -e CATALOG_WAREHOUSE=/tmp/iceberg_warehouse \
+            -v /tmp/iceberg_warehouse:/tmp/iceberg_warehouse apache/iceberg-rest-fixture
+          for i in $(seq 1 60); do curl -sf localhost:8181/v1/config && exit 0; sleep 2; done
+          exit 1
+      - run: uv run scripts/iceberg_fixture.py http://localhost:8181
+      - run: cargo test -p plimsoll-control live_rest_catalog -- --ignored
+        env:
+          PLIMSOLL_CATALOG_URI: http://localhost:8181

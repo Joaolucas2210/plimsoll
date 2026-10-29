@@ -12,13 +12,14 @@ use std::time::Instant;
 use plimsoll_control::catalog::CatalogConfig;
 use plimsoll_control::governance::{Admission, QueryRegistry};
 
+use plimsoll_control::rest::RestCatalog;
 use plimsoll_core::engine::Engine;
 use plimsoll_core::memory::CeilingPool;
 use plimsoll_server::app::{self, AppState};
 use plimsoll_server::config::Config;
 use plimsoll_server::engine::CoreEngine;
 use plimsoll_server::metrics::PoolStats;
-use plimsoll_server::{system, tables};
+use plimsoll_server::{lakehouse, system, tables};
 
 /// Finished/failed/cancelled queries kept for `system.runtime.queries`.
 const RETAINED_QUERIES: usize = 1_000;
@@ -53,6 +54,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let engine = Arc::new(Engine::new(pool.clone(), spill_dir)?);
     system::register(engine.context(), admission.registry().clone())?;
+    // Catalog first: env tables aimed at a catalog-backed schema then fail
+    // fast (those schemas are read-only) instead of being silently shadowed.
+    if let Some(cfg) = catalog.clone() {
+        let catalog = Arc::new(RestCatalog::connect(cfg).await?);
+        let schemas = lakehouse::register(engine.context(), catalog).await?;
+        eprintln!("catalog: serving namespaces {schemas:?}");
+    }
     let n = tables::register_from_env(engine.context(), |k| std::env::var(k).ok()).await?;
     eprintln!("registered {n} table(s) from env");
 
