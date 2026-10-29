@@ -101,6 +101,7 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_QUERY_TIMEOUT_MS` | `30000` | Deadline for queue wait + execution |
 | `PLIMSOLL_SPILL_DIR` | unset | Spill directory; unset = no spill, pressure fails the query |
 | `PLIMSOLL_PARQUET_TABLES` | unset | `bronze.trips=/data/trips/,gold.daily=/data/d.parquet` |
+| `PLIMSOLL_ICEBERG_TABLES` | unset | `bronze.trips=/wh/bronze/trips` (table dir or `*.metadata.json`) |
 | `PLIMSOLL_PG_TABLES` | unset | `silver.users=public.users` (needs `PLIMSOLL_PG_URL`) |
 | `PLIMSOLL_PG_URL` | unset | Postgres connection string (secret, env only) |
 | `PLIMSOLL_CATALOG_URI` | unset | Iceberg REST base URI (e.g. Polaris `http://host:8181/api/catalog`) |
@@ -149,6 +150,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 - [ADR 0004 — HTTP with axum](docs/adr/0004-http-axum.md)
 - [ADR 0005 — Federation correctness](docs/adr/0005-federation-correctness.md)
 - [ADR 0006 — Pushdown policy](docs/adr/0006-pushdown-policy.md)
+- [ADR 0007 — Iceberg read path under the ceiling](docs/adr/0007-iceberg-read-path.md)
 
 Roadmap: [ROADMAP.md](ROADMAP.md).
 

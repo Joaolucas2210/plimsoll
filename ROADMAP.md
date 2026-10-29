@@ -15,7 +15,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Engine façade in `plimsoll-core`: `SessionContext` built on `CeilingPool`, result buffers in the Output slice
 - [x] Wire `QueryEngine` in the server to the façade
 - [ ] Parquet scans from local/object storage under the ceiling, spill enabled
-- [ ] Iceberg table reads (metadata → manifests → Parquet) under the ceiling
+- [x] Iceberg table reads (metadata → manifests → Parquet) under the ceiling (ADR 0007)
 - [x] Test: a query exceeding the ceiling fails with `memory_limit_exceeded`
       and the next query on the same node succeeds (concurrent variant: TODO)
 
@@ -40,10 +40,11 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Real Iceberg `TableProvider` under `CeilingPool`**: resolve a table through
-the REST catalog (`load_table` → `metadata_location`), plan the scan from
-manifests, execute Parquet reads with every reservation going through the
-ceiling, and expose it via `POST /v1/sql`.
+**Iceberg REST catalog over HTTP (Polaris)**: implement `Catalog` with
+`reqwest` + rustls, register `bronze`/`silver`/`gold` tables from
+`load_table` → `metadata-location` into `IcebergConnector`, and re-resolve
+the snapshot per query. Then manifest pruning (partition summaries, column
+bounds) and delete-file support (ADR 0007).
 
 ## Later
 

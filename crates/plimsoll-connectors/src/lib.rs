@@ -8,9 +8,11 @@ use datafusion::error::DataFusionError;
 use datafusion::prelude::SessionContext;
 use plimsoll_core::federation::{FederationFilterGuard, PushdownPolicy};
 
+pub mod iceberg;
 pub mod parquet;
 pub mod postgres;
 
+pub use iceberg::IcebergConnector;
 pub use parquet::ParquetConnector;
 pub use postgres::{PG_URL_ENV, PostgresConnector};
 
@@ -46,6 +48,8 @@ pub enum ConnectorError {
     Postgres(#[from] tokio_postgres::Error),
     #[error("arrow: {0}")]
     Arrow(#[from] datafusion::arrow::error::ArrowError),
+    #[error("iceberg: {0}")]
+    Iceberg(String),
     #[error(transparent)]
     DataFusion(#[from] DataFusionError),
 }

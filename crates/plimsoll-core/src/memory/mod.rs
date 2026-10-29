@@ -17,8 +17,10 @@
 //! produced results can always ship them out.
 //! See `docs/adr/0003-memory-ceiling.md`.
 
+mod accounted;
 mod df_adapter;
 
+pub use accounted::AccountedExec;
 pub use df_adapter::{runtime_env, session_context_with_ceiling, spilled_bytes};
 
 use std::collections::HashMap;

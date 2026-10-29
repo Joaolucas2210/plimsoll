@@ -1,12 +1,14 @@
 //! Boot-time table registration from env (fail fast on bad entries).
 //!
 //! - `PLIMSOLL_PARQUET_TABLES=bronze.trips=/data/trips/,gold.daily=/data/d.parquet`
+//! - `PLIMSOLL_ICEBERG_TABLES=bronze.trips=s3://wh/bronze/trips` (table dir or `*.metadata.json`)
 //! - `PLIMSOLL_PG_TABLES=silver.users=public.users` (needs `PLIMSOLL_PG_URL`)
 //!
 //! Names may use the medallion schemas (`bronze`/`silver`/`gold`).
-//! ponytail: static list at boot; upgrade path is the Iceberg REST catalog.
+//! ponytail: static list at boot; upgrade path is the Iceberg REST catalog
+//! (`load_table` returns the `metadata-location` IcebergConnector takes).
 
-use plimsoll_connectors::{Connector, ParquetConnector, PostgresConnector};
+use plimsoll_connectors::{Connector, IcebergConnector, ParquetConnector, PostgresConnector};
 use plimsoll_core::datafusion::prelude::SessionContext;
 
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +54,20 @@ pub async fn register_from_env(
             source: e,
         };
         ParquetConnector::try_new(name.as_str(), &path, &ctx.state())
+            .await
+            .map_err(|e| reg(e.into()))?
+            .register(ctx)
+            .map_err(|e| reg(e.into()))?;
+        count += 1;
+    }
+    const ICE: &str = "PLIMSOLL_ICEBERG_TABLES";
+    for (name, location) in entries(ICE, &lookup(ICE).unwrap_or_default())? {
+        let reg = |e: Box<dyn std::error::Error + Send + Sync>| TablesError::Register {
+            var: ICE,
+            name: name.clone(),
+            source: e,
+        };
+        IcebergConnector::try_new(name.as_str(), &location, &ctx.state())
             .await
             .map_err(|e| reg(e.into()))?
             .register(ctx)

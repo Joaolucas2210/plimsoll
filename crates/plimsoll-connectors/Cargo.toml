@@ -15,6 +15,10 @@ tokio.workspace = true
 # ADR 0006: thin async Postgres client, no ORM/pool; chrono is already in the Arrow tree.
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime", "with-chrono-0_4"] }
 chrono = { version = "0.4", default-features = false }
+# ADR 0007: Iceberg manifests are Avro; deflate is built in (no codec features).
+apache-avro = { version = "0.22", default-features = false }
+serde_json.workspace = true
+bytes = "1"
 
 [lints]
 workspace = true
