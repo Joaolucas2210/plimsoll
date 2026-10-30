@@ -7,6 +7,7 @@
 //! Time travel (ADR 0028): `bronze."trips@<snapshot-id>"`,
 //! `bronze."trips@2024-05-01T00:00:00Z"` or, by branch/tag (ADR 0029),
 //! `bronze."trips@audit"` reads the table as of that snapshot. The reference stays in its schema, so grants apply unchanged.
+//! `bronze."trips$snapshots"`, `$history` and `$refs` list them (ADR 0030).
 
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ use plimsoll_connectors::iceberg;
 use plimsoll_connectors::{AsOf, Connector, IcebergConnector};
 use plimsoll_control::catalog::{Catalog, CatalogError, LoadedTable, Namespace, TableIdent};
 use plimsoll_core::datafusion::catalog::{SchemaProvider, TableProvider};
+use plimsoll_core::datafusion::datasource::MemTable;
 use plimsoll_core::datafusion::error::{DataFusionError, Result};
 use plimsoll_core::datafusion::prelude::SessionContext;
 
@@ -74,6 +76,18 @@ impl SchemaProvider for CatalogSchema {
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+        // `table$snapshots|history|refs` (ADR 0030): built from the metadata
+        // just loaded, so it is as fresh as a data read. Other suffixes mean
+        // `$` is part of the name.
+        if let Some((base, kind)) = name.rsplit_once('$') {
+            if let Some((_, loaded)) = self.load(base).await? {
+                if let Some(batch) = iceberg::meta::table(&loaded.metadata, kind) {
+                    let batch = batch?;
+                    let mem = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+                    return Ok(Some(Arc::new(mem)));
+                }
+            }
+        }
         // `table@spec`: a snapshot id, an instant, or a branch/tag of `table`
         // (ADR 0028/0029). Anything else means `@` is part of the name.
         if let Some((base, spec)) = name.rsplit_once('@') {
@@ -148,6 +162,7 @@ pub async fn register(
 mod tests {
     use super::*;
     use plimsoll_control::catalog::InMemoryCatalog;
+    use plimsoll_core::datafusion::arrow::array::Int64Array as arrow_i64;
     use serde_json::json;
 
     fn empty_table(column: &str) -> serde_json::Value {
@@ -313,5 +328,45 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn metadata_tables_list_history_through_sql() {
+        let cat = Arc::new(InMemoryCatalog::default());
+        let ident = TableIdent::new(Namespace::new(&["silver"]), "users");
+        cat.put_table(
+            ident,
+            Some("file:///wh/silver/users/metadata/2.metadata.json".to_owned()),
+            two_snapshots(),
+        );
+        let ctx = SessionContext::new();
+        register(&ctx, cat).await.unwrap();
+        let ints = async |sql: &str| {
+            let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            let mut out = Vec::new();
+            for b in batches {
+                let col = b.column(0).as_any().downcast_ref::<arrow_i64>().unwrap();
+                out.extend(col.iter().flatten());
+            }
+            out
+        };
+        assert_eq!(
+            ints("SELECT snapshot_id FROM silver.\"users$snapshots\" ORDER BY committed_at").await,
+            [1, 2]
+        );
+        assert_eq!(
+            ints("SELECT snapshot_id FROM silver.\"users$refs\" WHERE name = 'v1'").await,
+            [1]
+        );
+        assert_eq!(
+            ints("SELECT count(*) FROM silver.\"users$history\"").await,
+            [2]
+        );
+        // Unknown kinds fall back to a whole-name lookup (and are missing).
+        assert!(
+            ctx.sql("SELECT * FROM silver.\"users$files\"")
+                .await
+                .is_err()
+        );
     }
 }

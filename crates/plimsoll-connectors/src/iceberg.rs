@@ -49,6 +49,7 @@ use serde_json::Value as Json;
 use crate::{Connector, ConnectorError};
 
 mod deletes;
+pub mod meta;
 mod prune;
 use deletes::{DeleteFile, EqualityDelete};
 use prune::{PartitionField, Prim, Pruner, Summary};

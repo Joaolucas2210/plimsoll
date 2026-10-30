@@ -882,6 +882,36 @@ async fn time_travels_a_spark_table() {
     assert_eq!(totals(AsOf::Snapshot(audit)).await, (49, 2128));
     let main = plimsoll_connectors::iceberg::ref_snapshot(&meta, "main").unwrap();
     assert_eq!(totals(AsOf::Snapshot(main)).await, (32, 768));
+    // Metadata tables (ADR 0030) list what Spark wrote.
+    let meta_table = |kind| {
+        let b = plimsoll_connectors::iceberg::meta::table(&meta, kind)
+            .unwrap()
+            .unwrap();
+        datafusion::arrow::util::pretty::pretty_format_batches(&[b])
+            .unwrap()
+            .to_string()
+    };
+    let refs = meta_table("refs");
+    for row in [
+        format!("| after_insert | TAG    | {tag} "),
+        format!("| audit        | BRANCH | {audit} "),
+        format!("| main         | BRANCH | {main} "),
+    ] {
+        assert!(refs.contains(&row), "{row} in\n{refs}");
+    }
+    let snaps = plimsoll_connectors::iceberg::meta::table(&meta, "snapshots")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        snaps.num_rows(),
+        meta["snapshots"].as_array().unwrap().len()
+    );
+    assert_eq!(
+        snaps.column(3).null_count(),
+        0,
+        "every snapshot has an operation"
+    );
+    assert!(meta_table("history").contains("| true "));
     // Before the first snapshot there is nothing to read.
     assert!(at(&meta, AsOf::TimestampMs(ts - 1)).is_err());
 }

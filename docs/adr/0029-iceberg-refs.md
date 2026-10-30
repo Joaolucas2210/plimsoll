@@ -72,7 +72,7 @@ silently change the meaning of existing queries. Rejected (driver 2).
 - The `main` ref and the current snapshot are normally the same, but are
   not checked for agreement. Plimsoll reads `current-snapshot-id` for plain
   names, as before.
-- Refs are not listable yet (next ROADMAP item: metadata tables).
+- Refs were not listable; ADR 0030 adds `"table$refs"`.
 
 ## Risks and mitigations
 
