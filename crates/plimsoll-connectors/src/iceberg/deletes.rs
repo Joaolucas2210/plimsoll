@@ -1,15 +1,23 @@
-//! Merge-on-read: position delete files applied as Parquet row selections.
+//! Merge-on-read deletes.
 //!
-//! A position delete file lists `(file_path, pos)` pairs. Spec v2: it applies
-//! to a data file when `file_path` matches and the data file's sequence number
-//! is <= the delete file's. Plimsoll turns the surviving positions of each
-//! data file into a file-level `RowSelection`, so DataFusion's Parquet scan
-//! never decodes deleted rows (ADR 0014). Equality deletes are refused.
+//! Position deletes: `(file_path, pos)` pairs. Spec v2: they apply to a data
+//! file when `file_path` matches and the data file's sequence number is <= the
+//! delete file's. Plimsoll turns the surviving positions of each data file
+//! into a file-level `RowSelection`, so DataFusion's Parquet scan never
+//! decodes deleted rows (ADR 0014).
+//!
+//! Equality deletes: rows of key values. Spec v2: they apply to a data file
+//! with a *strictly lower* sequence number in the same partition (or to every
+//! partition when the delete's spec is unpartitioned). Loaded here as key
+//! batches; the scan anti-joins against them (ADR 0016).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, AsArray};
-use datafusion::arrow::datatypes::Int64Type;
+use apache_avro::types::Value as Avro;
+use datafusion::arrow::array::{Array, AsArray, RecordBatch};
+use datafusion::arrow::compute::cast;
+use datafusion::arrow::datatypes::{Field, Int64Type, Schema};
 use datafusion::catalog::Session;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::memory_pool::MemoryReservation;
@@ -28,6 +36,79 @@ pub(super) struct DeleteFile {
     pub seq: i64,
     /// v2 `referenced_data_file`: when set, the only data file it touches.
     pub referenced: Option<String>,
+}
+
+/// A live equality delete file from a delete manifest.
+pub(super) struct EqualityDelete {
+    pub path: String,
+    pub seq: i64,
+    /// Partition spec id and partition tuple of the delete file.
+    pub spec: i64,
+    pub partition: Option<Avro>,
+    /// `equality_ids`: the key columns, as field ids.
+    pub ids: Vec<i64>,
+}
+
+impl EqualityDelete {
+    /// Spec v2 applicability to a data file (`unpartitioned`: the delete's
+    /// spec has no non-void field, so it applies across partitions).
+    pub fn applies(
+        &self,
+        seq: i64,
+        spec: i64,
+        partition: Option<&Avro>,
+        unpartitioned: bool,
+    ) -> bool {
+        self.seq > seq
+            && (unpartitioned || (self.spec == spec && self.partition.as_ref() == partition))
+    }
+}
+
+/// Key rows of an equality delete file, cast to the table's types, columns
+/// named after the table's `key` fields. The whole file is read; its bytes and
+/// the decoded keys are reserved while planning (the hash join reserves them
+/// again when it builds, ADR 0016).
+pub(super) async fn equality_keys(
+    state: &dyn Session,
+    scoped: Option<&ScopedStore>,
+    path: &str,
+    key: &[Field],
+    reservation: &MemoryReservation,
+) -> Result<Vec<RecordBatch>> {
+    let bytes = super::read(path, state, scoped).await?;
+    reservation.try_grow(bytes.len())?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?;
+    let mask = ProjectionMask::columns(
+        builder.parquet_schema(),
+        key.iter().map(|f| f.name().as_str()),
+    );
+    let schema = Arc::new(Schema::new(
+        key.iter()
+            .map(|f| f.clone().with_nullable(true))
+            .collect::<Vec<_>>(),
+    ));
+    let mut out = Vec::new();
+    for batch in builder.with_projection(mask).build()? {
+        let batch = batch?;
+        let columns = key
+            .iter()
+            .map(|f| {
+                let c = batch.column_by_name(f.name()).ok_or_else(|| {
+                    invalid_delete(
+                        path,
+                        "equality delete",
+                        &format!("missing key column {}", f.name()),
+                    )
+                })?;
+                Ok(cast(c, f.data_type())?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let keys = RecordBatch::try_new(schema.clone(), columns)?;
+        reservation.try_grow(keys.get_array_memory_size())?;
+        out.push(keys);
+    }
+    reservation.shrink(bytes.len());
+    Ok(out)
 }
 
 /// Data file path -> its data sequence number, for the files being scanned.
@@ -128,8 +209,12 @@ fn to_usize(n: u64) -> Result<usize> {
 }
 
 fn invalid(path: &str, what: &str) -> DataFusionError {
+    invalid_delete(path, "position delete", what)
+}
+
+fn invalid_delete(path: &str, kind: &str, what: &str) -> DataFusionError {
     DataFusionError::from(ConnectorError::InvalidMetadata(format!(
-        "position delete file {path}: {what}"
+        "{kind} file {path}: {what}"
     )))
 }
 

@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Writes a merge-on-read Iceberg table with Apache Spark (the reference
-# engine) for tests/iceberg.rs::reads_a_spark_merge_on_read_table.
+# Writes merge-on-read Iceberg tables with Apache Spark and Iceberg's Java
+# writers (the reference implementation) for tests/iceberg.rs:
+# position deletes (reads_a_spark_merge_on_read_table) and equality deletes
+# (reads_reference_equality_deletes).
 #
-#   scripts/spark_mor_fixture.sh <warehouse-dir>   # prints PLIMSOLL_ICEBERG_MOR=...
+#   scripts/spark_mor_fixture.sh <warehouse-dir>
+#   # prints PLIMSOLL_ICEBERG_MOR=... and PLIMSOLL_ICEBERG_EQ=...
 #
 # The warehouse is mounted at the same absolute path inside the container, so
 # the paths Spark records in the metadata are valid on the host.
@@ -18,27 +21,72 @@ mkdir -p "$jars"
 [ -f "$jars/$ICEBERG_JAR" ] || curl -sSfL -o "$jars/$ICEBERG_JAR" "$JAR_URL"
 rm -rf "$wh/db" && chmod 777 "$wh"
 
-sql=$(mktemp)
-cat > "$sql" <<'SQL'
-CREATE TABLE local.db.mor (id BIGINT, name STRING, ts TIMESTAMP) USING iceberg
-  PARTITIONED BY (days(ts))
-  TBLPROPERTIES ('format-version'='2', 'write.delete.mode'='merge-on-read',
-                 'write.update.mode'='merge-on-read');
-INSERT INTO local.db.mor SELECT id, concat('n', id),
-  timestamp '2024-01-01 00:00:00' + make_interval(0, 0, 0, 0, CAST(id AS INT), 0, 0)
-  FROM range(0, 48);
-DELETE FROM local.db.mor WHERE id % 3 = 0;
-UPDATE local.db.mor SET name = 'updated' WHERE id = 1;
-SQL
-chmod 644 "$sql"
+scala=$(mktemp --suffix=.scala)
+cat > "$scala" <<'SCALA'
+import org.apache.iceberg.{FileFormat, PartitionKey}
+import org.apache.iceberg.data.{GenericAppenderFactory, GenericRecord}
+import org.apache.iceberg.encryption.EncryptedFiles
+import org.apache.iceberg.spark.Spark3Util
 
-docker run --rm -e TZ=UTC -v "$wh:$wh" -v "$jars:/jars:ro" -v "$sql:/mor.sql:ro" "$SPARK_IMAGE" \
-  /opt/spark/bin/spark-sql --jars "/jars/$ICEBERG_JAR" \
+try {
+  // Position deletes (ADR 0014): Spark's own DELETE / UPDATE in MOR mode.
+  Seq(
+    """CREATE TABLE local.db.mor (id BIGINT, name STRING, ts TIMESTAMP) USING iceberg
+       PARTITIONED BY (days(ts))
+       TBLPROPERTIES ('format-version'='2', 'write.delete.mode'='merge-on-read',
+                      'write.update.mode'='merge-on-read')""",
+    """INSERT INTO local.db.mor SELECT id, concat('n', id),
+       timestamp '2024-01-01 00:00:00' + make_interval(0, 0, 0, 0, CAST(id AS INT), 0, 0)
+       FROM range(0, 48)""",
+    "DELETE FROM local.db.mor WHERE id % 3 = 0",
+    "UPDATE local.db.mor SET name = 'updated' WHERE id = 1"
+  ).foreach(spark.sql)
+
+  // Equality deletes (ADR 0016), as Flink upserts write them: keyed on
+  // `city`, scoped to partition region='a', including a null key. Spark
+  // cannot write them, so use Iceberg's own Java writer.
+  Seq(
+    """CREATE TABLE local.db.eq (id BIGINT, city STRING, region STRING) USING iceberg
+       PARTITIONED BY (region) TBLPROPERTIES ('format-version'='2')""",
+    """INSERT INTO local.db.eq VALUES (1, 'x', 'a'), (2, 'y', 'a'), (3, NULL, 'a'),
+       (4, 'x', 'b'), (5, NULL, 'b')"""
+  ).foreach(spark.sql)
+  val t = Spark3Util.loadIcebergTable(spark, "local.db.eq")
+  val keySchema = t.schema().select("city")
+  val factory = new GenericAppenderFactory(t.schema(), t.spec(),
+    Array(t.schema().findField("city").fieldId()), keySchema, null)
+  val row = GenericRecord.create(t.schema())
+  row.setField("region", "a")
+  val partition = new PartitionKey(t.spec(), t.schema())
+  partition.partition(row)
+  val out = t.io().newOutputFile(t.locationProvider().newDataLocation(t.spec(), partition, "eq-a.parquet"))
+  val writer = factory.newEqDeleteWriter(EncryptedFiles.plainAsEncryptedOutput(out), FileFormat.PARQUET, partition)
+  for (city <- Seq("x", null)) {
+    val key = GenericRecord.create(keySchema)
+    key.setField("city", city)
+    writer.write(key)
+  }
+  writer.close()
+  t.newRowDelta().addDeletes(writer.toDeleteFile()).commit()
+  // Newer than the delete: must survive although city = 'x'.
+  spark.sql("INSERT INTO local.db.eq VALUES (6, 'x', 'a')")
+
+  // The fixture is only useful if the reference engine agrees with it.
+  val ids = spark.sql("SELECT id FROM local.db.eq ORDER BY id").collect().map(_.getLong(0)).toSeq
+  require(ids == Seq(2L, 4L, 5L, 6L), s"Spark reads $ids")
+  System.exit(0)
+} catch { case e: Throwable => e.printStackTrace(); System.exit(1) }
+SCALA
+chmod 644 "$scala"
+
+docker run --rm -e TZ=UTC -v "$wh:$wh" -v "$jars:/jars:ro" -v "$scala:/fixture.scala:ro" "$SPARK_IMAGE" \
+  /opt/spark/bin/spark-shell --jars "/jars/$ICEBERG_JAR" \
   --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
   --conf spark.sql.catalog.local=org.apache.iceberg.spark.SparkCatalog \
   --conf spark.sql.catalog.local.type=hadoop \
   --conf "spark.sql.catalog.local.warehouse=$wh" \
   --conf spark.sql.session.timeZone=UTC \
-  -f /mor.sql >/dev/null 2>&1
-rm -f "$sql"
+  -i /fixture.scala >&2
+rm -f "$scala"
 echo "PLIMSOLL_ICEBERG_MOR=$wh/db/mor"
+echo "PLIMSOLL_ICEBERG_EQ=$wh/db/eq"

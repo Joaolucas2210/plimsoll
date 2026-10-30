@@ -12,7 +12,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::error::DataFusionError;
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use plimsoll_connectors::{Connector, ConnectorError, IcebergConnector};
+use plimsoll_connectors::{Connector, IcebergConnector};
 use plimsoll_core::memory::{CeilingPool, session_context_with_ceiling};
 use serde_json::json;
 
@@ -25,6 +25,15 @@ const MANIFEST: &str = r#"{"type":"record","name":"manifest_entry","fields":[
     {"name":"content","type":"int"},{"name":"file_path","type":"string"},
     {"name":"file_format","type":"string"},{"name":"record_count","type":"long"},
     {"name":"file_size_in_bytes","type":"long"}]}}]}"#;
+
+/// Delete manifest entry carrying `equality_ids`.
+const EQ_MANIFEST: &str = r#"{"type":"record","name":"manifest_entry","fields":[
+  {"name":"status","type":"int"},
+  {"name":"data_file","type":{"type":"record","name":"r2","fields":[
+    {"name":"content","type":"int"},{"name":"file_path","type":"string"},
+    {"name":"file_format","type":"string"},{"name":"record_count","type":"long"},
+    {"name":"file_size_in_bytes","type":"long"},
+    {"name":"equality_ids","type":["null",{"type":"array","items":"int"}]}]}}]}"#;
 
 fn tmp(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -100,7 +109,26 @@ enum Deletes {
     Position {
         seq: i64,
     },
+    /// An equality delete file (sequence number 3) on `city` removing `c2`
+    /// and `c5`; `late.parquet` (ids 4-6, seq 4) is newer, so `c5` stays.
     Equality,
+}
+
+/// Equality delete file keyed on `city`.
+fn equality_deletes(dir: &Path, cities: &[&str]) -> String {
+    let schema = Arc::new(Schema::new(vec![Field::new("city", DataType::Utf8, true)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from_iter_values(
+            cities.iter().copied(),
+        ))],
+    )
+    .unwrap();
+    let path = dir.join("data").join("eq-deletes.parquet");
+    let mut w = ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    format!("file://{}", path.display())
 }
 
 /// Position delete file: Iceberg's `file_path` + `pos` columns.
@@ -157,7 +185,44 @@ fn table(dir: &Path, deletes: Deletes, renamed: bool) {
             );
             (1, f, seq)
         }
-        Deletes::Equality => (2, live.clone(), 3),
+        Deletes::Equality => {
+            let late = parquet(dir, "late.parquet", &[4, 5, 6]);
+            let m = avro(
+                &dir.join("metadata/m1.avro"),
+                MANIFEST,
+                vec![vec![
+                    ("status", Value::Int(1)),
+                    ("data_file", data_file(0, &late)),
+                ]],
+            );
+            manifests.push(vec![
+                ("manifest_path", Value::String(m)),
+                ("content", Value::Int(0)),
+                ("sequence_number", Value::Long(4)),
+            ]);
+            let f = equality_deletes(dir, &["c2", "c5"]);
+            let Value::Record(mut df) = data_file(2, &f) else {
+                unreachable!()
+            };
+            df.push((
+                "equality_ids".into(),
+                Value::Union(1, Box::new(Value::Array(vec![Value::Int(2)]))),
+            ));
+            let d = avro(
+                &dir.join("metadata/d0.avro"),
+                EQ_MANIFEST,
+                vec![vec![
+                    ("status", Value::Int(1)),
+                    ("data_file", Value::Record(df)),
+                ]],
+            );
+            manifests.push(vec![
+                ("manifest_path", Value::String(d)),
+                ("content", Value::Int(1)),
+                ("sequence_number", Value::Long(3)),
+            ]);
+            (0, String::new(), 0)
+        }
     };
     if content != 0 {
         let deletes = avro(
@@ -286,19 +351,34 @@ async fn position_deletes_older_than_the_data_do_not_apply() {
 }
 
 #[tokio::test]
-async fn equality_deletes_fail_instead_of_returning_deleted_rows() {
+async fn equality_deletes_apply_only_to_older_data() {
     let dir = tmp("eq-deletes");
     table(&dir, Deletes::Equality, false);
     let ctx = SessionContext::new();
     register(&ctx, &dir).await.unwrap();
-    let err = ids(&ctx, "SELECT id FROM t").await.unwrap_err();
-    assert!(err.to_string().contains("equality delete files"), "{err}");
-    // Typed at the source so the server can answer 422, not 500 (ADR 0013).
-    let root = err.find_root();
+    // c2 (seq 2 < 3) is deleted; c5 lives in a newer file (seq 4) and stays.
+    // The key column is scanned for the join even when not selected.
+    assert_eq!(
+        ids(&ctx, "SELECT id FROM t ORDER BY id").await.unwrap(),
+        [1, 3, 4, 5, 6]
+    );
+    assert_eq!(
+        ids(&ctx, "SELECT id FROM t WHERE id < 5 ORDER BY id LIMIT 2")
+            .await
+            .unwrap(),
+        [1, 3]
+    );
+    assert_eq!(ids(&ctx, "SELECT count(*) FROM t").await.unwrap(), [5]);
+    let df = ctx.sql("SELECT city FROM t").await.unwrap();
+    let plan = format!(
+        "{}",
+        datafusion::physical_plan::displayable(df.create_physical_plan().await.unwrap().as_ref())
+            .indent(true)
+    );
+    assert!(plan.contains("equality_deletes=1"), "{plan}");
     assert!(
-        matches!(root, DataFusionError::External(e)
-            if matches!(e.downcast_ref::<ConnectorError>(), Some(ConnectorError::Unsupported(_)))),
-        "{root:?}"
+        plan.contains("HashJoinExec: mode=CollectLeft, join_type=RightAnti"),
+        "{plan}"
     );
 }
 
@@ -477,5 +557,36 @@ async fn reads_a_spark_merge_on_read_table() {
         "| 0 |",
     )
     .await;
+    assert_eq!(pool.used(), 0);
+}
+
+/// Equality deletes written by Iceberg's Java writer (`scripts/spark_mor_fixture.sh`):
+/// keyed on `city` (including a null key), scoped to partition `region='a'`,
+/// followed by a newer insert with a deleted key. Spark reads ids 2, 4, 5, 6.
+#[tokio::test]
+#[ignore = "needs PLIMSOLL_ICEBERG_EQ from scripts/spark_mor_fixture.sh"]
+async fn reads_reference_equality_deletes() {
+    let Ok(location) = std::env::var("PLIMSOLL_ICEBERG_EQ") else {
+        return;
+    };
+    let pool = Arc::new(CeilingPool::new(256 << 20, 0).unwrap());
+    let ctx = session_context_with_ceiling(pool.clone(), None, SessionConfig::new()).unwrap();
+    IcebergConnector::try_new("eq", &location, &ctx.state())
+        .await
+        .unwrap()
+        .register(&ctx)
+        .unwrap();
+    // Null keys match null (spec), other partitions and newer rows are kept.
+    assert_eq!(
+        ids(&ctx, "SELECT id FROM eq ORDER BY id").await.unwrap(),
+        [2, 4, 5, 6]
+    );
+    assert_eq!(
+        ids(&ctx, "SELECT id FROM eq WHERE region = 'b' ORDER BY id")
+            .await
+            .unwrap(),
+        [4, 5]
+    );
+    assert_eq!(ids(&ctx, "SELECT count(*) FROM eq").await.unwrap(), [4]);
     assert_eq!(pool.used(), 0);
 }

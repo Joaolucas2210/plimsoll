@@ -23,12 +23,13 @@ are allowed in place.
 | [0013](0013-error-taxonomy-and-failure-budgets.md) | Error taxonomy and dependency failure budgets | Accepted | 2026-10-30 | Errors classified at the source into `invalid_query`/`memory_limit_exceeded`/`unsupported_feature`/`invalid_table`/`dependency_failed`/`internal` with `retryable`; dependencies fail in seconds, not at the query timeout | 0004, 0005, 0007, 0008, 0009, 0012 |
 | [0014](0014-merge-on-read-position-deletes.md) | Merge-on-read: position deletes as Parquet row selections | Accepted | 2026-10-30 | Position delete files become `ParquetRowSelection`s so deleted rows are never decoded; seq-number rule, reserved positions; equality deletes refused; Spark interop workflow | 0007, 0010, 0011, 0012, 0013 |
 | [0015](0015-one-http-tls-stack.md) | One HTTP/TLS stack | Accepted | 2026-10-30 | Catalog client on the same `reqwest 0.12` + `ring` as `object_store`; `aws-lc-rs` and 14 other crates leave the build | 0008, 0009, 0011 |
+| [0016](0016-equality-deletes.md) | Merge-on-read: equality deletes as grouped hash anti-joins | Accepted | 2026-10-30 | Files grouped by the equality delete sets that apply (strict seq, same partition or global); each group anti-joins the keys with null = null; reference-writer interop | 0007, 0010, 0011, 0012, 0013, 0014 |
 
 ## Reading order
 
 - Invariant first: 0003 (memory), 0005 (correctness).
 - Shape of the system: 0001, 0002, 0004.
-- Lakehouse path: 0007 → 0008 → 0009 → 0010.
+- Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016.
 - Federation: 0005 → 0006.
 
 ## Conventions

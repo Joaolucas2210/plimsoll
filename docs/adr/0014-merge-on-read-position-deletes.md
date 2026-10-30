@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-10-30
 - Owner: JoaoLucas2210
-- Related: ADR 0007 (refines: deletes no longer refused), ADR 0010 (delete manifests now pruned), ADR 0012, ADR 0013, ADR 0011
+- Related: ADR 0007 (refines: deletes no longer refused), ADR 0010 (delete manifests now pruned), ADR 0012, ADR 0013, ADR 0011, ADR 0016 (equality deletes)
 - Scope: `plimsoll-connectors::iceberg` (`iceberg/deletes.rs`, `IcebergTable::data_files`, `scan`), `.github/workflows/interop.yml`
 
 ## Context

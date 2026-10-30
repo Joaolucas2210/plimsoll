@@ -61,7 +61,7 @@ would need wrappers. More code than A for the same result.
 |---|---|---|---|---|
 | `InvalidQuery` | 400 | `invalid_query` | no | parse/plan errors, unknown table/namespace |
 | `MemoryLimitExceeded` | 422 | `memory_limit_exceeded` | no | `ResourcesExhausted` (ADR 0003/0012) |
-| `Unsupported` | 422 | `unsupported_feature` | no | Iceberg delete files, nested types, v3; Postgres type |
+| `Unsupported` | 422 | `unsupported_feature` | no | Iceberg v3 / deletion vectors, nested types, equality keys on dropped fields; Postgres type |
 | `InvalidTable` | 422 | `invalid_table` | no | malformed metadata, data file `NotFound`, undecodable Parquet |
 | `Dependency{dependency}` | 502 | `dependency_failed` + `dependency` | yes | catalog (`Http`, `Auth`, `Status`, `Protocol`), `object_store` (anything but `NotFound`), `postgres` (SQLSTATE 08/28/53/57 or no response) |
 | (admission) | 429 / 503 / 504 | `queue_full` / `not_ready` / `query_timeout` | yes | governance |
@@ -109,7 +109,7 @@ code. Alert on `code="internal"` (page Plimsoll) separately from
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | A new error path is unclassified and shows as `internal` | Medium | Medium (false pages) | `internal` is the explicit default; tests pin each class; review new producers against this table. |
-| A wrapping change in DataFusion hides the typed source | Low | Medium | Unit test covers context, Parquet external and connector nesting; live tests assert real shapes (S3 auth, Iceberg delete files). |
+| A wrapping change in DataFusion hides the typed source | Low | Medium | Unit test covers context, Parquet external and connector nesting; live tests assert real shapes (S3 auth). |
 | Short budgets fail queries during brief storage blips | Medium | Low (retryable 502) | `retryable: true`; budgets documented; make configurable when needed. |
 | Replacing client options again drops env settings | Low | High (all S3 reads fail) | Regression test `failure_budget_keeps_env_settings`. |
 
@@ -119,8 +119,6 @@ code. Alert on `code="internal"` (page Plimsoll) separately from
   including context-wrapped, Parquet-external and connector-nested errors.
 - `app::tests::error_contract_carries_class_retryability_and_metrics`: HTTP
   status, `code`, `retryable`, `dependency`, and the metric lines.
-- `tests/iceberg.rs::delete_files_fail_instead_of_returning_deleted_rows`:
-  the real scan error downcasts to `ConnectorError::Unsupported`.
 - `lakehouse::tests::reads_with_catalog_vended_credentials` (live, CI): wrong
   S3 credentials classify as `Dependency { dependency: "object_store" }`.
 - `storage::tests::failure_budget_keeps_env_settings`: budgets applied,

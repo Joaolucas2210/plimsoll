@@ -6,20 +6,23 @@
 //! session's pool, so the whole read path runs under the `CeilingPool`.
 //! See ADR 0007.
 //!
-//! Correctness first: anything we can't read exactly (delete files, renamed
+//! Correctness first: anything we can't read exactly (v3 deletion vectors, renamed
 //! columns, non-Parquet files, nested types) is a typed error, never a
 //! silently wrong answer.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use apache_avro::types::Value as Avro;
 use async_trait::async_trait;
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::DFSchema;
 use datafusion::common::config::TableParquetOptions;
+use datafusion::common::{JoinType, NullEquality};
 use datafusion::datasource::listing::{ListingTableUrl, PartitionedFile};
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::parquet::ParquetRowSelection;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
@@ -30,7 +33,12 @@ use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::object_store::ObjectStoreExt;
 use datafusion::parquet::arrow::arrow_reader::RowSelection;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{PhysicalExpr, PhysicalExprRef};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::joins::{HashJoinExecBuilder, PartitionMode};
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::union::UnionExec;
 use plimsoll_core::federation::{Pushdown, PushdownPolicy};
 use plimsoll_core::memory::AccountedExec;
 use plimsoll_core::storage::{ScopedStore, scoped_s3_store};
@@ -40,7 +48,7 @@ use crate::{Connector, ConnectorError};
 
 mod deletes;
 mod prune;
-use deletes::DeleteFile;
+use deletes::{DeleteFile, EqualityDelete};
 use prune::{PartitionField, Prim, Pruner, Summary};
 
 #[derive(Debug)]
@@ -135,6 +143,10 @@ struct IcebergTable {
     columns: HashMap<String, (i64, Prim)>,
     /// `partition-specs` by spec id, for manifest-level pruning.
     specs: HashMap<i64, Vec<Option<PartitionField>>>,
+    /// Spec ids without a non-void field (equality deletes there are global).
+    unpartitioned: HashSet<i64>,
+    /// Field id -> column name in the current schema (equality delete keys).
+    names: HashMap<i64, String>,
 }
 
 /// A data file the scan will read, from its manifest entry.
@@ -148,6 +160,18 @@ struct DataFile {
     seq: i64,
     /// Rows surviving position deletes; `None` = all rows.
     selection: Option<RowSelection>,
+    /// Partition spec id and tuple, to match equality deletes.
+    spec: i64,
+    partition: Option<Avro>,
+    /// Indices into the planned equality delete sets that apply to this file.
+    eq: Vec<usize>,
+}
+
+/// Keys deleted by one equality delete file (ADR 0016).
+struct EqualitySet {
+    /// Key columns, as fields of the table schema.
+    key: Vec<Field>,
+    batches: Vec<RecordBatch>,
 }
 
 /// What planning skipped, shown in EXPLAIN
@@ -160,6 +184,7 @@ struct PlanStats {
     files_kept: usize,
     delete_files: usize,
     deleted_rows: usize,
+    equality_files: usize,
 }
 
 impl IcebergTable {
@@ -213,6 +238,23 @@ impl IcebergTable {
             .flatten()
             .filter_map(|s| Some((s["spec-id"].as_i64()?, prune::partition_spec(&s["fields"]))))
             .collect();
+        let unpartitioned = meta["partition-specs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|s| {
+                s["fields"]
+                    .as_array()
+                    .is_none_or(|f| f.iter().all(|f| f["transform"] == "void"))
+            })
+            .filter_map(|s| s["spec-id"].as_i64())
+            .collect();
+        let names = current["fields"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|f| Some((f["id"].as_i64()?, f["name"].as_str()?.to_owned())))
+            .collect();
         Ok(Self {
             name: name.to_owned(),
             schema,
@@ -222,21 +264,24 @@ impl IcebergTable {
             scoped: None,
             columns,
             specs,
+            unpartitioned,
+            names,
         })
     }
 
     /// Live data files of the pinned snapshot that may match `pruner`, with
-    /// position deletes applied as row selections (ADR 0014). Manifest bytes,
-    /// the planned file list and delete positions are reserved in the session
-    /// pool. Pruned manifests are never read.
+    /// position deletes applied as row selections (ADR 0014) and the equality
+    /// delete sets that apply to each (ADR 0016). Manifest bytes, the planned
+    /// file list and delete state are reserved in the session pool. Pruned
+    /// manifests are never read.
     async fn data_files(
         &self,
         state: &dyn Session,
         pruner: &Pruner,
-    ) -> Result<(Vec<DataFile>, PlanStats)> {
+    ) -> Result<(Vec<DataFile>, Vec<EqualitySet>, PlanStats)> {
         let mut stats = PlanStats::default();
         let Some(list_path) = &self.manifest_list else {
-            return Ok((vec![], stats));
+            return Ok((vec![], vec![], stats));
         };
         self.register_scoped(state);
         let reservation = MemoryConsumer::new(format!("IcebergPlanning[{}]", self.name))
@@ -252,6 +297,7 @@ impl IcebergTable {
         // Phase 1: data files and delete files that survive pruning.
         let mut files = Vec::new();
         let mut deletes = Vec::new();
+        let mut equality = Vec::new();
         let list_bytes = load(list_path).await?;
         for manifest in avro_entries(list_path, &list_bytes)? {
             let manifest = manifest?;
@@ -261,14 +307,13 @@ impl IcebergTable {
             // v1 has no `content`; 0 = data, 1 = deletes.
             let is_delete = long_field(&manifest, "content").unwrap_or(0) == 1;
             let manifest_seq = long_field(&manifest, "sequence_number").unwrap_or(0);
+            let spec_id = long_field(&manifest, "partition_spec_id").unwrap_or(0);
             stats.manifests += 1;
             // Delete manifests prune like data manifests: a position delete
             // shares its data file's partition, so if no data file there can
             // match, neither can its deletes.
             if !pruner.is_empty() {
-                let spec =
-                    long_field(&manifest, "partition_spec_id").and_then(|id| self.specs.get(&id));
-                if let Some(spec) = spec {
+                if let Some(spec) = self.specs.get(&spec_id) {
                     if !pruner.may_match_manifest(spec, &summaries(&manifest)) {
                         continue;
                     }
@@ -309,11 +354,27 @@ impl IcebergTable {
                         continue;
                     }
                     (true, 2) => {
-                        return Err(unsupported(
-                            &manifest_path,
-                            "equality delete files".to_owned(),
-                        )
-                        .into());
+                        let Some(Avro::Array(ids)) = field(file, "equality_ids") else {
+                            return Err(
+                                invalid(path, "equality delete without equality_ids").into()
+                            );
+                        };
+                        let ids = ids
+                            .iter()
+                            .map(|id| match id {
+                                Avro::Int(i) => Ok(i64::from(*i)),
+                                _ => Err(invalid(path, "equality_ids is not a list of int")),
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        reservation.try_grow(path.len() + std::mem::size_of::<EqualityDelete>())?;
+                        equality.push(EqualityDelete {
+                            path: path.to_owned(),
+                            seq,
+                            spec: spec_id,
+                            partition: field(file, "partition").cloned(),
+                            ids,
+                        });
+                        continue;
                     }
                     (_, content) => {
                         let kind = if is_delete { "delete" } else { "data" };
@@ -344,6 +405,9 @@ impl IcebergTable {
                     rows: long_field(file, "record_count").and_then(|r| u64::try_from(r).ok()),
                     seq,
                     selection: None,
+                    spec: spec_id,
+                    partition: field(file, "partition").cloned(),
+                    eq: vec![],
                 });
             }
             reservation.shrink(manifest_bytes.len());
@@ -379,7 +443,48 @@ impl IcebergTable {
             // Fully deleted files need not be opened at all.
             files.retain(|f| f.selection.as_ref().is_none_or(|s| s.row_count() > 0));
         }
-        Ok((files, stats))
+
+        // Phase 3: equality deletes that apply to at least one kept file.
+        let mut sets = Vec::new();
+        for delete in &equality {
+            let unpartitioned = self.unpartitioned.contains(&delete.spec);
+            let targets: Vec<usize> = (0..files.len())
+                .filter(|&i| {
+                    let f = &files[i];
+                    delete.applies(f.seq, f.spec, f.partition.as_ref(), unpartitioned)
+                })
+                .collect();
+            if targets.is_empty() {
+                continue;
+            }
+            let key = delete
+                .ids
+                .iter()
+                .map(|id| {
+                    let name = self.names.get(id).ok_or_else(|| {
+                        unsupported(
+                            &delete.path,
+                            format!("equality delete on dropped field {id}"),
+                        )
+                    })?;
+                    Ok(self.schema.field_with_name(name)?.clone())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let batches = deletes::equality_keys(
+                state,
+                self.scoped.as_ref(),
+                &delete.path,
+                &key,
+                &reservation,
+            )
+            .await?;
+            for i in targets {
+                files[i].eq.push(sets.len());
+            }
+            sets.push(EqualitySet { key, batches });
+        }
+        stats.equality_files = sets.len();
+        Ok((files, sets, stats))
     }
 }
 
@@ -405,7 +510,116 @@ impl TableProvider for IcebergTable {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let pruner = Pruner::new(filters, &self.columns);
-        let (files, stats) = self.data_files(state, &pruner).await?;
+        let (files, sets, stats) = self.data_files(state, &pruner).await?;
+        // Files sharing the same equality delete sets scan together; a group
+        // with sets is anti-joined against their keys (ADR 0016).
+        let mut groups: BTreeMap<&[usize], Vec<&DataFile>> = BTreeMap::new();
+        for file in &files {
+            groups.entry(&file.eq).or_default().push(file);
+        }
+        if groups.is_empty() {
+            groups.insert(&[], vec![]);
+        }
+        let mut plans = Vec::new();
+        for (eq, files) in groups {
+            if eq.is_empty() {
+                plans.push(
+                    self.parquet_scan(state, &files, projection, filters, limit)
+                        .await?,
+                );
+                continue;
+            }
+            // Key columns are scanned even when not selected, then dropped.
+            let scan_projection = projection.map(|p| {
+                let mut p = p.clone();
+                for &i in eq {
+                    for f in &sets[i].key {
+                        if let Ok(k) = self.schema.index_of(f.name()) {
+                            if !p.contains(&k) {
+                                p.push(k);
+                            }
+                        }
+                    }
+                }
+                p
+            });
+            // No limit below the anti-join: it would cut rows before deletes.
+            let mut plan = self
+                .parquet_scan(state, &files, scan_projection.as_ref(), filters, None)
+                .await?;
+            for &i in eq {
+                plan = anti_join(&sets[i], plan)?;
+            }
+            if let Some(p) = projection {
+                let schema = plan.schema();
+                let exprs = (0..p.len())
+                    .map(|i| {
+                        let f = schema.field(i);
+                        (
+                            Arc::new(Column::new(f.name(), i)) as Arc<dyn PhysicalExpr>,
+                            f.name().clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                plan = Arc::new(ProjectionExec::try_new(exprs, plan)?);
+            }
+            plans.push(plan);
+        }
+        Ok(Arc::new(AccountedExec::new(
+            format!(
+                "IcebergScan[{}] manifests={}/{} files={}/{} deletes={} deleted_rows={} equality_deletes={}",
+                self.name,
+                stats.manifests_read,
+                stats.manifests,
+                stats.files_kept,
+                stats.files,
+                stats.delete_files,
+                stats.deleted_rows,
+                stats.equality_files,
+            ),
+            UnionExec::try_new(plans)?,
+        )))
+    }
+}
+
+/// `probe` rows whose key is not in `set`. Iceberg compares nulls as equal.
+fn anti_join(set: &EqualitySet, probe: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    let schema = Arc::new(Schema::new(
+        set.key
+            .iter()
+            .map(|f| f.clone().with_nullable(true))
+            .collect::<Vec<_>>(),
+    ));
+    let build = MemorySourceConfig::try_new_exec(std::slice::from_ref(&set.batches), schema, None)?;
+    let probe_schema = probe.schema();
+    let on = set
+        .key
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let l: PhysicalExprRef = Arc::new(Column::new(f.name(), i));
+            let r: PhysicalExprRef = Arc::new(Column::new_with_schema(f.name(), &probe_schema)?);
+            Ok((l, r))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(
+        HashJoinExecBuilder::new(build, probe, on, JoinType::RightAnti)
+            .with_partition_mode(PartitionMode::CollectLeft)
+            .with_null_equality(NullEquality::NullEqualsNull)
+            .build()?,
+    ))
+}
+
+impl IcebergTable {
+    /// One Parquet scan over `files` (position deletes as row selections).
+    async fn parquet_scan(
+        &self,
+        state: &dyn Session,
+        files: &[&DataFile],
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut store: Option<ObjectStoreUrl> = None;
         let scoped = self.scoped.as_ref();
         let mut groups = vec![Vec::new(); state.config().target_partitions().max(1)];
@@ -468,19 +682,7 @@ impl TableProvider for IcebergTable {
         .with_projection_indices(projection.cloned())?
         .with_limit(limit)
         .build();
-        Ok(Arc::new(AccountedExec::new(
-            format!(
-                "IcebergScan[{}] manifests={}/{} files={}/{} deletes={} deleted_rows={}",
-                self.name,
-                stats.manifests_read,
-                stats.manifests,
-                stats.files_kept,
-                stats.files,
-                stats.delete_files,
-                stats.deleted_rows
-            ),
-            DataSourceExec::from_data_source(config),
-        )))
+        Ok(DataSourceExec::from_data_source(config))
     }
 }
 
