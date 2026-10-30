@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::MemorySchemaProvider;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::context::SQLOptions;
 use datafusion::physical_plan::execute_stream;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
@@ -111,7 +112,16 @@ impl Engine {
 
     async fn run(&self, ctx: &SessionContext, sql: &str) -> Result<QueryResult> {
         let started = Instant::now();
-        let df = ctx.sql(sql).await?;
+        // Read-only SQL (ADR 0024): DDL would let any caller read or write
+        // server files (`CREATE EXTERNAL TABLE ... LOCATION '/etc/...'`,
+        // `COPY ... TO`) and mutate the catalogs every user shares; `SET`
+        // would tune engine limits. Tables are registered by the operator
+        // (env, catalog), never through the query API.
+        let read_only = SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
+        let df = ctx.sql_with_options(sql, read_only).await?;
         let (state, plan) = df.into_parts();
         let plan = preevaluate_scalar_subqueries(&state, plan).await?;
         let physical = state.create_physical_plan(&plan).await?;
@@ -187,8 +197,57 @@ mod tests {
     #[tokio::test]
     async fn medallion_schemas_exist() {
         let e = engine(64 << 20);
-        e.sql("CREATE TABLE gold.t AS SELECT 1 AS x").await.unwrap();
+        // Operators register tables on the context; the query API can't.
+        e.context()
+            .sql("CREATE TABLE gold.t AS SELECT 1 AS x")
+            .await
+            .unwrap();
         let b = e.sql("SELECT x FROM gold.t").await.unwrap().batches;
         assert_eq!(b[0].num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_api_is_read_only() {
+        let e = engine(64 << 20);
+        let dir = std::env::temp_dir().join(format!("plimsoll-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("secret.csv");
+        std::fs::write(&secret, "id,secret\n1,hunter2\n").unwrap();
+        let out = dir.join("out.csv");
+        for sql in [
+            // Arbitrary file read through a table definition.
+            format!(
+                "CREATE EXTERNAL TABLE leak STORED AS CSV LOCATION '{}'",
+                secret.display()
+            ),
+            // Arbitrary file write.
+            format!("COPY (SELECT 1) TO '{}' STORED AS CSV", out.display()),
+            // Shared catalog mutation, and session/engine tuning.
+            "CREATE VIEW gold.v AS SELECT 1".to_owned(),
+            "DROP SCHEMA bronze".to_owned(),
+            "SET datafusion.execution.target_partitions = 1".to_owned(),
+            // Also inside a subquery or CTE.
+            "WITH x AS (SELECT 1) SELECT * FROM x".to_owned(),
+        ] {
+            let result = e.sql(&sql).await;
+            if sql.starts_with("WITH") {
+                assert!(result.is_ok(), "plain queries still work: {sql}");
+                continue;
+            }
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("not supported"), "{sql}: {err}");
+        }
+        assert!(!out.exists(), "COPY must not write");
+        assert!(
+            e.sql("SELECT * FROM leak").await.is_err(),
+            "no table was created"
+        );
+        assert!(
+            e.context()
+                .catalog("datafusion")
+                .unwrap()
+                .schema("bronze")
+                .is_some()
+        );
     }
 }
