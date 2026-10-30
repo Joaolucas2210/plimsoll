@@ -108,7 +108,8 @@ the weight, and C's "unknown means keep" rule makes its incompleteness safe.
   partitions, or predicates on casted columns.
 - Partition summaries are only used for the spec each manifest declares;
   evolved specs work but prune only on fields present in that spec.
-- Manifests are still read sequentially (one round trip each).
+- Manifests were read sequentially (one round trip each); concurrent since
+  ADR 0020.
 
 **Operational**
 - A query that unexpectedly reads `manifests=N/N` signals a predicate the

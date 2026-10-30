@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use apache_avro::types::Value as Avro;
 use chrono::{DateTime, Utc};
@@ -36,6 +37,7 @@ use datafusion::parquet::arrow::ProjectionMask;
 use datafusion::parquet::arrow::arrow_reader::{
     ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
 };
+use futures::StreamExt;
 use plimsoll_core::storage::ScopedStore;
 use roaring::RoaringTreemap;
 
@@ -89,7 +91,7 @@ pub(super) async fn equality_keys(
     path: &str,
     key: &[Field],
     reservation: &MemoryReservation,
-    hits: &mut usize,
+    hits: &AtomicUsize,
 ) -> Result<Vec<RecordBatch>> {
     let types = key
         .iter()
@@ -149,82 +151,117 @@ pub(super) async fn equality_keys(
 pub(super) type Targets<'a> = HashMap<&'a str, i64>;
 
 /// Deleted positions per data file (sorted, unique), read from the delete
-/// files that apply to `targets`. Decoded delete files are cached (ADR 0018);
-/// the positions a query keeps are reserved in `reservation` (8 bytes each)
-/// because they grow with the number of deletes.
+/// files that apply to `targets`, `concurrency` at a time. Decoded delete
+/// files are cached (ADR 0018); the positions a query keeps are reserved in
+/// `reservation` (8 bytes each) because they grow with the number of deletes.
 pub(super) async fn positions(
     state: &dyn Session,
     scoped: Option<&ScopedStore>,
     deletes: &[DeleteFile],
     targets: &Targets<'_>,
     reservation: &MemoryReservation,
-    hits: &mut usize,
+    concurrency: usize,
+    hits: &AtomicUsize,
 ) -> Result<HashMap<String, Vec<u64>>> {
+    // Fetch + decode concurrently; merge sequentially in manifest order.
+    // Indices, not references: a borrowed stream item trips the `Send`
+    // check of the `async_trait` scan future (higher-ranked lifetimes).
+    let mut loaded = futures::stream::iter(0..deletes.len())
+        .map(|i| load(state, scoped, &deletes[i], targets, reservation, hits))
+        .buffered(concurrency);
     let mut out: HashMap<String, Vec<u64>> = HashMap::new();
     let word = std::mem::size_of::<u64>();
-    for delete in deletes {
-        // `referenced_data_file` lets us skip delete files for pruned data.
-        if delete
-            .referenced
-            .as_deref()
-            .is_some_and(|r| !targets.contains_key(r))
-        {
-            continue;
-        }
-        if let Some((offset, size)) = delete.blob {
-            let Some(target) = delete.referenced.as_deref() else {
-                return Err(invalid_delete(
-                    &delete.path,
-                    "deletion vector",
-                    "no referenced_data_file",
-                ));
-            };
-            match targets.get(target) {
-                Some(&data_seq) if data_seq <= delete.seq => {}
-                _ => continue,
+    while let Some(next) = loaded.next().await {
+        let (delete, decoded, held) = next?;
+        match decoded {
+            Decoded::Skip => {}
+            Decoded::Vector(target, bitmap) => {
+                let n = usize::try_from(bitmap.len())
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                reservation.try_grow(n * word)?;
+                out.entry(target).or_default().extend(bitmap.iter());
             }
-            let key = format!("{}#{offset}+{size}", delete.path);
-            let (bitmap, held) = cached(state, &key, reservation, hits, async {
-                let blob =
-                    super::read_range(&delete.path, offset..offset + size, state, scoped).await?;
-                reservation.try_grow(blob.len())?;
-                let bitmap = deletion_vector(&blob)
-                    .map_err(|e| invalid_delete(&delete.path, "deletion vector", &e));
-                reservation.shrink(blob.len());
-                let bitmap = bitmap?;
-                let bytes = bitmap.serialized_size();
-                Ok((bitmap, bytes))
-            })
-            .await?;
-            let n = usize::try_from(bitmap.len())
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            reservation.try_grow(n * word)?;
-            out.entry(target.to_owned())
-                .or_default()
-                .extend(bitmap.iter());
-            reservation.shrink(held);
-            continue;
-        }
-        let (all, held) = cached(state, &delete.path, reservation, hits, async {
-            decode_positions(&delete.path, state, scoped, reservation).await
-        })
-        .await?;
-        for (path, positions) in all.iter() {
-            // Spec: applies only when data seq <= delete seq.
-            match targets.get(path.as_str()) {
-                Some(&data_seq) if data_seq <= delete.seq => {}
-                _ => continue,
+            Decoded::Positions(all) => {
+                for (path, positions) in all.iter() {
+                    // Spec: applies only when data seq <= delete seq.
+                    match targets.get(path.as_str()) {
+                        Some(&data_seq) if data_seq <= delete.seq => {}
+                        _ => continue,
+                    }
+                    reservation.try_grow(positions.len() * word)?;
+                    out.entry(path.clone()).or_default().extend(positions);
+                }
             }
-            reservation.try_grow(positions.len() * word)?;
-            out.entry(path.clone()).or_default().extend(positions);
         }
         reservation.shrink(held);
     }
+    drop(loaded);
     for positions in out.values_mut() {
         positions.sort_unstable();
         positions.dedup();
     }
     Ok(out)
+}
+
+/// One delete file's decoded content, before filtering by target.
+enum Decoded {
+    /// Applies to nothing scanned.
+    Skip,
+    /// A deletion vector for one data file.
+    Vector(String, Arc<RoaringTreemap>),
+    /// Every position of a position delete file, by data file.
+    Positions(Arc<HashMap<String, Vec<u64>>>),
+}
+
+/// Fetches and decodes one delete file (or DV blob), via the cache. `held`
+/// bytes are reserved on a miss until the caller has merged the result.
+async fn load<'a>(
+    state: &dyn Session,
+    scoped: Option<&ScopedStore>,
+    delete: &'a DeleteFile,
+    targets: &Targets<'_>,
+    reservation: &MemoryReservation,
+    hits: &AtomicUsize,
+) -> Result<(&'a DeleteFile, Decoded, usize)> {
+    // `referenced_data_file` lets us skip delete files for pruned data.
+    if delete
+        .referenced
+        .as_deref()
+        .is_some_and(|r| !targets.contains_key(r))
+    {
+        return Ok((delete, Decoded::Skip, 0));
+    }
+    let Some((offset, size)) = delete.blob else {
+        let (all, held) = cached(state, &delete.path, reservation, hits, async {
+            decode_positions(&delete.path, state, scoped, reservation).await
+        })
+        .await?;
+        return Ok((delete, Decoded::Positions(all), held));
+    };
+    let Some(target) = delete.referenced.as_deref() else {
+        return Err(invalid_delete(
+            &delete.path,
+            "deletion vector",
+            "no referenced_data_file",
+        ));
+    };
+    match targets.get(target) {
+        Some(&data_seq) if data_seq <= delete.seq => {}
+        _ => return Ok((delete, Decoded::Skip, 0)),
+    }
+    let key = format!("{}#{offset}+{size}", delete.path);
+    let (bitmap, held) = cached(state, &key, reservation, hits, async {
+        let blob = super::read_range(&delete.path, offset..offset + size, state, scoped).await?;
+        reservation.try_grow(blob.len())?;
+        let bitmap =
+            deletion_vector(&blob).map_err(|e| invalid_delete(&delete.path, "deletion vector", &e));
+        reservation.shrink(blob.len());
+        let bitmap = bitmap?;
+        let bytes = bitmap.serialized_size();
+        Ok((bitmap, bytes))
+    })
+    .await?;
+    Ok((delete, Decoded::Vector(target.to_owned(), bitmap), held))
 }
 
 /// Every `(file_path, pos)` of a position delete file, read whole. Returns
@@ -303,7 +340,7 @@ async fn cached<T: Send + Sync + 'static>(
     state: &dyn Session,
     key: &str,
     reservation: &MemoryReservation,
-    hits: &mut usize,
+    hits: &AtomicUsize,
     load: impl Future<Output = Result<(T, usize)>>,
 ) -> Result<(Arc<T>, usize)> {
     let cache = state.runtime_env().cache_manager.get_file_metadata_cache();
@@ -318,7 +355,7 @@ async fn cached<T: Send + Sync + 'static>(
         && entry.is_valid_for(&meta)
         && let Some(hit) = entry.file_metadata.as_any().downcast_ref::<Cached<T>>()
     {
-        *hits += 1;
+        hits.fetch_add(1, Ordering::Relaxed);
         return Ok((hit.value.clone(), 0));
     }
     let (value, bytes) = load.await?;

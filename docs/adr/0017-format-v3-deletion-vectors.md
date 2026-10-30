@@ -101,7 +101,7 @@ wrong answers without an error:
 
 **Negative (accepted debt)**
 - One range request per DV; a Puffin file holding many relevant DVs costs
-  many round trips (coalescing is the upgrade path).
+  many requests (concurrent since ADR 0020; coalescing is the upgrade path).
 - DV positions are materialised into a sorted `Vec<u64>` before becoming a
   selection (8 B/position reserved): a file with tens of millions of deletes
   costs hundreds of MB during planning. Iterating the bitmap directly into

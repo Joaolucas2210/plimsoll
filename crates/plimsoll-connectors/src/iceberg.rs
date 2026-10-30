@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use apache_avro::types::Value as Avro;
 use async_trait::async_trait;
@@ -39,6 +40,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::joins::{HashJoinExecBuilder, PartitionMode};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::union::UnionExec;
+use futures::StreamExt;
 use plimsoll_core::federation::{Pushdown, PushdownPolicy};
 use plimsoll_core::memory::AccountedExec;
 use plimsoll_core::storage::{ScopedStore, scoped_s3_store};
@@ -318,10 +320,14 @@ impl IcebergTable {
             Ok(bytes)
         };
 
-        // Phase 1: data files and delete files that survive pruning.
-        let mut files = Vec::new();
-        let mut deletes = Vec::new();
-        let mut equality = Vec::new();
+        // Object store round trips dominate planning: manifests and delete
+        // files are fetched `meta_fetch_concurrency` at a time (ADR 0020).
+        // Each in-flight fetch is reserved, so the window is under the ceiling.
+        let concurrency = usize::from(state.config_options().execution.meta_fetch_concurrency);
+        let hits = AtomicUsize::new(0);
+
+        // Phase 1a: the manifest list decides which manifests to read.
+        let mut manifests = Vec::new();
         let list_bytes = load(list_path).await?;
         for manifest in avro_entries(list_path, &list_bytes)? {
             let manifest = manifest?;
@@ -344,7 +350,26 @@ impl IcebergTable {
                 }
             }
             stats.manifests_read += 1;
-            let manifest_bytes = load(&manifest_path).await?;
+            manifests.push((manifest_path, is_delete, manifest_seq, spec_id));
+        }
+        reservation.shrink(list_bytes.len());
+
+        // Phase 1b: data files and delete files that survive pruning, from
+        // manifests fetched concurrently and decoded in list order.
+        let mut files = Vec::new();
+        let mut deletes = Vec::new();
+        let mut equality = Vec::new();
+        let mut fetched = futures::stream::iter(manifests)
+            .map(|(path, is_delete, seq, spec)| {
+                let load = &load;
+                async move {
+                    let bytes = load(&path).await?;
+                    Ok::<_, DataFusionError>((path, is_delete, seq, spec, bytes))
+                }
+            })
+            .buffered(concurrency);
+        while let Some(manifest) = fetched.next().await {
+            let (manifest_path, is_delete, manifest_seq, spec_id, manifest_bytes) = manifest?;
             for entry in avro_entries(&manifest_path, &manifest_bytes)? {
                 let entry = entry?;
                 // status 2 = deleted in this snapshot.
@@ -461,7 +486,7 @@ impl IcebergTable {
             }
             reservation.shrink(manifest_bytes.len());
         }
-        reservation.shrink(list_bytes.len());
+        drop(fetched);
 
         // Phase 2: position deletes -> row selections for the kept files.
         if !deletes.is_empty() && !files.is_empty() {
@@ -473,7 +498,8 @@ impl IcebergTable {
                 &deletes,
                 &targets,
                 &reservation,
-                &mut stats.cache_hits,
+                concurrency,
+                &hits,
             )
             .await?;
             stats.delete_files = deletes.len();
@@ -495,8 +521,8 @@ impl IcebergTable {
         }
 
         // Phase 3: equality deletes that apply to at least one kept file.
-        let mut sets = Vec::new();
-        for delete in &equality {
+        let mut pending = Vec::new();
+        for (d, delete) in equality.iter().enumerate() {
             let unpartitioned = self.unpartitioned.contains(&delete.spec);
             let targets: Vec<usize> = (0..files.len())
                 .filter(|&i| {
@@ -520,21 +546,36 @@ impl IcebergTable {
                     Ok(self.schema.field_with_name(name)?.clone())
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let batches = deletes::equality_keys(
-                state,
-                self.scoped.as_ref(),
-                &delete.path,
-                &key,
-                &reservation,
-                &mut stats.cache_hits,
-            )
-            .await?;
+            pending.push((d, key, targets));
+        }
+        let mut loaded = futures::stream::iter(pending)
+            .map(|(d, key, targets): (usize, Vec<Field>, Vec<usize>)| {
+                let (reservation, hits, path) = (&reservation, &hits, &equality[d].path);
+                async move {
+                    let batches = deletes::equality_keys(
+                        state,
+                        self.scoped.as_ref(),
+                        path,
+                        &key,
+                        reservation,
+                        hits,
+                    )
+                    .await?;
+                    Ok::<_, DataFusionError>((key, targets, batches))
+                }
+            })
+            .buffered(concurrency);
+        let mut sets = Vec::new();
+        while let Some(set) = loaded.next().await {
+            let (key, targets, batches) = set?;
             for i in targets {
                 files[i].eq.push(sets.len());
             }
             sets.push(EqualitySet { key, batches });
         }
+        drop(loaded);
         stats.equality_files = sets.len();
+        stats.cache_hits = hits.into_inner();
         Ok((files, sets, stats))
     }
 }

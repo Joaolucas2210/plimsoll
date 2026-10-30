@@ -713,3 +713,102 @@ async fn delete_files_are_cached_within_the_cache_reserve() {
         assert!(explain(&plain, sql).await.contains("delete_cache_hits=0"));
     }
 }
+
+/// A table with `n` data manifests of one file each (ids 0..n).
+fn many_manifests(dir: &Path, n: i64) {
+    let manifests = (0..n)
+        .map(|i| {
+            let data = parquet(dir, &format!("d{i}.parquet"), &[i]);
+            // Real sizes, as the spec requires: no HEAD fallback per file.
+            let size = std::fs::metadata(dir.join(format!("data/d{i}.parquet")))
+                .unwrap()
+                .len();
+            let Value::Record(mut file) = data_file(0, &data) else {
+                unreachable!()
+            };
+            file.retain(|(k, _)| k != "file_size_in_bytes");
+            file.push((
+                "file_size_in_bytes".into(),
+                Value::Long(i64::try_from(size).unwrap()),
+            ));
+            let m = avro(
+                &dir.join(format!("metadata/m{i}.avro")),
+                MANIFEST,
+                vec![vec![
+                    ("status", Value::Int(1)),
+                    ("data_file", Value::Record(file)),
+                ]],
+            );
+            vec![
+                ("manifest_path", Value::String(m)),
+                ("content", Value::Int(0)),
+                ("sequence_number", Value::Long(1)),
+            ]
+        })
+        .collect();
+    let list = avro(&dir.join("metadata/snap-1.avro"), MANIFEST_LIST, manifests);
+    let meta = json!({
+        "format-version": 2, "current-schema-id": 0, "current-snapshot-id": 1,
+        "schemas": [{"schema-id": 0, "fields": [
+            {"id": 1, "name": "id", "type": "long", "required": true},
+            {"id": 2, "name": "city", "type": "string", "required": false}]}],
+        "snapshots": [{"snapshot-id": 1, "manifest-list": list}],
+    });
+    std::fs::write(dir.join("metadata/v1.metadata.json"), meta.to_string()).unwrap();
+}
+
+/// Manifests are fetched concurrently (ADR 0020): with 50 ms per GET and 8
+/// manifests, planning takes a few round trips instead of one per manifest.
+#[tokio::test]
+async fn planning_fetches_manifests_concurrently() {
+    use datafusion::execution::object_store::ObjectStoreUrl;
+    use datafusion::object_store::memory::InMemory;
+    use datafusion::object_store::path::Path as StorePath;
+    use datafusion::object_store::throttle::{ThrottleConfig, ThrottledStore};
+    use datafusion::object_store::{ObjectStoreExt, PutPayload};
+    use std::time::{Duration, Instant};
+
+    let dir = tmp("concurrent");
+    many_manifests(&dir, 8);
+    // Same paths as on disk (`ThrottledStore` can't wrap file-backed reads).
+    let files = InMemory::new();
+    for sub in ["metadata", "data"] {
+        for entry in std::fs::read_dir(dir.join(sub)).unwrap() {
+            let path = entry.unwrap().path();
+            let key = StorePath::from_absolute_path(&path).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            files.put(&key, PutPayload::from(bytes)).await.unwrap();
+        }
+    }
+    let files = Arc::new(files);
+    let plan_time = async |concurrency: usize| {
+        let config = SessionConfig::new()
+            .set_usize("datafusion.execution.meta_fetch_concurrency", concurrency);
+        let ctx = SessionContext::new_with_config(config);
+        let slow = ThrottleConfig {
+            wait_get_per_call: Duration::from_millis(50),
+            ..Default::default()
+        };
+        ctx.runtime_env().register_object_store(
+            ObjectStoreUrl::local_filesystem().as_ref(),
+            Arc::new(ThrottledStore::new(files.clone(), slow)),
+        );
+        register(&ctx, &dir).await.unwrap();
+        let df = ctx.sql("SELECT sum(id) FROM t").await.unwrap();
+        let started = Instant::now();
+        df.clone().create_physical_plan().await.unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(ids(&ctx, "SELECT sum(id) FROM t").await.unwrap(), [28]);
+        elapsed
+    };
+    let sequential = plan_time(1).await;
+    let concurrent = plan_time(32).await;
+    eprintln!("planning with 50 ms/GET: sequential {sequential:?}, concurrent {concurrent:?}");
+    // Sequential: list + 8 manifests = 9 round trips (~450 ms); concurrent:
+    // list + one wave (~100 ms).
+    assert!(sequential >= Duration::from_millis(400), "{sequential:?}");
+    assert!(
+        concurrent * 2 < sequential,
+        "{concurrent:?} vs {sequential:?}"
+    );
+}

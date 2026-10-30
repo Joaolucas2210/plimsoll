@@ -46,22 +46,21 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] `system.runtime.queries` schema + snapshot source
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
+- [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
 - [x] Query latency histograms by phase: queue, planning, execution, serialization, total (ADR 0019)
 - [x] Wire pool/spill metrics to the live `CeilingPool`
 
 ## Next obvious PR
 
-**Parallel manifest and delete-file reads** under the planning reservation:
-planning dominates on MOR tables (ADR 0019 smoke: ~22 ms planning vs ~8 ms
-execution on the v3 fixture), and manifests/DV blobs are fetched one by one
-(ADRs 0010, 0017).
+**Authentication**: bearer tokens (then mTLS) deriving `user` from the
+principal; today `user` is trusted as sent, so per-user admission limits are
+advisory (ADR 0004, `ponytail:` in `app::sql`).
 
 ## Later
 
 - OTLP traces and metrics export (OpenTelemetry), query-level spans
   (admission wait, planning, execution). No OpenTelemetry dependency until then.
 - Configurable resource groups (per-group limits from config).
-- Authentication (bearer / mTLS) deriving `user` from the principal.
 - Readiness drain delay before closing the listener.
 - Per-layer governance on the medallion namespaces (`bronze`/`silver`/`gold`).
 - Coordinator/worker split along the existing plane boundary.
