@@ -20,6 +20,7 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::DFSchema;
 use datafusion::common::config::TableParquetOptions;
 use datafusion::datasource::listing::{ListingTableUrl, PartitionedFile};
+use datafusion::datasource::physical_plan::parquet::ParquetRowSelection;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result};
@@ -28,6 +29,7 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::object_store::ObjectStoreExt;
+use datafusion::parquet::arrow::arrow_reader::RowSelection;
 use datafusion::physical_plan::ExecutionPlan;
 use plimsoll_core::federation::{Pushdown, PushdownPolicy};
 use plimsoll_core::memory::AccountedExec;
@@ -36,7 +38,9 @@ use serde_json::Value as Json;
 
 use crate::{Connector, ConnectorError};
 
+mod deletes;
 mod prune;
+use deletes::DeleteFile;
 use prune::{PartitionField, Prim, Pruner, Summary};
 
 #[derive(Debug)]
@@ -138,15 +142,24 @@ struct DataFile {
     path: String,
     /// `file_size_in_bytes`; saves a HEAD per file on object storage.
     size: Option<u64>,
+    /// `record_count`; needed to apply position deletes.
+    rows: Option<u64>,
+    /// Data sequence number (inherited from the manifest when absent).
+    seq: i64,
+    /// Rows surviving position deletes; `None` = all rows.
+    selection: Option<RowSelection>,
 }
 
-/// What planning skipped, shown in EXPLAIN (`IcebergScan[t] files=2/40`).
+/// What planning skipped, shown in EXPLAIN
+/// (`IcebergScan[t] manifests=1/4 files=2/40 deletes=1 deleted_rows=3`).
 #[derive(Default)]
 struct PlanStats {
     manifests: usize,
     manifests_read: usize,
     files: usize,
     files_kept: usize,
+    delete_files: usize,
+    deleted_rows: usize,
 }
 
 impl IcebergTable {
@@ -213,8 +226,9 @@ impl IcebergTable {
     }
 
     /// Live data files of the pinned snapshot that may match `pruner`, with
-    /// manifest bytes reserved in the session pool while they are decoded.
-    /// Pruned manifests are never read.
+    /// position deletes applied as row selections (ADR 0014). Manifest bytes,
+    /// the planned file list and delete positions are reserved in the session
+    /// pool. Pruned manifests are never read.
     async fn data_files(
         &self,
         state: &dyn Session,
@@ -225,7 +239,7 @@ impl IcebergTable {
             return Ok((vec![], stats));
         };
         self.register_scoped(state);
-        let reservation = MemoryConsumer::new(format!("IcebergManifests[{}]", self.name))
+        let reservation = MemoryConsumer::new(format!("IcebergPlanning[{}]", self.name))
             .register(&state.runtime_env().memory_pool);
         // Raw Avro bytes are reserved while in use; entries are decoded one at
         // a time (never collected), so decoded state stays O(one entry).
@@ -235,7 +249,9 @@ impl IcebergTable {
             Ok(bytes)
         };
 
+        // Phase 1: data files and delete files that survive pruning.
         let mut files = Vec::new();
+        let mut deletes = Vec::new();
         let list_bytes = load(list_path).await?;
         for manifest in avro_entries(list_path, &list_bytes)? {
             let manifest = manifest?;
@@ -244,9 +260,12 @@ impl IcebergTable {
                 .to_owned();
             // v1 has no `content`; 0 = data, 1 = deletes.
             let is_delete = long_field(&manifest, "content").unwrap_or(0) == 1;
+            let manifest_seq = long_field(&manifest, "sequence_number").unwrap_or(0);
             stats.manifests += 1;
-            // Delete manifests are always read: we must see them to refuse.
-            if !is_delete && !pruner.is_empty() {
+            // Delete manifests prune like data manifests: a position delete
+            // shares its data file's partition, so if no data file there can
+            // match, neither can its deletes.
+            if !pruner.is_empty() {
                 let spec =
                     long_field(&manifest, "partition_spec_id").and_then(|id| self.specs.get(&id));
                 if let Some(spec) = spec {
@@ -263,15 +282,10 @@ impl IcebergTable {
                 if long_field(&entry, "status") == Some(2) {
                     continue;
                 }
+                // Spec: a null entry sequence number inherits the manifest's.
+                let seq = long_field(&entry, "sequence_number").unwrap_or(manifest_seq);
                 let file = field(&entry, "data_file")
                     .ok_or_else(|| invalid(&manifest_path, "data_file missing"))?;
-                if is_delete || long_field(file, "content").unwrap_or(0) != 0 {
-                    return Err(unsupported(
-                        &manifest_path,
-                        "row-level delete files (merge-on-read)".to_owned(),
-                    )
-                    .into());
-                }
                 let format = str_field(file, "file_format").unwrap_or("");
                 if !format.eq_ignore_ascii_case("parquet") {
                     return Err(
@@ -280,6 +294,36 @@ impl IcebergTable {
                 }
                 let path = str_field(file, "file_path")
                     .ok_or_else(|| invalid(&manifest_path, "file_path missing"))?;
+                let size = long_field(file, "file_size_in_bytes")
+                    .and_then(|s| u64::try_from(s).ok())
+                    .filter(|s| *s > 0);
+                match (is_delete, long_field(file, "content").unwrap_or(0)) {
+                    (false, 0) => {}
+                    (true, 1) => {
+                        reservation.try_grow(path.len() + std::mem::size_of::<DeleteFile>())?;
+                        deletes.push(DeleteFile {
+                            path: path.to_owned(),
+                            seq,
+                            referenced: str_field(file, "referenced_data_file").map(str::to_owned),
+                        });
+                        continue;
+                    }
+                    (true, 2) => {
+                        return Err(unsupported(
+                            &manifest_path,
+                            "equality delete files".to_owned(),
+                        )
+                        .into());
+                    }
+                    (_, content) => {
+                        let kind = if is_delete { "delete" } else { "data" };
+                        return Err(invalid(
+                            &manifest_path,
+                            format!("content {content} in a {kind} manifest"),
+                        )
+                        .into());
+                    }
+                }
                 stats.files += 1;
                 if !pruner.is_empty()
                     && !pruner.may_match_file(
@@ -296,14 +340,45 @@ impl IcebergTable {
                 reservation.try_grow(path.len() + std::mem::size_of::<DataFile>())?;
                 files.push(DataFile {
                     path: path.to_owned(),
-                    size: long_field(file, "file_size_in_bytes")
-                        .and_then(|s| u64::try_from(s).ok())
-                        .filter(|s| *s > 0),
+                    size,
+                    rows: long_field(file, "record_count").and_then(|r| u64::try_from(r).ok()),
+                    seq,
+                    selection: None,
                 });
             }
             reservation.shrink(manifest_bytes.len());
         }
         reservation.shrink(list_bytes.len());
+
+        // Phase 2: position deletes -> row selections for the kept files.
+        if !deletes.is_empty() && !files.is_empty() {
+            let targets: deletes::Targets<'_> =
+                files.iter().map(|f| (f.path.as_str(), f.seq)).collect();
+            let mut positions = deletes::positions(
+                state,
+                self.scoped.as_ref(),
+                &deletes,
+                &targets,
+                &reservation,
+            )
+            .await?;
+            stats.delete_files = deletes.len();
+            for file in &mut files {
+                let Some(deleted) = positions.remove(&file.path) else {
+                    continue;
+                };
+                let rows = file.rows.ok_or_else(|| {
+                    invalid(
+                        &file.path,
+                        "record_count missing on a file with position deletes",
+                    )
+                })?;
+                stats.deleted_rows += deleted.len();
+                file.selection = Some(deletes::selection(&deleted, rows)?);
+            }
+            // Fully deleted files need not be opened at all.
+            files.retain(|f| f.selection.as_ref().is_none_or(|s| s.row_count() > 0));
+        }
         Ok((files, stats))
     }
 }
@@ -361,8 +436,12 @@ impl TableProvider for IcebergTable {
                         .size
                 }
             };
+            let mut part = PartitionedFile::new(url.prefix().to_string(), size);
+            if let Some(selection) = &file.selection {
+                part = part.with_extension(ParquetRowSelection::new(selection.clone()));
+            }
             let n = groups.len();
-            groups[i % n].push(PartitionedFile::new(url.prefix().to_string(), size));
+            groups[i % n].push(part);
         }
 
         let mut source = ParquetSource::new(self.schema.clone()).with_table_parquet_options(
@@ -391,8 +470,14 @@ impl TableProvider for IcebergTable {
         .build();
         Ok(Arc::new(AccountedExec::new(
             format!(
-                "IcebergScan[{}] manifests={}/{} files={}/{}",
-                self.name, stats.manifests_read, stats.manifests, stats.files_kept, stats.files
+                "IcebergScan[{}] manifests={}/{} files={}/{} deletes={} deleted_rows={}",
+                self.name,
+                stats.manifests_read,
+                stats.manifests,
+                stats.files_kept,
+                stats.files,
+                stats.delete_files,
+                stats.deleted_rows
             ),
             DataSourceExec::from_data_source(config),
         )))

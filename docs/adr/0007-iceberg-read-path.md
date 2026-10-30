@@ -77,7 +77,8 @@ Wrong: reads files that are not in the snapshot.
    at …")`: `format-version` other than 1–2, nested types, unknown primitive
    types, a v1 snapshot without `manifest-list` and any schema history where a
    field id and a name disagree (rename, drop + re-add) at registration;
-   row-level delete files (merge-on-read) and non-Parquet data files at scan.
+   equality delete files and non-Parquet data files at scan. Position deletes
+   (merge-on-read) are applied since ADR 0014.
    Files spanning more than one object store → `NotImplemented` at scan.
 5. **Dependency:** `apache-avro 0.22` with `default-features = false` (null and
    deflate codecs, the pyiceberg/Java defaults). No iceberg-rust, no second
@@ -97,9 +98,9 @@ pyiceberg-written tables is exercised in CI, locally and on S3 (ADR 0009).
   decoded and every file `HEAD`-ed per scan. ADR 0010 refines this step
   (manifest/file pruning, sizes from `file_size_in_bytes`); the rest of this
   decision stands.
-- Decoded manifest entries (`Vec<apache_avro::Value>`) and `metadata.json`
-  bytes are not reserved; only raw Avro bytes during decode are.
-- No delete-file application; no field-id column mapping; no snappy/zstd Avro.
+- `metadata.json` bytes are not reserved (manifests are, ADR 0012).
+- No equality-delete application (position deletes: ADR 0014); no field-id
+  column mapping; no snappy/zstd Avro.
 - `try_new` pins the snapshot at registration (`PLIMSOLL_ICEBERG_TABLES`);
   catalog tables are re-resolved per query (ADR 0008).
 
@@ -114,7 +115,7 @@ mapping: `ConnectorError::Iceberg` reaches the server as
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Merge-on-read tables in the wild fail every query | High | Medium | Typed error names the manifest; delete-file support is the next correctness item |
+| Merge-on-read tables in the wild fail every query | High | Medium | Resolved for position deletes by ADR 0014; equality deletes still refused with a typed error |
 | Planning latency on large tables | High | Medium | ADR 0010 (manifest and file pruning) |
 | Spec edge cases misparsed (v1 vs v2 fields) | Medium | High | Interop test against pyiceberg; refuse on missing required fields |
 | Column renamed in a future writer | Medium | High | Name/id mismatch check across all schemas rejects at registration |
@@ -124,7 +125,8 @@ mapping: `ConnectorError::Iceberg` reaches the server as
 - `crates/plimsoll-connectors/tests/iceberg.rs`:
   `reads_only_live_files_of_the_current_snapshot` (orphan and status-2 files
   ignored; asserts `AccountedExec: IcebergScan[t]`),
-  `delete_files_fail_instead_of_returning_deleted_rows`,
+  `equality_deletes_fail_instead_of_returning_deleted_rows` (position deletes:
+  ADR 0014),
   `renamed_columns_are_rejected_at_registration`, `empty_table_has_no_rows`,
   `read_path_runs_under_the_ceiling` (512-byte ceiling → `ResourcesExhausted`
   naming `Iceberg`, pool back to 0).
@@ -134,7 +136,7 @@ mapping: `ConnectorError::Iceberg` reaches the server as
 
 ## Revisit when
 
-- A target table uses merge-on-read deletes or column renames.
+- A target table uses equality deletes or column renames.
 - Planning time dominates query latency (ADR 0010 is the first answer).
 - An Iceberg crate supports our DataFusion major and reserves through the
   session `MemoryPool`: re-evaluate Option B/C.

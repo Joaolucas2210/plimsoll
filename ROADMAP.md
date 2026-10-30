@@ -36,6 +36,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Scan pruning: manifests by partition summaries, files by column bounds (ADR 0010)
 - [x] Memory at the edges: Postgres streamed + accounted, response JSON accounted, manifests decoded lazily (ADR 0012)
 - [x] Error taxonomy (`code`, `retryable`, `dependency`), `plimsoll_query_errors_total{code}`, dependency failure budgets (ADR 0013)
+- [x] Merge-on-read position deletes, validated against Spark (ADR 0014)
 - [x] Admission: running/queued limits globally, per resource group, per user (RAII slots)
 - [x] Query registry + per-query deadline (queue wait + execution)
 - [x] `system.runtime.queries` schema + snapshot source
@@ -45,9 +46,8 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Row-level deletes (merge-on-read)**: apply position and equality delete
-files during the scan instead of refusing the table (ADR 0007), with delete
-sets accounted in the `CeilingPool`.
+**Equality deletes** (Flink upserts): anti-join with sequence-number
+semantics; then format v3 deletion vectors (ADR 0014).
 
 **One HTTP/TLS stack**: `object_store` uses reqwest 0.12 + ring, the catalog
 reqwest 0.13 + aws-lc-rs. Converge, or record the split as accepted (ADR 0009).

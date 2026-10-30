@@ -77,8 +77,9 @@ Option C:
   `month`, `day`, `hour`): `col < v` becomes `T(col) <= T(v)`, kept strict
   only when `v` is the first instant of its bucket (so `ts < '2024-01-02'`
   prunes exactly). `bucket`, `truncate` and `void` never prune. Delete
-  manifests are always read, so the "delete files are unsupported" refusal of
-  ADR 0007 can never be pruned away.
+  manifests are pruned the same way since ADR 0014 (a position delete shares
+  its data file's partition); before that they were always read so the
+  refusal of ADR 0007 could not be pruned away.
 - **File level.** Each entry's `lower_bounds` / `upper_bounds` (truncated
   bounds are valid by spec: lower ≤ min, upper ≥ max) are compared; missing or
   malformed bounds keep the file.

@@ -21,6 +21,7 @@ are allowed in place.
 | [0011](0011-ci-cost-and-build-reuse.md) | CI cost: one build, one job, one cache | Accepted | 2026-10-30 | Single job building once with `--workspace`; live tests reuse the build; shared main-only cache; docs-only pushes skip CI | 0001, 0007, 0010 |
 | [0012](0012-memory-at-the-edges.md) | Memory at the edges: connectors, planning and the response | Accepted | 2026-10-30 | Postgres streams in accounted batches; results keep their reservation through JSON serialization; manifests decode lazily under reservation | 0003, 0004, 0006, 0007, 0010 |
 | [0013](0013-error-taxonomy-and-failure-budgets.md) | Error taxonomy and dependency failure budgets | Accepted | 2026-10-30 | Errors classified at the source into `invalid_query`/`memory_limit_exceeded`/`unsupported_feature`/`invalid_table`/`dependency_failed`/`internal` with `retryable`; dependencies fail in seconds, not at the query timeout | 0004, 0005, 0007, 0008, 0009, 0012 |
+| [0014](0014-merge-on-read-position-deletes.md) | Merge-on-read: position deletes as Parquet row selections | Accepted | 2026-10-30 | Position delete files become `ParquetRowSelection`s so deleted rows are never decoded; seq-number rule, reserved positions; equality deletes refused; Spark interop workflow | 0007, 0010, 0011, 0012, 0013 |
 
 ## Reading order
 

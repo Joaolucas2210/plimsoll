@@ -1,0 +1,49 @@
+name: interop
+
+# Spark merge-on-read interop (ADR 0014). Heavy (Spark image + JVM), so it runs
+# only when the Iceberg reader changes, weekly, or on demand (ADR 0011).
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/plimsoll-connectors/src/iceberg*/**"
+      - "crates/plimsoll-connectors/src/iceberg.rs"
+      - "scripts/spark_mor_fixture.sh"
+      - ".github/workflows/interop.yml"
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: interop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  spark-mor:
+    name: Spark merge-on-read
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: write the table with Spark (background)
+        run: nohup scripts/spark_mor_fixture.sh "$RUNNER_TEMP/wh" > "$RUNNER_TEMP/mor.env" 2> "$RUNNER_TEMP/mor.err" &
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: plimsoll
+          save-if: false
+      - run: cargo test --workspace --no-run
+      - name: wait for Spark
+        run: |
+          for i in $(seq 1 180); do grep -q PLIMSOLL_ "$RUNNER_TEMP/mor.env" 2>/dev/null && break; sleep 2; done
+          cat "$RUNNER_TEMP/mor.err" >&2 || true
+          cat "$RUNNER_TEMP/mor.env" >> "$GITHUB_ENV"
+      - run: |
+          test -n "$PLIMSOLL_ICEBERG_MOR"
+          cargo test --workspace -- --ignored reads_a_spark_merge_on_read_table
