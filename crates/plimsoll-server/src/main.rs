@@ -83,6 +83,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ready: AtomicBool::new(false),
         started: Instant::now(),
         errors: Default::default(),
+        latency: Default::default(),
     });
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;

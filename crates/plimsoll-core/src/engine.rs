@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::MemorySchemaProvider;
@@ -30,6 +31,11 @@ pub const MEDALLION: [&str; 3] = ["bronze", "silver", "gold"];
 pub struct QueryResult {
     pub batches: Vec<RecordBatch>,
     pub memory: Reservation,
+    /// SQL text -> physical plan (parse, analyze, optimize, subquery
+    /// pre-evaluation, connector planning such as Iceberg manifests/deletes).
+    pub planning: Duration,
+    /// Physical plan -> all batches collected.
+    pub execution: Duration,
 }
 
 impl std::fmt::Debug for QueryResult {
@@ -87,10 +93,12 @@ impl Engine {
     /// Runs one statement. Dropping the returned future cancels execution
     /// (the stream and its reservations are dropped with it).
     pub async fn sql(&self, sql: &str) -> Result<QueryResult> {
+        let started = Instant::now();
         let df = self.ctx.sql(sql).await?;
         let (state, plan) = df.into_parts();
         let plan = preevaluate_scalar_subqueries(&state, plan).await?;
         let physical = state.create_physical_plan(&plan).await?;
+        let planning = started.elapsed();
 
         let mut output = self.pool.register("query-output", ConsumerKind::Output);
         let mut stream = execute_stream(physical.clone(), self.ctx.task_ctx())?;
@@ -112,6 +120,8 @@ impl Engine {
         Ok(QueryResult {
             batches,
             memory: output,
+            planning,
+            execution: started.elapsed() - planning,
         })
     }
 }

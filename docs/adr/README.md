@@ -26,6 +26,7 @@ are allowed in place.
 | [0016](0016-equality-deletes.md) | Merge-on-read: equality deletes as grouped hash anti-joins | Accepted | 2026-10-30 | Files grouped by the equality delete sets that apply (strict seq, same partition or global); each group anti-joins the keys with null = null; reference-writer interop | 0007, 0010, 0011, 0012, 0013, 0014 |
 | [0017](0017-format-v3-deletion-vectors.md) | Format v3: deletion vectors, and what v3 must not silently change | Accepted | 2026-10-30 | Accept v3; DV blobs read by range, length/magic/CRC verified, Roaring decoded with `roaring`, applied as row selections; refuse column defaults and encryption | 0007, 0013, 0014, 0016 |
 | [0018](0018-caches-under-the-ceiling.md) | Caches under the ceiling, and a delete-file cache | Accepted | 2026-10-30 | DataFusion caches sized to a `CeilingPool` cache reserve queries never get; listing cache off (stale directories); decoded delete files cached by immutable path | 0003, 0012, 0014, 0016, 0017 |
+| [0019](0019-query-latency-histograms.md) | Query latency histograms by phase | Accepted | 2026-10-30 | `plimsoll_query_duration_seconds{phase}` (queue, planning, execution, serialization, total) as hand-rolled fixed-bucket atomic histograms; no metrics crate | 0004, 0013, 0018 |
 
 ## Reading order
 

@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::engine::{EngineError, QueryEngine, QueryOutput};
-use crate::metrics::{self, PoolStatsProvider};
+use crate::metrics::{self, Latency, PoolStatsProvider};
 use futures::StreamExt;
 
 pub struct AppState {
@@ -30,6 +30,7 @@ pub struct AppState {
     pub started: Instant,
     /// `/v1/sql` errors by `code`, for `plimsoll_query_errors_total`.
     pub errors: ErrorCounts,
+    pub latency: Latency,
 }
 
 #[derive(Default)]
@@ -98,6 +99,7 @@ async fn metrics_handler(State(st): State<Arc<AppState>>) -> Response {
         queued,
         st.admission.registry().totals(),
         &st.errors.snapshot(),
+        &st.latency,
     );
     ([(header::CONTENT_TYPE, metrics::CONTENT_TYPE)], body).into_response()
 }
@@ -236,17 +238,28 @@ async fn sql(
     };
     let sql_text = request.sql.clone();
     let assigned = AtomicU64::new(0);
+    let arrived = Instant::now();
     let result = st
         .admission
         .execute(request, st.query_timeout, |id| {
             assigned.store(id, Ordering::Relaxed);
+            // Called once a slot is granted: everything before was queueing.
+            st.latency.queue.observe(arrived.elapsed());
             st.engine.execute(&sql_text)
         })
         .await;
     let query_id = Some(assigned.load(Ordering::Relaxed)).filter(|id| *id != 0);
+    if query_id.is_some() {
+        st.latency.total.observe(arrived.elapsed());
+    }
 
     match result {
-        Ok(out) => json_body(query_id, out),
+        Ok(out) => {
+            st.latency.planning.observe(out.phases.planning);
+            st.latency.execution.observe(out.phases.execution);
+            st.latency.serialization.observe(out.phases.serialization);
+            json_body(query_id, out)
+        }
         Err(e) => ApiError::of(&e).respond(&st, &e, query_id),
     }
 }
@@ -303,6 +316,7 @@ mod tests {
             ready: AtomicBool::new(true),
             started: Instant::now(),
             errors: ErrorCounts::default(),
+            latency: Latency::default(),
         })
     }
 
@@ -456,6 +470,29 @@ mod tests {
         for (body, status, code) in cases {
             let (got, text) = call(router(default_state()), sql_req(body)).await;
             assert_eq!((got, error_code(&text).as_str()), (status, code), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn latency_histograms_split_by_phase() {
+        let st = default_state();
+        for sql in ["select 1", "s3 down"] {
+            call(
+                router(st.clone()),
+                sql_req(json!({"sql": sql, "user": "ana"})),
+            )
+            .await;
+        }
+        let (_, m) = call(router(st), get_req("/metrics")).await;
+        // Both reached the engine; only the success has plan/execute/serialize.
+        for line in [
+            "plimsoll_query_duration_seconds_count{phase=\"queue\"} 2",
+            "plimsoll_query_duration_seconds_count{phase=\"total\"} 2",
+            "plimsoll_query_duration_seconds_count{phase=\"planning\"} 1",
+            "plimsoll_query_duration_seconds_count{phase=\"serialization\"} 1",
+            "plimsoll_query_duration_seconds_bucket{phase=\"total\",le=\"+Inf\"} 2",
+        ] {
+            assert!(m.contains(line), "missing {line}\n{m}");
         }
     }
 

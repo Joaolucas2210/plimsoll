@@ -5,6 +5,7 @@
 //! every call in `app.rs`.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use plimsoll_connectors::ConnectorError;
@@ -24,6 +25,16 @@ pub struct QueryOutput {
     pub columns: Vec<String>,
     pub rows_json: Vec<u8>,
     pub memory: Option<Reservation>,
+    pub phases: Phases,
+}
+
+/// Where a successful query spent its time (the admission queue is timed by
+/// the handler).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Phases {
+    pub planning: Duration,
+    pub execution: Duration,
+    pub serialization: Duration,
 }
 
 impl QueryOutput {
@@ -33,6 +44,7 @@ impl QueryOutput {
             columns,
             rows_json: serde_json::to_vec(rows).unwrap_or_else(|_| b"[]".to_vec()),
             memory: None,
+            phases: Phases::default(),
         }
     }
 }
@@ -74,7 +86,10 @@ impl QueryEngine for CoreEngine {
         let QueryResult {
             batches,
             mut memory,
+            planning,
+            execution,
         } = self.0.sql(sql).await.map_err(|e| classify(&e))?;
+        let serializing = Instant::now();
         let columns: Vec<String> = batches
             .first()
             .map(|b| {
@@ -122,6 +137,11 @@ impl QueryEngine for CoreEngine {
             columns,
             rows_json,
             memory: Some(memory),
+            phases: Phases {
+                planning,
+                execution,
+                serialization: serializing.elapsed(),
+            },
         })
     }
 }
