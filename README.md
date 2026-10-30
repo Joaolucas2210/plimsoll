@@ -93,7 +93,8 @@ curl -s localhost:8080/metrics
 ```
 
 Time travel on catalog tables: `SELECT * FROM bronze."trips@<snapshot-id>"`
-or `bronze."trips@2024-05-01T00:00:00Z"` (ADR 0028).
+or `bronze."trips@2024-05-01T00:00:00Z"` (ADR 0028), or a branch/tag:
+`bronze."trips@audit"` (ADR 0029).
 
 Local experiments without tokens: `PLIMSOLL_AUTH=disabled` (then `user` is
 read from the request body and trusted as sent).

@@ -36,12 +36,13 @@ are allowed in place.
 | [0026](0026-shutdown-drain.md) | Shutdown drain: unadvertise, keep serving, then close | Accepted | 2026-10-30 | Readiness and serving are separate flags; SIGTERM turns `/readyz` 503 but serves queries for `PLIMSOLL_DRAIN_DELAY_MS` (5 s) before closing; ctrl-c closes at once | 0004, 0013 |
 | [0027](0027-structured-logs.md) | Structured JSON logs | Accepted | 2026-10-30 | One JSON object per line on stderr; a `query` event for every `/v1/sql` outcome with identity, code, phase timings and a SQL fingerprint (never the text); no logging crate | 0004, 0013, 0019, 0021 |
 | [0028](0028-iceberg-time-travel.md) | Iceberg time travel by table-name suffix | Accepted | 2026-10-30 | `bronze."trips@<snapshot-id>"` or `@<RFC 3339>` pins the snapshot (and its schema) by rewriting metadata before planning; instants resolve via `snapshot-log`; the reference stays in its schema so grants apply | 0007, 0010, 0022, 0025 |
+| [0029](0029-iceberg-refs.md) | Iceberg branches and tags in time travel | Accepted | 2026-10-30 | `"table@<ref>"` resolves through metadata `refs` after snapshot ids and instants; unknown specs fall back to a whole-name lookup | 0028, 0025 |
 
 ## Reading order
 
 - Invariant first: 0003 (memory, with 0012 and 0018), 0005 (correctness).
 - Shape of the system: 0001, 0002, 0004.
-- Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028.
+- Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029.
 - Federation: 0005 → 0006.
 
 ## Conventions

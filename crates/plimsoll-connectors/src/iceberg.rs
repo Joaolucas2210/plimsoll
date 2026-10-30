@@ -108,6 +108,12 @@ pub fn at(metadata: &Json, as_of: AsOf) -> Result<Json, String> {
     Ok(pinned)
 }
 
+/// The snapshot a branch or tag (`refs`) points at (ADR 0029). A branch's
+/// head is its latest snapshot; a tag is fixed.
+pub fn ref_snapshot(metadata: &Json, name: &str) -> Option<i64> {
+    metadata["refs"][name]["snapshot-id"].as_i64()
+}
+
 #[derive(Debug)]
 pub struct IcebergConnector {
     name: String,

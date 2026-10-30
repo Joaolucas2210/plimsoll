@@ -874,6 +874,14 @@ async fn time_travels_a_spark_table() {
     assert_eq!(totals(AsOf::Snapshot(id(second))).await, (32, 768));
     let ts = first["timestamp-ms"].as_i64().unwrap();
     assert_eq!(totals(AsOf::TimestampMs(ts)).await, (48, 1128));
+    // Refs (ADR 0029): the tag on the insert, and a branch holding one extra
+    // row (id 1000) that main never saw.
+    let tag = plimsoll_connectors::iceberg::ref_snapshot(&meta, "after_insert").unwrap();
+    assert_eq!(totals(AsOf::Snapshot(tag)).await, (48, 1128));
+    let audit = plimsoll_connectors::iceberg::ref_snapshot(&meta, "audit").unwrap();
+    assert_eq!(totals(AsOf::Snapshot(audit)).await, (49, 2128));
+    let main = plimsoll_connectors::iceberg::ref_snapshot(&meta, "main").unwrap();
+    assert_eq!(totals(AsOf::Snapshot(main)).await, (32, 768));
     // Before the first snapshot there is nothing to read.
     assert!(at(&meta, AsOf::TimestampMs(ts - 1)).is_err());
 }

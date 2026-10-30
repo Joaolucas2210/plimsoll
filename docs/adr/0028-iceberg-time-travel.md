@@ -98,7 +98,7 @@ one query.
 **Negative (accepted debt)**
 - Quoted identifiers: `bronze."trips@123"`. Less ergonomic than
   `FOR SYSTEM_TIME AS OF`.
-- No branches or tags by name yet (`refs`). That is the next ROADMAP item.
+- No branches or tags by name yet (`refs`); added by ADR 0029.
 - Expired snapshots are gone. An instant whose snapshot was expired
   resolves to "snapshot not found".
 - Env-registered tables do not support it.

@@ -4,16 +4,16 @@
 //! `loadTable` on *every* query, so new commits are visible without a
 //! restart and a dropped table disappears. Read-only: DDL goes to the catalog.
 //!
-//! Time travel (ADR 0028): `bronze."trips@<snapshot-id>"` or
-//! `bronze."trips@2024-05-01T00:00:00Z"` reads the table as of that snapshot
-//! or instant. The reference stays in its schema, so grants apply unchanged.
+//! Time travel (ADR 0028): `bronze."trips@<snapshot-id>"`,
+//! `bronze."trips@2024-05-01T00:00:00Z"` or, by branch/tag (ADR 0029),
+//! `bronze."trips@audit"` reads the table as of that snapshot. The reference stays in its schema, so grants apply unchanged.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use plimsoll_connectors::iceberg;
 use plimsoll_connectors::{AsOf, Connector, IcebergConnector};
-use plimsoll_control::catalog::{Catalog, CatalogError, Namespace, TableIdent};
+use plimsoll_control::catalog::{Catalog, CatalogError, LoadedTable, Namespace, TableIdent};
 use plimsoll_core::datafusion::catalog::{SchemaProvider, TableProvider};
 use plimsoll_core::datafusion::error::{DataFusionError, Result};
 use plimsoll_core::datafusion::prelude::SessionContext;
@@ -33,6 +33,40 @@ impl std::fmt::Debug for CatalogSchema {
     }
 }
 
+impl CatalogSchema {
+    /// `loadTable` for `name`; `None` when the catalog has no such table.
+    async fn load(&self, name: &str) -> Result<Option<(TableIdent, LoadedTable)>> {
+        let ident = TableIdent::new(self.namespace.clone(), name);
+        match self.catalog.load_table(&ident).await {
+            Ok(t) => Ok(Some((ident, t))),
+            Err(CatalogError::TableNotFound(_)) => Ok(None),
+            Err(e) => Err(DataFusionError::External(Box::new(e))),
+        }
+    }
+
+    /// A provider over `metadata` (possibly pinned) of a loaded table, named
+    /// `schema.name` as queried (the label shows the `@` spec).
+    fn provider(
+        &self,
+        name: &str,
+        (ident, loaded): (TableIdent, LoadedTable),
+        metadata: &serde_json::Value,
+    ) -> Result<Arc<dyn TableProvider>> {
+        let location = loaded.metadata_location.ok_or_else(|| {
+            DataFusionError::Plan(format!("{ident} has no metadata-location (staged table?)"))
+        })?;
+        // Vended credentials (if the catalog sent any) scope this table's
+        // reads; they are fetched fresh with every query.
+        let connector = IcebergConnector::from_metadata(
+            format!("{}.{name}", self.namespace),
+            &location,
+            metadata,
+        )?
+        .with_storage_properties(&loaded.storage)?;
+        Ok(connector.provider())
+    }
+}
+
 #[async_trait]
 impl SchemaProvider for CatalogSchema {
     fn table_names(&self) -> Vec<String> {
@@ -40,37 +74,29 @@ impl SchemaProvider for CatalogSchema {
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        // `table@spec` only when `spec` parses; otherwise `@` is part of a name.
-        let (base, as_of) = match name
-            .rsplit_once('@')
-            .and_then(|(t, spec)| Some((t, AsOf::parse(spec)?)))
-        {
-            Some((t, a)) => (t, Some(a)),
-            None => (name, None),
-        };
-        let ident = TableIdent::new(self.namespace.clone(), base);
-        let loaded = match self.catalog.load_table(&ident).await {
-            Ok(t) => t,
-            Err(CatalogError::TableNotFound(_)) => return Ok(None),
-            Err(e) => return Err(DataFusionError::External(Box::new(e))),
-        };
-        let location = loaded.metadata_location.ok_or_else(|| {
-            DataFusionError::Plan(format!("{ident} has no metadata-location (staged table?)"))
-        })?;
-        // Vended credentials (if the catalog sent any) scope this table's
-        // reads; they are fetched fresh with every query.
-        let metadata = match as_of {
-            None => loaded.metadata,
-            Some(as_of) => iceberg::at(&loaded.metadata, as_of)
-                .map_err(|m| DataFusionError::Plan(format!("{ident}@: {m}")))?,
-        };
-        let connector = IcebergConnector::from_metadata(
-            format!("{}.{name}", self.namespace),
-            &location,
-            &metadata,
-        )?
-        .with_storage_properties(&loaded.storage)?;
-        Ok(Some(connector.provider()))
+        // `table@spec`: a snapshot id, an instant, or a branch/tag of `table`
+        // (ADR 0028/0029). Anything else means `@` is part of the name.
+        if let Some((base, spec)) = name.rsplit_once('@') {
+            if let Some(loaded) = self.load(base).await? {
+                let pinned = match AsOf::parse(spec) {
+                    Some(as_of) => Some(iceberg::at(&loaded.1.metadata, as_of)),
+                    None => iceberg::ref_snapshot(&loaded.1.metadata, spec)
+                        .map(|id| iceberg::at(&loaded.1.metadata, AsOf::Snapshot(id))),
+                };
+                if let Some(pinned) = pinned {
+                    let metadata = pinned
+                        .map_err(|m| DataFusionError::Plan(format!("{}@{spec}: {m}", loaded.0)))?;
+                    return self.provider(name, loaded, &metadata).map(Some);
+                }
+            }
+        }
+        match self.load(name).await? {
+            Some(loaded) => {
+                let metadata = loaded.1.metadata.clone();
+                self.provider(name, loaded, &metadata).map(Some)
+            }
+            None => Ok(None),
+        }
     }
 
     fn table_exist(&self, name: &str) -> bool {
@@ -237,7 +263,9 @@ mod tests {
                    {"snapshot-id": 2, "schema-id": 1, "timestamp-ms": 200, "manifest-list": "file:///l2.avro"}],
                "snapshot-log": [
                    {"snapshot-id": 1, "timestamp-ms": 100},
-                   {"snapshot-id": 2, "timestamp-ms": 200}]})
+                   {"snapshot-id": 2, "timestamp-ms": 200}],
+               "refs": {"main": {"snapshot-id": 2, "type": "branch"},
+                        "v1": {"snapshot-id": 1, "type": "tag"}}})
     }
 
     #[tokio::test]
@@ -277,6 +305,9 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("snapshot 999 not found"), "{err}");
+        // Branches and tags (ADR 0029).
+        assert!(plans("SELECT a FROM silver.\"users@v1\"").await.is_ok());
+        assert!(plans("SELECT b FROM silver.\"users@main\"").await.is_ok());
         // Not a time-travel spec: the whole name is looked up (and missing).
         let err = plans("SELECT * FROM silver.\"users@yesterday\"")
             .await

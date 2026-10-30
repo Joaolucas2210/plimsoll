@@ -39,6 +39,11 @@ try {
     """INSERT INTO local.db.mor SELECT id, concat('n', id),
        timestamp '2024-01-01 00:00:00' + make_interval(0, 0, 0, 0, CAST(id AS INT), 0, 0)
        FROM range(0, 48)""",
+    // Refs (ADR 0029): a tag on the insert, and a branch with a row that
+    // only exists there. Main's history (snapshot-log) is unaffected.
+    "ALTER TABLE local.db.mor CREATE TAG after_insert",
+    "ALTER TABLE local.db.mor CREATE BRANCH audit",
+    "INSERT INTO local.db.mor.branch_audit VALUES (1000, 'audit', timestamp '2024-01-03 00:00:00')",
     "DELETE FROM local.db.mor WHERE id % 3 = 0",
     "UPDATE local.db.mor SET name = 'updated' WHERE id = 1"
   ).foreach(spark.sql)
