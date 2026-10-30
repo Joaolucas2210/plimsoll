@@ -12,7 +12,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::error::DataFusionError;
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use plimsoll_connectors::{Connector, IcebergConnector};
+use plimsoll_connectors::{Connector, ConnectorError, IcebergConnector};
 use plimsoll_core::memory::{CeilingPool, session_context_with_ceiling};
 use serde_json::json;
 
@@ -206,6 +206,13 @@ async fn delete_files_fail_instead_of_returning_deleted_rows() {
     register(&ctx, &dir).await.unwrap();
     let err = ids(&ctx, "SELECT id FROM t").await.unwrap_err();
     assert!(err.to_string().contains("delete files"), "{err}");
+    // Typed at the source so the server can answer 422, not 500 (ADR 0013).
+    let root = err.find_root();
+    assert!(
+        matches!(root, DataFusionError::External(e)
+            if matches!(e.downcast_ref::<ConnectorError>(), Some(ConnectorError::Unsupported(_)))),
+        "{root:?}"
+    );
 }
 
 #[tokio::test]

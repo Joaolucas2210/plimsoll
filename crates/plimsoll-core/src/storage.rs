@@ -15,8 +15,34 @@ use datafusion::execution::object_store::{
     DefaultObjectStoreRegistry, ObjectStoreRegistry, ObjectStoreUrl,
 };
 use datafusion::object_store::ObjectStore;
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
+use object_store::{BackoffConfig, ClientConfigKey, RetryConfig};
+use std::time::Duration;
 use url::Url;
+
+/// S3 builder from `AWS_*` env with Plimsoll's failure budget (ADR 0013).
+///
+/// The `object_store` default retries for up to 3 minutes; with storage down,
+/// every query would then sit until its own timeout holding an admission
+/// slot, turning a storage outage into a node-wide queue. Fail fast instead:
+/// the query gets `dependency_failed` (retryable) in seconds.
+/// ponytail: fixed budget; make it configurable when a deployment needs to
+/// ride out longer storage blips.
+fn s3_builder() -> AmazonS3Builder {
+    AmazonS3Builder::from_env()
+        .with_retry(RetryConfig {
+            backoff: BackoffConfig::default(),
+            max_retries: 3,
+            retry_timeout: Duration::from_secs(10),
+        })
+        // Set individually: replacing `ClientOptions` wholesale would drop
+        // what `from_env` read (e.g. `AWS_ALLOW_HTTP`).
+        .with_config(
+            AmazonS3ConfigKey::Client(ClientConfigKey::ConnectTimeout),
+            "3s",
+        )
+        .with_config(AmazonS3ConfigKey::Client(ClientConfigKey::Timeout), "30s")
+}
 
 #[derive(Debug, Default)]
 pub struct LazyObjectStores {
@@ -38,7 +64,7 @@ impl ObjectStoreRegistry for LazyObjectStores {
         }
         let store: Arc<dyn ObjectStore> = match url.scheme() {
             "s3" | "s3a" => Arc::new(
-                AmazonS3Builder::from_env()
+                s3_builder()
                     .with_url(url.as_str())
                     .build()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?,
@@ -92,7 +118,7 @@ pub fn scoped_s3_store(
         return Ok(None);
     }
     let bucket = url.host_str().unwrap_or_default();
-    let mut builder = AmazonS3Builder::from_env()
+    let mut builder = s3_builder()
         .with_bucket_name(bucket)
         .with_access_key_id(key_id);
     if let Some(v) = props.get("s3.secret-access-key") {
@@ -155,6 +181,19 @@ mod tests {
             reg.get_store(&Url::parse("gs://bucket/x").unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn failure_budget_keeps_env_settings() {
+        // Regression: replacing ClientOptions dropped AWS_ALLOW_HTTP.
+        let b = s3_builder().with_config(
+            AmazonS3ConfigKey::Client(ClientConfigKey::AllowHttp),
+            "true",
+        );
+        let get = |k| b.get_config_value(&AmazonS3ConfigKey::Client(k));
+        assert_eq!(get(ClientConfigKey::AllowHttp).as_deref(), Some("true"));
+        assert_eq!(get(ClientConfigKey::ConnectTimeout).as_deref(), Some("3s"));
+        assert_eq!(get(ClientConfigKey::Timeout).as_deref(), Some("30s"));
     }
 
     #[test]

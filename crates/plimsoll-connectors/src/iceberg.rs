@@ -624,9 +624,9 @@ fn long_field(record: &Avro, name: &str) -> Option<i64> {
 }
 
 fn invalid(path: &str, e: impl ToString) -> ConnectorError {
-    ConnectorError::Iceberg(format!("invalid metadata at {path}: {}", e.to_string()))
+    ConnectorError::InvalidMetadata(format!("{path}: {}", e.to_string()))
 }
 
 fn unsupported(path: &str, what: String) -> ConnectorError {
-    ConnectorError::Iceberg(format!("unsupported at {path}: {what}"))
+    ConnectorError::Unsupported(format!("iceberg {what} ({path})"))
 }

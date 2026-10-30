@@ -1,8 +1,9 @@
 //! HTTP routes. Every handler is a thin translation layer: governance lives
 //! in `plimsoll-control`, execution behind [`QueryEngine`].
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
@@ -27,6 +28,29 @@ pub struct AppState {
     /// False while starting and while draining after SIGTERM.
     pub ready: AtomicBool,
     pub started: Instant,
+    /// `/v1/sql` errors by `code`, for `plimsoll_query_errors_total`.
+    pub errors: ErrorCounts,
+}
+
+#[derive(Default)]
+pub struct ErrorCounts(Mutex<BTreeMap<&'static str, u64>>);
+
+impl ErrorCounts {
+    fn inc(&self, code: &'static str) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(code)
+            .or_default() += 1;
+    }
+
+    pub fn snapshot(&self) -> BTreeMap<&'static str, u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -73,6 +97,7 @@ async fn metrics_handler(State(st): State<Arc<AppState>>) -> Response {
         running,
         queued,
         st.admission.registry().totals(),
+        &st.errors.snapshot(),
     );
     ([(header::CONTENT_TYPE, metrics::CONTENT_TYPE)], body).into_response()
 }
@@ -108,15 +133,70 @@ pub struct SqlRequest {
     pub resource_group: Option<String>,
 }
 
-fn error(
+/// Error contract (ADR 0013): `code` is stable and machine-readable;
+/// `retryable` says whether the same request may succeed later unchanged.
+struct ApiError {
     status: StatusCode,
-    code: &str,
-    message: impl ToString,
-    query_id: Option<u64>,
-) -> Response {
-    let body =
-        json!({ "error": { "code": code, "message": message.to_string(), "query_id": query_id } });
-    (status, Json(body)).into_response()
+    code: &'static str,
+    retryable: bool,
+    dependency: Option<&'static str>,
+}
+
+impl ApiError {
+    const fn new(status: StatusCode, code: &'static str, retryable: bool) -> Self {
+        Self {
+            status,
+            code,
+            retryable,
+            dependency: None,
+        }
+    }
+
+    fn of(e: &GovernedError<EngineError>) -> Self {
+        use StatusCode as S;
+        match e {
+            GovernedError::Rejected(AdmissionError::QueueFull { .. }) => {
+                Self::new(S::TOO_MANY_REQUESTS, "queue_full", true)
+            }
+            GovernedError::Rejected(AdmissionError::Closed) => {
+                Self::new(S::SERVICE_UNAVAILABLE, "not_ready", true)
+            }
+            GovernedError::TimedOut(_) => Self::new(S::GATEWAY_TIMEOUT, "query_timeout", true),
+            GovernedError::Failed(e) => match e {
+                EngineError::InvalidQuery(_) => Self::new(S::BAD_REQUEST, "invalid_query", false),
+                // 4xx: the node is healthy; retrying unchanged will not help.
+                EngineError::MemoryLimitExceeded(_) => {
+                    Self::new(S::UNPROCESSABLE_ENTITY, "memory_limit_exceeded", false)
+                }
+                EngineError::Unsupported(_) => {
+                    Self::new(S::UNPROCESSABLE_ENTITY, "unsupported_feature", false)
+                }
+                EngineError::InvalidTable(_) => {
+                    Self::new(S::UNPROCESSABLE_ENTITY, "invalid_table", false)
+                }
+                // 502: an upstream failed, not this node.
+                EngineError::Dependency { dependency, .. } => Self {
+                    dependency: Some(dependency),
+                    ..Self::new(S::BAD_GATEWAY, "dependency_failed", true)
+                },
+                EngineError::Internal(_) => Self::new(S::INTERNAL_SERVER_ERROR, "internal", false),
+            },
+        }
+    }
+
+    fn respond(self, st: &AppState, message: impl ToString, query_id: Option<u64>) -> Response {
+        st.errors.inc(self.code);
+        let mut body = json!({
+            "code": self.code,
+            "message": message.to_string(),
+            "retryable": self.retryable,
+            "query_id": query_id,
+        });
+        if let Some(d) = self.dependency {
+            body["dependency"] = json!(d);
+        }
+        (self.status, Json(json!({ "error": body }))).into_response()
+    }
 }
 
 async fn sql(
@@ -124,9 +204,8 @@ async fn sql(
     body: Result<Json<SqlRequest>, JsonRejection>,
 ) -> Response {
     if !st.ready.load(Ordering::Relaxed) {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "not_ready",
+        return ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "not_ready", true).respond(
+            &st,
             "server is not accepting queries",
             None,
         );
@@ -134,18 +213,16 @@ async fn sql(
     let req = match body {
         Ok(Json(r)) => r,
         Err(e) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request",
+            return ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", false).respond(
+                &st,
                 e.body_text(),
                 None,
             );
         }
     };
     if req.sql.trim().is_empty() || req.user.trim().is_empty() {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
+        return ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", false).respond(
+            &st,
             "`sql` and `user` must be non-empty",
             None,
         );
@@ -170,30 +247,7 @@ async fn sql(
 
     match result {
         Ok(out) => json_body(query_id, out),
-        Err(e) => {
-            let (status, code) = match &e {
-                GovernedError::Rejected(AdmissionError::QueueFull { .. }) => {
-                    (StatusCode::TOO_MANY_REQUESTS, "queue_full")
-                }
-                GovernedError::Rejected(AdmissionError::Closed) => {
-                    (StatusCode::SERVICE_UNAVAILABLE, "not_ready")
-                }
-                GovernedError::TimedOut(_) => (StatusCode::GATEWAY_TIMEOUT, "query_timeout"),
-                GovernedError::Failed(EngineError::InvalidQuery(_)) => {
-                    (StatusCode::BAD_REQUEST, "invalid_query")
-                }
-                // 422: the request is valid but cannot complete under the load
-                // line; retrying unchanged will not help. 5xx would wrongly
-                // suggest the node is unhealthy.
-                GovernedError::Failed(EngineError::MemoryLimitExceeded(_)) => {
-                    (StatusCode::UNPROCESSABLE_ENTITY, "memory_limit_exceeded")
-                }
-                GovernedError::Failed(EngineError::Internal(_)) => {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "internal")
-                }
-            };
-            error(status, code, e, query_id)
-        }
+        Err(e) => ApiError::of(&e).respond(&st, &e, query_id),
     }
 }
 
@@ -216,6 +270,11 @@ mod tests {
             match sql {
                 "select 1" => Ok(QueryOutput::from_rows(vec!["x".into()], &[vec![json!(1)]])),
                 "oom" => Err(EngineError::MemoryLimitExceeded("needed 2GiB".into())),
+                "deletes" => Err(EngineError::Unsupported("delete files".into())),
+                "s3 down" => Err(EngineError::Dependency {
+                    dependency: "object_store",
+                    message: "connection refused".into(),
+                }),
                 "slow" => {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     Err(EngineError::Internal("unreachable".into()))
@@ -242,6 +301,7 @@ mod tests {
             query_timeout: timeout,
             ready: AtomicBool::new(true),
             started: Instant::now(),
+            errors: ErrorCounts::default(),
         })
     }
 
@@ -396,6 +456,51 @@ mod tests {
             let (got, text) = call(router(default_state()), sql_req(body)).await;
             assert_eq!((got, error_code(&text).as_str()), (status, code), "{text}");
         }
+    }
+
+    #[tokio::test]
+    async fn error_contract_carries_class_retryability_and_metrics() {
+        let st = default_state();
+        let cases = [
+            (
+                "deletes",
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_feature",
+                false,
+            ),
+            (
+                "s3 down",
+                StatusCode::BAD_GATEWAY,
+                "dependency_failed",
+                true,
+            ),
+        ];
+        for (sql, status, code, retryable) in cases {
+            let (got, body) = call(
+                router(st.clone()),
+                sql_req(json!({"sql": sql, "user": "ana"})),
+            )
+            .await;
+            assert_eq!(got, status, "{body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["error"]["code"], code);
+            assert_eq!(v["error"]["retryable"], retryable);
+        }
+        let (_, body) = call(
+            router(st.clone()),
+            sql_req(json!({"sql": "s3 down", "user": "ana"})),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["dependency"], "object_store");
+
+        let req = Request::get("/metrics").body(Body::empty()).unwrap();
+        let (_, metrics) = call(router(st), req).await;
+        assert!(
+            metrics.contains("plimsoll_query_errors_total{code=\"dependency_failed\"} 2"),
+            "{metrics}"
+        );
+        assert!(metrics.contains("plimsoll_query_errors_total{code=\"unsupported_feature\"} 1"));
     }
 
     #[tokio::test]

@@ -76,6 +76,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         query_timeout: cfg.query_timeout,
         ready: AtomicBool::new(false),
         started: Instant::now(),
+        errors: Default::default(),
     });
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;

@@ -5,6 +5,7 @@
 //! in sync. Upgrade path: `prometheus-client` once histograms (query latency)
 //! are needed, or OTLP export (see ROADMAP).
 
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -23,7 +24,13 @@ pub type PoolStatsProvider = Arc<dyn Fn() -> PoolStats + Send + Sync>;
 
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-pub fn render(pool: PoolStats, running: usize, queued: usize, totals: QueryTotals) -> String {
+pub fn render(
+    pool: PoolStats,
+    running: usize,
+    queued: usize,
+    totals: QueryTotals,
+    errors: &BTreeMap<&'static str, u64>,
+) -> String {
     let mut out = String::new();
     let mut metric = |name: &str, kind: &str, help: &str, samples: &[(&str, u64)]| {
         // Writing to a String cannot fail.
@@ -72,6 +79,19 @@ pub fn render(pool: PoolStats, running: usize, queued: usize, totals: QueryTotal
             ("{state=\"cancelled\"}", totals.cancelled),
         ],
     );
+    let by_code: Vec<(String, u64)> = errors
+        .iter()
+        .map(|(code, n)| (format!("{{code=\"{code}\"}}"), *n))
+        .collect();
+    metric(
+        "plimsoll_query_errors_total",
+        "counter",
+        "SQL endpoint errors by code (ADR 0013).",
+        &by_code
+            .iter()
+            .map(|(l, n)| (l.as_str(), *n))
+            .collect::<Vec<_>>(),
+    );
     out
 }
 
@@ -91,7 +111,8 @@ mod tests {
             failed: 1,
             cancelled: 0,
         };
-        let text = render(pool, 2, 1, totals);
+        let errors = BTreeMap::from([("dependency_failed", 2), ("unsupported_feature", 1)]);
+        let text = render(pool, 2, 1, totals, &errors);
         for line in [
             "plimsoll_pool_used_bytes 10",
             "plimsoll_pool_limit_bytes 100",
@@ -100,6 +121,8 @@ mod tests {
             "plimsoll_queries_queued 1",
             "plimsoll_queries_total{state=\"finished\"} 4",
             "# TYPE plimsoll_queries_total counter",
+            "plimsoll_query_errors_total{code=\"dependency_failed\"} 2",
+            "plimsoll_query_errors_total{code=\"unsupported_feature\"} 1",
         ] {
             assert!(text.lines().any(|l| l == line), "missing {line}\n{text}");
         }

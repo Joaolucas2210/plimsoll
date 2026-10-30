@@ -16,7 +16,11 @@ use crate::catalog::{
     Catalog, CatalogAuth, CatalogConfig, CatalogError, LoadedTable, Namespace, TableIdent, encode,
 };
 
-const TIMEOUT: Duration = Duration::from_secs(30);
+/// `loadTable` sits on every query's planning path (ADR 0008): a catalog
+/// outage must fail the query in seconds, not hold its admission slot until
+/// the query timeout (ADR 0013).
+const TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct RestCatalog {
     http: Client,
@@ -35,6 +39,7 @@ impl RestCatalog {
     pub async fn connect(cfg: CatalogConfig) -> Result<Self, CatalogError> {
         let http = Client::builder()
             .timeout(TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|e| CatalogError::Http(e.to_string()))?;
         let mut catalog = Self {

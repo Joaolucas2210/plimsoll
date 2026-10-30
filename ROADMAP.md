@@ -35,6 +35,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Catalog-vended storage credentials, scoped per table (ADR 0009)
 - [x] Scan pruning: manifests by partition summaries, files by column bounds (ADR 0010)
 - [x] Memory at the edges: Postgres streamed + accounted, response JSON accounted, manifests decoded lazily (ADR 0012)
+- [x] Error taxonomy (`code`, `retryable`, `dependency`), `plimsoll_query_errors_total{code}`, dependency failure budgets (ADR 0013)
 - [x] Admission: running/queued limits globally, per resource group, per user (RAII slots)
 - [x] Query registry + per-query deadline (queue wait + execution)
 - [x] `system.runtime.queries` schema + snapshot source
@@ -43,10 +44,6 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Wire pool/spill metrics to the live `CeilingPool`
 
 ## Next obvious PR
-
-**Error taxonomy**: "unsupported table feature" (e.g. delete files) and
-"dependency down" (catalog, object store) are typed and mapped to distinct
-HTTP codes instead of `500 internal`, so on-call can tell them from node bugs.
 
 **Row-level deletes (merge-on-read)**: apply position and equality delete
 files during the scan instead of refusing the table (ADR 0007), with delete

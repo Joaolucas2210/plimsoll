@@ -38,20 +38,47 @@ pub trait Connector: Send + Sync {
     }
 }
 
+/// Variants are classified at the source (ADR 0013): the server maps them to
+/// distinct HTTP codes without knowing driver internals.
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectorError {
     #[error("environment variable {0} is not set")]
     MissingEnv(&'static str),
+    /// A table uses something Plimsoll does not read yet (delete files,
+    /// nested types, a Postgres type, ...). Not a node fault.
     #[error("column {column:?} has unsupported Postgres type {pg_type}")]
     UnsupportedType { column: String, pg_type: String },
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+    /// The table's own metadata is malformed or inconsistent.
+    #[error("invalid table metadata: {0}")]
+    InvalidMetadata(String),
+    /// Postgres unreachable, refusing the login or out of resources
+    /// (SQLSTATE classes 08, 28, 53, 57, or no server response).
+    #[error("postgres unavailable: {0}")]
+    PostgresUnavailable(tokio_postgres::Error),
+    /// Postgres rejected the statement: most likely a Plimsoll bug.
     #[error("postgres: {0}")]
-    Postgres(#[from] tokio_postgres::Error),
+    Postgres(tokio_postgres::Error),
     #[error("arrow: {0}")]
     Arrow(#[from] datafusion::arrow::error::ArrowError),
-    #[error("iceberg: {0}")]
-    Iceberg(String),
     #[error(transparent)]
     DataFusion(#[from] DataFusionError),
+}
+
+impl From<tokio_postgres::Error> for ConnectorError {
+    fn from(e: tokio_postgres::Error) -> Self {
+        let unavailable = match e.as_db_error() {
+            Some(db) => matches!(&db.code().code()[..2], "08" | "28" | "53" | "57"),
+            // No SQLSTATE: I/O, closed connection, timeout.
+            None => true,
+        };
+        if unavailable {
+            Self::PostgresUnavailable(e)
+        } else {
+            Self::Postgres(e)
+        }
+    }
 }
 
 impl From<ConnectorError> for DataFusionError {

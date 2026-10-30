@@ -149,7 +149,18 @@ mod tests {
             engine.sql("SELECT count(*) FROM bronze.trips").await
         };
         let plain = Arc::new(RestCatalog::connect(cfg.clone()).await.unwrap());
-        assert!(run(plain).await.is_err(), "env credentials are wrong");
+        let err = run(plain).await.unwrap_err();
+        // Wrong storage credentials are the object store's refusal, not a bug.
+        assert!(
+            matches!(
+                crate::engine::classify(&err),
+                crate::engine::EngineError::Dependency {
+                    dependency: "object_store",
+                    ..
+                }
+            ),
+            "{err}"
+        );
         let vending = Vending(
             RestCatalog::connect(cfg).await.unwrap(),
             key.to_owned(),

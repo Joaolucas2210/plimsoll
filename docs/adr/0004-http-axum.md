@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-10-29
 - Owner: JoaoLucas2210
-- Related: ADR 0001, ADR 0002, ADR 0003, ADR 0008
+- Related: ADR 0013 (error taxonomy), ADR 0001, ADR 0002, ADR 0003, ADR 0008
 - Scope: `plimsoll-server` (`app.rs`, `main.rs`, `metrics.rs`)
 
 ## Context
@@ -54,11 +54,12 @@ Six series rendered from values read at scrape time (`metrics::render`) vs
   dependencies), `GET /readyz` (200/503 from `AppState::ready`),
   `GET /healthz` (JSON: readiness, uptime, running/queued, pool bytes),
   `GET /metrics`, `POST /v1/sql` (`{sql, user, resource_group?}`).
-- Error contract for `/v1/sql`: `{"error": {"code", "message", "query_id"}}`
-  with `400 invalid_request` / `400 invalid_query`, `422
-  memory_limit_exceeded`, `429 queue_full`, `503 not_ready`, `504
-  query_timeout`, `500 internal`. 422 is deliberate: the request is valid but
-  cannot complete under the ceiling; a 5xx would signal an unhealthy node.
+- Error contract for `/v1/sql`: `{"error": {"code", "message", "retryable",
+  "query_id", "dependency"?}}`. The full class table (400 / 422 / 429 / 502 /
+  503 / 504 / 500) and the rule "only `internal` means Plimsoll is wrong" are
+  in ADR 0013, which refines this ADR. 422 is deliberate for requests that are
+  valid but cannot complete (ceiling, unsupported or broken table); a 5xx
+  would signal an unhealthy node.
 - Shutdown: SIGTERM or ctrl-c flips `ready` to false, the listener stops
   accepting, in-flight requests finish.
 - Metrics (`text/plain; version=0.0.4`): `plimsoll_pool_used_bytes`,
