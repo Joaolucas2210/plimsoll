@@ -54,8 +54,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v6
-      - run: uv run scripts/iceberg_fixture.py "$RUNNER_TEMP/wh" | tail -1 >> "$GITHUB_ENV"
-      - run: cargo test -p plimsoll-connectors --test iceberg -- --ignored
+      - run: uv run scripts/iceberg_fixture.py "$RUNNER_TEMP/wh" | grep ^PLIMSOLL_ >> "$GITHUB_ENV"
+      # The ignored tests return early without their env: make that impossible here.
+      - run: |
+          test -n "$PLIMSOLL_ICEBERG_FIXTURE" && test -n "$PLIMSOLL_ICEBERG_EVENTS"
+          cargo test -p plimsoll-connectors --test iceberg -- --ignored
       # Reference REST catalog with an S3 warehouse (SeaweedFS): no shared
       # filesystem, and Plimsoll reads metadata and data through s3://.
       - name: start SeaweedFS (S3) and apache/iceberg-rest-fixture
@@ -86,7 +89,7 @@ jobs:
       - run: >-
           uv run scripts/iceberg_fixture.py http://localhost:8181
           s3.endpoint=http://localhost:8333 s3.access-key-id=admin
-          s3.secret-access-key=password s3.region=us-east-1 | tail -1 >> "$GITHUB_ENV"
+          s3.secret-access-key=password s3.region=us-east-1 | grep ^PLIMSOLL_ >> "$GITHUB_ENV"
       - run: |
           cargo test -p plimsoll-control live_rest_catalog -- --ignored
           cargo test -p plimsoll-connectors --test iceberg -- --ignored

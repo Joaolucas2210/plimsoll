@@ -281,3 +281,63 @@ async fn reads_a_pyiceberg_table() {
         .to_string();
     assert!(out.contains("| 7 | 49 | 7 | n10 |"), "{out}");
 }
+
+/// Pruning on a real partitioned table (`bronze.events` from the fixture):
+/// day(ts) partition summaries skip manifests, column bounds skip files, and
+/// results are unchanged.
+#[tokio::test]
+#[ignore = "needs PLIMSOLL_ICEBERG_EVENTS from scripts/iceberg_fixture.py"]
+async fn prunes_a_partitioned_pyiceberg_table() {
+    let Ok(location) = std::env::var("PLIMSOLL_ICEBERG_EVENTS") else {
+        return;
+    };
+    let pool = Arc::new(CeilingPool::new(256 << 20, 0).unwrap());
+    let ctx = session_context_with_ceiling(pool, None, SessionConfig::new()).unwrap();
+    IcebergConnector::try_new("events", &location, &ctx.state())
+        .await
+        .unwrap()
+        .register(&ctx)
+        .unwrap();
+    let check = async |sql: &str, expected: &str, scan: &str| {
+        let df = ctx.sql(sql).await.unwrap();
+        let plan = datafusion::physical_plan::displayable(
+            df.clone().create_physical_plan().await.unwrap().as_ref(),
+        )
+        .indent(true)
+        .to_string();
+        assert!(plan.contains(scan), "expected `{scan}` in\n{plan}");
+        let out =
+            datafusion::arrow::util::pretty::pretty_format_batches(&df.collect().await.unwrap())
+                .unwrap()
+                .to_string();
+        assert!(out.contains(expected), "{sql}\n{out}");
+    };
+    // Days 7..=9 survive the partition summaries; no file is wasted.
+    check(
+        "SELECT count(*) AS n, min(id) AS m FROM events WHERE ts >= '2024-01-08T00:00:00Z'",
+        "| 30 | 70 |",
+        "manifests=3/10 files=3/3",
+    )
+    .await;
+    // `ts < midnight` keeps the strict bound: day 0 only.
+    check(
+        "SELECT count(*) AS n, max(id) AS m FROM events WHERE ts < '2024-01-02T00:00:00Z'",
+        "| 10 | 9 |",
+        "manifests=1/10 files=1/1",
+    )
+    .await;
+    // No partition predicate: every manifest is read, id bounds pick one file.
+    check(
+        "SELECT count(*) AS n, sum(id) AS s FROM events WHERE id BETWEEN 42 AND 44",
+        "| 3 | 129 |",
+        "manifests=10/10 files=1/10",
+    )
+    .await;
+    // OR is not provable: nothing pruned, result still right.
+    check(
+        "SELECT count(*) AS n FROM events WHERE id = 3 OR id = 97",
+        "| 2 |",
+        "manifests=10/10 files=10/10",
+    )
+    .await;
+}

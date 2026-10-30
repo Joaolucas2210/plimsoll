@@ -36,6 +36,9 @@ use serde_json::Value as Json;
 
 use crate::{Connector, ConnectorError};
 
+mod prune;
+use prune::{PartitionField, Prim, Pruner, Summary};
+
 #[derive(Debug)]
 pub struct IcebergConnector {
     name: String,
@@ -124,6 +127,26 @@ struct IcebergTable {
     location: Option<String>,
     /// Catalog-vended credentials for the table's bucket, if any.
     scoped: Option<ScopedStore>,
+    /// Prunable columns of the current schema: name -> (field id, type).
+    columns: HashMap<String, (i64, Prim)>,
+    /// `partition-specs` by spec id, for manifest-level pruning.
+    specs: HashMap<i64, Vec<Option<PartitionField>>>,
+}
+
+/// A data file the scan will read, from its manifest entry.
+struct DataFile {
+    path: String,
+    /// `file_size_in_bytes`; saves a HEAD per file on object storage.
+    size: Option<u64>,
+}
+
+/// What planning skipped, shown in EXPLAIN (`IcebergScan[t] files=2/40`).
+#[derive(Default)]
+struct PlanStats {
+    manifests: usize,
+    manifests_read: usize,
+    files: usize,
+    files_kept: usize,
 }
 
 impl IcebergTable {
@@ -162,6 +185,21 @@ impl IcebergTable {
                 Some(list.to_owned())
             }
         };
+        let columns = current["fields"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|f| {
+                let prim = Prim::from_iceberg(f["type"].as_str()?)?;
+                Some((f["name"].as_str()?.to_owned(), (f["id"].as_i64()?, prim)))
+            })
+            .collect();
+        let specs = meta["partition-specs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| Some((s["spec-id"].as_i64()?, prune::partition_spec(&s["fields"]))))
+            .collect();
         Ok(Self {
             name: name.to_owned(),
             schema,
@@ -169,14 +207,22 @@ impl IcebergTable {
             manifest_list,
             location: meta["location"].as_str().map(str::to_owned),
             scoped: None,
+            columns,
+            specs,
         })
     }
 
-    /// Live data files of the pinned snapshot, with manifest bytes reserved
-    /// in the session pool while they are decoded.
-    async fn data_files(&self, state: &dyn Session) -> Result<Vec<String>> {
+    /// Live data files of the pinned snapshot that may match `pruner`, with
+    /// manifest bytes reserved in the session pool while they are decoded.
+    /// Pruned manifests are never read.
+    async fn data_files(
+        &self,
+        state: &dyn Session,
+        pruner: &Pruner,
+    ) -> Result<(Vec<DataFile>, PlanStats)> {
+        let mut stats = PlanStats::default();
         let Some(list_path) = &self.manifest_list else {
-            return Ok(vec![]);
+            return Ok((vec![], stats));
         };
         self.register_scoped(state);
         let reservation = MemoryConsumer::new(format!("IcebergManifests[{}]", self.name))
@@ -198,6 +244,18 @@ impl IcebergTable {
                 .to_owned();
             // v1 has no `content`; 0 = data, 1 = deletes.
             let is_delete = long_field(&manifest, "content").unwrap_or(0) == 1;
+            stats.manifests += 1;
+            // Delete manifests are always read: we must see them to refuse.
+            if !is_delete && !pruner.is_empty() {
+                let spec =
+                    long_field(&manifest, "partition_spec_id").and_then(|id| self.specs.get(&id));
+                if let Some(spec) = spec {
+                    if !pruner.may_match_manifest(spec, &summaries(&manifest)) {
+                        continue;
+                    }
+                }
+            }
+            stats.manifests_read += 1;
             for entry in decode(&manifest_path).await? {
                 // status 2 = deleted in this snapshot.
                 if long_field(&entry, "status") == Some(2) {
@@ -220,10 +278,25 @@ impl IcebergTable {
                 }
                 let path = str_field(file, "file_path")
                     .ok_or_else(|| invalid(&manifest_path, "file_path missing"))?;
-                files.push(path.to_owned());
+                stats.files += 1;
+                if !pruner.is_empty()
+                    && !pruner.may_match_file(
+                        &bound_map(file, "lower_bounds"),
+                        &bound_map(file, "upper_bounds"),
+                    )
+                {
+                    continue;
+                }
+                stats.files_kept += 1;
+                files.push(DataFile {
+                    path: path.to_owned(),
+                    size: long_field(file, "file_size_in_bytes")
+                        .and_then(|s| u64::try_from(s).ok())
+                        .filter(|s| *s > 0),
+                });
             }
         }
-        Ok(files)
+        Ok((files, stats))
     }
 }
 
@@ -248,12 +321,13 @@ impl TableProvider for IcebergTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let files = self.data_files(state).await?;
+        let pruner = Pruner::new(filters, &self.columns);
+        let (files, stats) = self.data_files(state, &pruner).await?;
         let mut store: Option<ObjectStoreUrl> = None;
         let scoped = self.scoped.as_ref();
         let mut groups = vec![Vec::new(); state.config().target_partitions().max(1)];
-        for (i, path) in files.iter().enumerate() {
-            let url = ListingTableUrl::parse(path)?;
+        for (i, file) in files.iter().enumerate() {
+            let url = ListingTableUrl::parse(&file.path)?;
             let file_store = store_url(&url, scoped);
             match &store {
                 None => store = Some(file_store.clone()),
@@ -267,13 +341,18 @@ impl TableProvider for IcebergTable {
                 }
                 Some(_) => {}
             }
-            let size = state
-                .runtime_env()
-                .object_store(&file_store)?
-                .head(url.prefix())
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?
-                .size;
+            let size = match file.size {
+                Some(size) => size,
+                None => {
+                    state
+                        .runtime_env()
+                        .object_store(&file_store)?
+                        .head(url.prefix())
+                        .await
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?
+                        .size
+                }
+            };
             let n = groups.len();
             groups[i % n].push(PartitionedFile::new(url.prefix().to_string(), size));
         }
@@ -303,7 +382,10 @@ impl TableProvider for IcebergTable {
         .with_limit(limit)
         .build();
         Ok(Arc::new(AccountedExec::new(
-            format!("IcebergScan[{}]", self.name),
+            format!(
+                "IcebergScan[{}] manifests={}/{} files={}/{}",
+                self.name, stats.manifests_read, stats.manifests, stats.files_kept, stats.files
+            ),
             DataSourceExec::from_data_source(config),
         )))
     }
@@ -460,6 +542,41 @@ fn arrow_type(path: &str, ty: &str) -> Result<DataType, ConnectorError> {
             parsed.ok_or_else(|| unsupported(path, format!("type {t:?}")))?
         }
     })
+}
+
+/// Iceberg `map<int, binary>` (Avro array of `{key, value}` records), e.g.
+/// `lower_bounds`. Missing or malformed -> empty (no pruning).
+fn bound_map(file: &Avro, name: &str) -> HashMap<i64, Vec<u8>> {
+    let Some(Avro::Array(items)) = field(file, name) else {
+        return HashMap::new();
+    };
+    items
+        .iter()
+        .filter_map(|kv| Some((long_field(kv, "key")?, bytes_field(kv, "value")?.to_vec())))
+        .collect()
+}
+
+/// Manifest-list `partitions`: per partition field, (lower, upper) bound.
+fn summaries(manifest: &Avro) -> Vec<Summary> {
+    let Some(Avro::Array(items)) = field(manifest, "partitions") else {
+        return vec![];
+    };
+    items
+        .iter()
+        .map(|s| {
+            (
+                bytes_field(s, "lower_bound").map(<[u8]>::to_vec),
+                bytes_field(s, "upper_bound").map(<[u8]>::to_vec),
+            )
+        })
+        .collect()
+}
+
+fn bytes_field<'a>(record: &'a Avro, name: &str) -> Option<&'a [u8]> {
+    match field(record, name)? {
+        Avro::Bytes(b) | Avro::Fixed(_, b) => Some(b),
+        _ => None,
+    }
 }
 
 /// Record field by name, looking through `["null", T]` unions.

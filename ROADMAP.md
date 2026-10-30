@@ -33,6 +33,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] HTTP implementation of the catalog client (Polaris), `reqwest` + rustls (ADR 0008)
 - [x] Catalog namespaces as schemas; tables resolved per query (fresh snapshots)
 - [x] Catalog-vended storage credentials, scoped per table (ADR 0009)
+- [x] Scan pruning: manifests by partition summaries, files by column bounds (ADR 0010)
 - [x] Admission: running/queued limits globally, per resource group, per user (RAII slots)
 - [x] Query registry + per-query deadline (queue wait + execution)
 - [x] `system.runtime.queries` schema + snapshot source
@@ -42,9 +43,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Manifest pruning**: skip manifests by partition summaries and data files
-by column bounds before opening them, so selective queries on large tables
-read (and reserve) only what they need. Then delete-file support (ADR 0007).
+**Row-level deletes (merge-on-read)**: apply position and equality delete
+files during the scan instead of refusing the table (ADR 0007), with delete
+sets accounted in the `CeilingPool`.
 
 ## Later
 

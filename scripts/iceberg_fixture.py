@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["pyiceberg[sql-sqlite,pyarrow]>=0.9"]
+# dependencies = ["pyiceberg[sql-sqlite,pyarrow,pyiceberg-core]>=0.9"]
 # ///
 """Writes a small Iceberg v2 table with pyiceberg (the reference Python
 implementation) for the interop test in crates/plimsoll-connectors/tests/iceberg.rs.
@@ -11,7 +11,9 @@ implementation) for the interop test in crates/plimsoll-connectors/tests/iceberg
 Extra `prop=value` args are pyiceberg catalog properties, e.g. for S3:
 `s3.endpoint=http://localhost:8333 s3.access-key-id=... s3.region=us-east-1`.
 
-Prints PLIMSOLL_ICEBERG_FIXTURE=<metadata location>.
+Prints PLIMSOLL_ICEBERG_FIXTURE=<location> (bronze.trips: appends + a copy-on-write
+delete) and PLIMSOLL_ICEBERG_EVENTS=<location> (bronze.events: partitioned by
+day(ts), one append per day, for scan pruning).
 """
 import sys
 from datetime import datetime, timezone
@@ -19,7 +21,10 @@ from pathlib import Path
 
 import pyarrow as pa
 from pyiceberg.catalog import load_catalog
+from datetime import timedelta
+
 from pyiceberg.catalog.sql import SqlCatalog
+from pyiceberg.transforms import DayTransform
 
 target = sys.argv[1]
 if target.startswith("http"):
@@ -62,3 +67,26 @@ table.append(rows(list(range(1, 6))))
 table.append(rows(list(range(6, 11))))
 table.delete("id <= 3")  # copy-on-write: rewrites the first file
 print(f"PLIMSOLL_ICEBERG_FIXTURE={table.metadata_location}")
+
+# bronze.events: 10 days x 10 rows, id = day * 10 + hour, one append per day
+# -> 10 manifests, 10 data files, each with its own bounds.
+if catalog.table_exists("bronze.events"):
+    catalog.drop_table("bronze.events")
+events = catalog.create_table("bronze.events", schema=schema)
+# Field ids only exist once the table does, so partition afterwards.
+with events.update_spec() as spec:
+    spec.add_field("ts", DayTransform(), "ts_day")
+start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+for day in range(10):
+    ids = [day * 10 + h for h in range(10)]
+    events.append(
+        pa.table(
+            {
+                "id": ids,
+                "name": [f"e{i}" for i in ids],
+                "ts": [start + timedelta(days=day, hours=h) for h in range(10)],
+            },
+            schema=schema,
+        )
+    )
+print(f"PLIMSOLL_ICEBERG_EVENTS={events.metadata_location}")
