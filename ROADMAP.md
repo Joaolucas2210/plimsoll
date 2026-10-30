@@ -31,6 +31,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 - [x] Iceberg REST catalog contract + in-memory implementation (`plimsoll-control::catalog`)
 - [x] HTTP implementation of the catalog client (Polaris), `reqwest` + rustls (ADR 0008)
+- [x] One HTTP/TLS stack: catalog on object_store's reqwest 0.12 + ring (ADR 0015)
 - [x] Catalog namespaces as schemas; tables resolved per query (fresh snapshots)
 - [x] Catalog-vended storage credentials, scoped per table (ADR 0009)
 - [x] Scan pruning: manifests by partition summaries, files by column bounds (ADR 0010)
@@ -48,9 +49,6 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 **Equality deletes** (Flink upserts): anti-join with sequence-number
 semantics; then format v3 deletion vectors (ADR 0014).
-
-**One HTTP/TLS stack**: `object_store` uses reqwest 0.12 + ring, the catalog
-reqwest 0.13 + aws-lc-rs. Converge, or record the split as accepted (ADR 0009).
 
 ## Later
 

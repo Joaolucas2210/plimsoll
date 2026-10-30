@@ -22,6 +22,7 @@ are allowed in place.
 | [0012](0012-memory-at-the-edges.md) | Memory at the edges: connectors, planning and the response | Accepted | 2026-10-30 | Postgres streams in accounted batches; results keep their reservation through JSON serialization; manifests decode lazily under reservation | 0003, 0004, 0006, 0007, 0010 |
 | [0013](0013-error-taxonomy-and-failure-budgets.md) | Error taxonomy and dependency failure budgets | Accepted | 2026-10-30 | Errors classified at the source into `invalid_query`/`memory_limit_exceeded`/`unsupported_feature`/`invalid_table`/`dependency_failed`/`internal` with `retryable`; dependencies fail in seconds, not at the query timeout | 0004, 0005, 0007, 0008, 0009, 0012 |
 | [0014](0014-merge-on-read-position-deletes.md) | Merge-on-read: position deletes as Parquet row selections | Accepted | 2026-10-30 | Position delete files become `ParquetRowSelection`s so deleted rows are never decoded; seq-number rule, reserved positions; equality deletes refused; Spark interop workflow | 0007, 0010, 0011, 0012, 0013 |
+| [0015](0015-one-http-tls-stack.md) | One HTTP/TLS stack | Accepted | 2026-10-30 | Catalog client on the same `reqwest 0.12` + `ring` as `object_store`; `aws-lc-rs` and 14 other crates leave the build | 0008, 0009, 0011 |
 
 ## Reading order
 

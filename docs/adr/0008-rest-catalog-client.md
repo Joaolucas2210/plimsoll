@@ -77,8 +77,9 @@ with the catalog.
 - **Boot order.** Catalog first, then env tables (`PLIMSOLL_*_TABLES`), so an
   env table aimed at a catalog-backed schema fails at boot instead of being
   shadowed.
-- **Dependency.** `reqwest 0.13`, `default-features = false`, feature
-  `rustls` (aws-lc-rs provider in `Cargo.lock`, no OpenSSL).
+- **Dependency.** `reqwest`, `default-features = false`, rustls (no OpenSSL).
+  Version and TLS provider follow `object_store` since ADR 0015 (`reqwest
+  0.12`, `rustls-tls-native-roots`, `ring`).
 
 Why over Option D: per-query resolution makes freshness a property of the
 design, not of restart discipline; the cost is one round trip with a known
