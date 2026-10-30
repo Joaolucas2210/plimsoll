@@ -43,9 +43,25 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
+**Close the gaps in the ceiling** (found in the ADR review; each one can
+still OOM the node, contradicting ADR 0003):
+1. Postgres results stream in bounded batches through `AccountedExec`
+   instead of one unreserved `RecordBatch`.
+2. The server streams results to the client (or reserves its JSON copy in
+   the `Output` slice) instead of materializing an unaccounted copy.
+3. Decoded Iceberg manifest entries and `metadata.json` are reserved, not
+   only the raw Avro bytes.
+
+**Error taxonomy**: "unsupported table feature" (e.g. delete files) and
+"dependency down" (catalog, object store) are typed and mapped to distinct
+HTTP codes instead of `500 internal`, so on-call can tell them from node bugs.
+
 **Row-level deletes (merge-on-read)**: apply position and equality delete
 files during the scan instead of refusing the table (ADR 0007), with delete
 sets accounted in the `CeilingPool`.
+
+**One HTTP/TLS stack**: `object_store` uses reqwest 0.12 + ring, the catalog
+reqwest 0.13 + aws-lc-rs. Converge, or record the split as accepted (ADR 0009).
 
 ## Later
 

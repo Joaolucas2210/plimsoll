@@ -72,9 +72,5 @@ Every failure in this list is a response code, never a process exit.
 
 ## Decision records
 
-[0001](adr/0001-rust-datafusion.md) Rust + DataFusion ·
-[0002](adr/0002-platform-planes.md) control vs compute ·
-[0003](adr/0003-memory-ceiling.md) memory ceiling ·
-[0004](adr/0004-http-axum.md) axum ·
-[0005](adr/0005-federation-correctness.md) federation correctness ·
-[0006](adr/0006-pushdown-policy.md) pushdown policy
+See the [ADR index](adr/README.md) (0001–0010: status, date and one-line
+decision for each).

@@ -148,15 +148,9 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 
 ## Decision records
 
-- [ADR 0001 — Rust + DataFusion](docs/adr/0001-rust-datafusion.md)
-- [ADR 0002 — Control vs compute plane](docs/adr/0002-platform-planes.md)
-- [ADR 0003 — Process-wide memory ceiling](docs/adr/0003-memory-ceiling.md)
-- [ADR 0004 — HTTP with axum](docs/adr/0004-http-axum.md)
-- [ADR 0005 — Federation correctness](docs/adr/0005-federation-correctness.md)
-- [ADR 0006 — Pushdown policy](docs/adr/0006-pushdown-policy.md)
-- [ADR 0007 — Iceberg read path under the ceiling](docs/adr/0007-iceberg-read-path.md)
-- [ADR 0008 — Iceberg REST catalog client](docs/adr/0008-rest-catalog-client.md)
-- [ADR 0009 — Object storage](docs/adr/0009-object-storage.md)
+Index with status, date and the one-line decision of every ADR:
+[docs/adr/README.md](docs/adr/README.md) (0001–0010; template in
+[docs/adr/0000-template.md](docs/adr/0000-template.md)).
 
 Roadmap: [ROADMAP.md](ROADMAP.md).
 
