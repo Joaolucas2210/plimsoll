@@ -131,5 +131,5 @@ code. Alert on `code="internal"` (page Plimsoll) separately from
 - An alert policy needs finer codes (e.g. `dependency_auth` vs
   `dependency_unavailable`).
 - Deployments need different budgets (make them config).
-- Structured logging lands: log `code`/`dependency` per failed query.
+- Structured logging lands: log `code`/`dependency` per failed query. (Done: ADR 0027.)
 - A connector adds a new failure mode (extend the table first).

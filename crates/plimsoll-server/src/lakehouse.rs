@@ -72,7 +72,11 @@ pub async fn register(
         // ponytail: `a.b.c` namespaces need nested catalogs in DataFusion;
         // skipped until someone has one.
         let [name] = namespace.0.as_slice() else {
-            eprintln!("catalog: skipping multi-level namespace {namespace}");
+            crate::log::emit(
+                crate::log::Level::Warn,
+                "namespace_skipped",
+                serde_json::json!({ "namespace": namespace.to_string(), "reason": "multi-level" }),
+            );
             continue;
         };
         let names = catalog

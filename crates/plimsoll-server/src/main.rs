@@ -19,8 +19,10 @@ use plimsoll_server::app::{self, AppState};
 use plimsoll_server::auth::Auth;
 use plimsoll_server::config::Config;
 use plimsoll_server::engine::CoreEngine;
+use plimsoll_server::log::{self, Level};
 use plimsoll_server::metrics::PoolStats;
 use plimsoll_server::{lakehouse, system, tables};
+use serde_json::json;
 
 /// Finished/failed/cancelled queries kept for `system.runtime.queries`.
 const RETAINED_QUERIES: usize = 1_000;
@@ -30,7 +32,11 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("plimsoll-server: {e}");
+            log::emit(
+                Level::Error,
+                "startup_failed",
+                json!({ "error": e.to_string() }),
+            );
             ExitCode::FAILURE
         }
     }
@@ -65,10 +71,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(cfg) = catalog.clone() {
         let catalog = Arc::new(RestCatalog::connect(cfg).await?);
         let schemas = lakehouse::register(engine.context(), catalog).await?;
-        eprintln!("catalog: serving namespaces {schemas:?}");
+        log::emit(
+            Level::Info,
+            "catalog_registered",
+            json!({ "namespaces": schemas }),
+        );
     }
     let n = tables::register_from_env(engine.context(), |k| std::env::var(k).ok()).await?;
-    eprintln!("registered {n} table(s) from env");
+    log::emit(Level::Info, "env_tables_registered", json!({ "tables": n }));
 
     let stats_engine = engine.clone();
     let state = Arc::new(AppState {
@@ -90,18 +100,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
-    // ponytail: eprintln instead of a tracing subscriber; one less dependency
-    // until structured logs / OTLP land (ROADMAP).
-    eprintln!(
-        "plimsoll-server listening on {} (catalog: {}, auth: {:?})",
-        listener.local_addr()?,
-        catalog.as_ref().map_or("none", |c| c.uri.as_str()),
-        cfg.auth
+    log::emit(
+        Level::Info,
+        "listening",
+        json!({
+            "addr": listener.local_addr()?.to_string(),
+            "catalog": catalog.as_ref().map(|c| c.uri.as_str()),
+            "auth": format!("{:?}", cfg.auth),
+        }),
     );
     if cfg.auth == Auth::Disabled {
-        eprintln!("WARNING: PLIMSOLL_AUTH=disabled: `user` is trusted as sent (development only)");
+        log::emit(
+            Level::Warn,
+            "auth_disabled",
+            json!({ "message": "PLIMSOLL_AUTH=disabled: `user` is trusted as sent (development only)" }),
+        );
     } else if !cfg.auth.grants_enforced() {
-        eprintln!("WARNING: PLIMSOLL_AUTH_GRANTS unset: every principal reads every schema");
+        log::emit(
+            Level::Warn,
+            "grants_not_enforced",
+            json!({ "message": "PLIMSOLL_AUTH_GRANTS unset: every principal reads every schema" }),
+        );
     }
     state.serving.store(true, Ordering::Relaxed);
     state.ready.store(true, Ordering::Relaxed);
@@ -109,7 +128,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app::router(state.clone()))
         .with_graceful_shutdown(shutdown_signal(state, cfg.drain_delay))
         .await?;
-    eprintln!("plimsoll-server stopped");
+    log::emit(Level::Info, "stopped", json!({}));
     Ok(())
 }
 
@@ -119,7 +138,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 async fn shutdown_signal(state: Arc<AppState>, delay: std::time::Duration) {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
-            eprintln!("ctrl-c handler failed: {e}");
+            log::emit(
+                Level::Error,
+                "signal_handler_failed",
+                json!({ "signal": "SIGINT", "error": e.to_string() }),
+            );
             std::future::pending::<()>().await;
         }
     };
@@ -130,7 +153,11 @@ async fn shutdown_signal(state: Arc<AppState>, delay: std::time::Duration) {
                 s.recv().await;
             }
             Err(e) => {
-                eprintln!("SIGTERM handler failed: {e}");
+                log::emit(
+                    Level::Error,
+                    "signal_handler_failed",
+                    json!({ "signal": "SIGTERM", "error": e.to_string() }),
+                );
                 std::future::pending::<()>().await;
             }
         }
@@ -142,7 +169,11 @@ async fn shutdown_signal(state: Arc<AppState>, delay: std::time::Duration) {
         () = ctrl_c => std::time::Duration::ZERO,
         () = term => delay,
     };
-    eprintln!("shutdown requested: not ready, serving for {delay:?} before closing");
+    log::emit(
+        Level::Info,
+        "draining",
+        json!({ "serving_for_ms": delay.as_millis() }),
+    );
     app::drain(&state, delay).await;
-    eprintln!("closing the listener; draining in-flight queries");
+    log::emit(Level::Info, "closing_listener", json!({}));
 }

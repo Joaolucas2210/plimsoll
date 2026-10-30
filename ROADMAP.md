@@ -47,6 +47,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Structured JSON logs: one `query` line per request (identity, outcome, phase timings, SQL fingerprint, never SQL text) (ADR 0027)
 - [x] SIGTERM drain: readiness off, keep serving for `PLIMSOLL_DRAIN_DELAY_MS`, then close (ADR 0026)
 - [x] Per-schema data grants per principal, checked on every table scan before execution (ADR 0025)
 - [x] Read-only query API: no DDL/DML/COPY/SET through `/v1/sql` (closed arbitrary file read/write, ADR 0024)
@@ -58,9 +59,10 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Structured logs**: one JSON line per finished query (`query_id`, `user`,
-`resource_group`, `code`, phase timings) instead of `eprintln!`, so failures
-can be found by user or code without the registry (ADRs 0013, 0019).
+**Iceberg time travel**: read a table as of a snapshot id or timestamp
+(`snapshots` / `snapshot-log` are already in the metadata Plimsoll reads),
+under the same pruning, delete and grant rules; syntax to be decided in the
+ADR (DataFusion does not plan `FOR SYSTEM_TIME AS OF`).
 
 ## Later
 

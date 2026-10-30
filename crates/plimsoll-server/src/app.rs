@@ -20,6 +20,7 @@ use serde_json::json;
 
 use crate::auth::Auth;
 use crate::engine::{EngineError, QueryEngine, QueryOutput};
+use crate::log::{QueryLog, level_for};
 use crate::metrics::{self, Latency, PoolStatsProvider};
 use futures::StreamExt;
 
@@ -209,24 +210,60 @@ impl ApiError {
 
     fn respond(self, st: &AppState, message: impl ToString, query_id: Option<u64>) -> Response {
         st.errors.inc(self.code);
+        let message = message.to_string();
         let mut body = json!({
             "code": self.code,
-            "message": message.to_string(),
+            "message": message,
             "retryable": self.retryable,
             "query_id": query_id,
         });
         if let Some(d) = self.dependency {
             body["dependency"] = json!(d);
         }
-        (self.status, Json(json!({ "error": body }))).into_response()
+        let mut response = (self.status, Json(json!({ "error": body }))).into_response();
+        // For the query log line written by `sql` (ADR 0027).
+        response.extensions_mut().insert(ErrorInfo {
+            code: self.code,
+            message,
+        });
+        response
     }
 }
 
+/// The error a response carries, read back by the query log.
+#[derive(Clone)]
+struct ErrorInfo {
+    code: &'static str,
+    message: String,
+}
+
+/// `/v1/sql`: runs the request and writes one structured `query` log line
+/// for every outcome, rejections included (ADR 0027).
 async fn sql(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Result<Json<SqlRequest>, JsonRejection>,
 ) -> Response {
+    let started = Instant::now();
+    let mut log = QueryLog::default();
+    let response = run_sql(&st, &headers, body, &mut log).await;
+    log.total = started.elapsed();
+    let status = response.status().as_u16();
+    let error = response
+        .extensions()
+        .get::<ErrorInfo>()
+        .map(|e| (e.code, e.message.as_str()));
+    crate::log::emit(level_for(status), "query", log.fields(status, error));
+    response
+}
+
+async fn run_sql(
+    st: &Arc<AppState>,
+    headers: &HeaderMap,
+    body: Result<Json<SqlRequest>, JsonRejection>,
+    log: &mut QueryLog,
+) -> Response {
+    let st = st.as_ref();
     // Authenticate first: an anonymous caller learns nothing else (ADR 0021).
     let authorization = headers
         .get(header::AUTHORIZATION)
@@ -234,8 +271,8 @@ async fn sql(
     let principal = match st.auth.principal(authorization) {
         Ok(p) => p,
         Err(e) => {
-            let mut r = ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", false)
-                .respond(&st, e, None);
+            let mut r =
+                ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", false).respond(st, e, None);
             r.headers_mut()
                 .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
             return r;
@@ -243,16 +280,19 @@ async fn sql(
     };
     if !st.serving.load(Ordering::Relaxed) {
         return ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "not_ready", true).respond(
-            &st,
+            st,
             "server is not accepting queries",
             None,
         );
     }
     let req = match body {
-        Ok(Json(r)) => r,
+        Ok(Json(r)) => {
+            log.set_sql(&r.sql);
+            r
+        }
         Err(e) => {
             return ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", false).respond(
-                &st,
+                st,
                 e.body_text(),
                 None,
             );
@@ -261,7 +301,7 @@ async fn sql(
     let user = match (principal, req.user) {
         (Some(p), Some(u)) if u != p => {
             return ApiError::new(StatusCode::FORBIDDEN, "forbidden", false).respond(
-                &st,
+                st,
                 format!("authenticated as {p:?}, cannot run as {u:?}"),
                 None,
             );
@@ -270,9 +310,10 @@ async fn sql(
         (None, Some(u)) => u,
         (None, None) => String::new(),
     };
+    log.user = Some(user.clone()).filter(|u| !u.is_empty());
     if req.sql.trim().is_empty() || user.trim().is_empty() {
         return ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", false).respond(
-            &st,
+            st,
             "`sql` and `user` must be non-empty",
             None,
         );
@@ -286,16 +327,17 @@ async fn sql(
             .unwrap_or(&DEFAULT_GROUP)
             .to_string()
     });
+    log.resource_group = Some(group.clone());
     if !st.admission.config().has_group(&group) {
         return ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", false).respond(
-            &st,
+            st,
             format!("unknown resource group {group:?}"),
             None,
         );
     }
     if allowed.is_some_and(|a| !a.contains(&group.as_str())) {
         return ApiError::new(StatusCode::FORBIDDEN, "forbidden", false).respond(
-            &st,
+            st,
             format!("{user:?} may not use resource group {group:?}"),
             None,
         );
@@ -308,29 +350,40 @@ async fn sql(
     let sql_text = request.sql.clone();
     let viewer = st.auth.viewer(&request.user);
     let assigned = AtomicU64::new(0);
+    let queued_us = AtomicU64::new(0);
     let arrived = Instant::now();
     let result = st
         .admission
         .execute(request, st.query_timeout, |id| {
             assigned.store(id, Ordering::Relaxed);
             // Called once a slot is granted: everything before was queueing.
-            st.latency.queue.observe(arrived.elapsed());
+            let queued = arrived.elapsed();
+            st.latency.queue.observe(queued);
+            queued_us.store(
+                u64::try_from(queued.as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
             st.engine.execute(&sql_text, viewer)
         })
         .await;
     let query_id = Some(assigned.load(Ordering::Relaxed)).filter(|id| *id != 0);
+    log.query_id = query_id;
     if query_id.is_some() {
         st.latency.total.observe(arrived.elapsed());
+        log.queue = Some(Duration::from_micros(queued_us.load(Ordering::Relaxed)));
     }
 
     match result {
         Ok(out) => {
+            log.planning = Some(out.phases.planning);
+            log.execution = Some(out.phases.execution);
+            log.serialization = Some(out.phases.serialization);
             st.latency.planning.observe(out.phases.planning);
             st.latency.execution.observe(out.phases.execution);
             st.latency.serialization.observe(out.phases.serialization);
             json_body(query_id, out)
         }
-        Err(e) => ApiError::of(&e).respond(&st, &e, query_id),
+        Err(e) => ApiError::of(&e).respond(st, &e, query_id),
     }
 }
 

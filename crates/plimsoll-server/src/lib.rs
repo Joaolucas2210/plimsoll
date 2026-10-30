@@ -7,6 +7,7 @@ pub mod auth;
 pub mod config;
 pub mod engine;
 pub mod lakehouse;
+pub mod log;
 pub mod metrics;
 pub mod system;
 pub mod tables;
