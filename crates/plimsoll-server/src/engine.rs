@@ -15,6 +15,8 @@ use plimsoll_core::datafusion::error::DataFusionError;
 use plimsoll_core::datafusion::object_store::Error as ObjectStoreError;
 use plimsoll_core::datafusion::parquet::errors::ParquetError;
 use plimsoll_core::engine::{Engine, QueryResult};
+
+use crate::auth::Viewer;
 use plimsoll_core::memory::Reservation;
 use serde_json::Value;
 
@@ -75,20 +77,25 @@ pub enum EngineError {
 
 #[async_trait]
 pub trait QueryEngine: Send + Sync {
-    async fn execute(&self, sql: &str) -> Result<QueryOutput, EngineError>;
+    /// Runs `sql` on behalf of `viewer` (scopes system tables, ADR 0022).
+    async fn execute(&self, sql: &str, viewer: Viewer) -> Result<QueryOutput, EngineError>;
 }
 
 pub struct CoreEngine(pub Arc<Engine>);
 
 #[async_trait]
 impl QueryEngine for CoreEngine {
-    async fn execute(&self, sql: &str) -> Result<QueryOutput, EngineError> {
+    async fn execute(&self, sql: &str, viewer: Viewer) -> Result<QueryOutput, EngineError> {
         let QueryResult {
             batches,
             mut memory,
             planning,
             execution,
-        } = self.0.sql(sql).await.map_err(|e| classify(&e))?;
+        } = self
+            .0
+            .sql_with(sql, Arc::new(viewer))
+            .await
+            .map_err(|e| classify(&e))?;
         let serializing = Instant::now();
         let columns: Vec<String> = batches
             .first()
@@ -225,17 +232,23 @@ mod tests {
     async fn sql_to_rows_and_typed_errors() {
         let pool = Arc::new(CeilingPool::new(1 << 20, 1 << 17).unwrap());
         let e = CoreEngine(Arc::new(Engine::new(pool, None).unwrap()));
-        let out = e.execute("SELECT 1 AS a, NULL AS b").await.unwrap();
+        let out = e
+            .execute("SELECT 1 AS a, NULL AS b", Viewer { only: None })
+            .await
+            .unwrap();
         assert_eq!(out.columns, ["a", "b"]);
         let rows: Value = serde_json::from_slice(&out.rows_json).unwrap();
         assert_eq!(rows, serde_json::json!([[1, null]]));
         assert!(matches!(
-            e.execute("SELEC").await,
+            e.execute("SELEC", Viewer { only: None }).await,
             Err(EngineError::InvalidQuery(_))
         ));
         assert!(matches!(
-            e.execute("SELECT value, repeat('x', 100) FROM range(200000)")
-                .await,
+            e.execute(
+                "SELECT value, repeat('x', 100) FROM range(200000)",
+                Viewer { only: None }
+            )
+            .await,
             Err(EngineError::MemoryLimitExceeded(_))
         ));
     }
@@ -317,7 +330,10 @@ mod tests {
     async fn serialized_response_is_accounted() {
         let pool = Arc::new(CeilingPool::new(4 << 20, 2 << 20).unwrap());
         let e = CoreEngine(Arc::new(Engine::new(pool.clone(), None).unwrap()));
-        let small = e.execute("SELECT value FROM range(1000)").await.unwrap();
+        let small = e
+            .execute("SELECT value FROM range(1000)", Viewer { only: None })
+            .await
+            .unwrap();
         let held = small.memory.as_ref().map(Reservation::size).unwrap();
         assert_eq!(
             held,
@@ -331,7 +347,10 @@ mod tests {
         // row as JSON (`[null,null,null,null]`): 200k rows only cross the
         // 4 MiB ceiling once serialized.
         let err = e
-            .execute("SELECT NULL AS a, NULL AS b, NULL AS c, NULL AS d FROM range(200000)")
+            .execute(
+                "SELECT NULL AS a, NULL AS b, NULL AS c, NULL AS d FROM range(200000)",
+                Viewer { only: None },
+            )
             .await;
         assert!(matches!(err, Err(EngineError::MemoryLimitExceeded(_))));
         assert_eq!(pool.used(), 0);

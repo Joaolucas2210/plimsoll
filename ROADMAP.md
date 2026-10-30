@@ -47,22 +47,22 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] `system.runtime.queries` scoped to the principal; operators see all; fail closed without a viewer (ADR 0022)
 - [x] Bearer-token authentication, `user` = principal, SHA-256 digests in env, secure by default (ADR 0021)
 - [x] Query latency histograms by phase: queue, planning, execution, serialization, total (ADR 0019)
 - [x] Wire pool/spill metrics to the live `CeilingPool`
 
 ## Next obvious PR
 
-**Authorization after authentication**: `system.runtime.queries` shows
-every user's SQL to any authenticated caller, and the resource group is still
-chosen by the client. Scope both to the principal (own queries; an operator
-role sees all; group bound to the token) (ADR 0021 debt).
+**Configurable resource groups bound to principals**: groups share the
+global limits today (`ponytail:` in `AdmissionConfig`), and the client picks
+its group. Per-group limits from config, and each token's principal mapped to
+the groups it may use (ADRs 0021, 0022).
 
 ## Later
 
 - OTLP traces and metrics export (OpenTelemetry), query-level spans
   (admission wait, planning, execution). No OpenTelemetry dependency until then.
-- Configurable resource groups (per-group limits from config).
 - Readiness drain delay before closing the listener.
 - Per-layer governance on the medallion namespaces (`bronze`/`silver`/`gold`).
 - Coordinator/worker split along the existing plane boundary.

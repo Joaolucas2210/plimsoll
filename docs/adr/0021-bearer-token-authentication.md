@@ -100,7 +100,8 @@ depend on correct gateway configuration, with no defence in depth. Rejected.
   - read every user's SQL through `system.runtime.queries`;
   - pick any `resource_group`.
 
-  These are the next ROADMAP item.
+  The first is resolved by ADR 0022; resource groups are the next ROADMAP
+  item.
 - Tokens travel in clear unless TLS is terminated in front of Plimsoll (the
   server speaks plain HTTP, ADR 0004). Deployments must terminate TLS at the
   ingress.

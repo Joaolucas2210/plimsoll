@@ -101,6 +101,7 @@ Configuration is environment-only; invalid values abort startup.
 |---|---|---|
 | `PLIMSOLL_BIND` | `127.0.0.1:8080` | Listen address |
 | `PLIMSOLL_AUTH_TOKENS` | required | `ana:sha256:<hex>,etl:sha256:<hex>`: SHA-256 of each bearer token and its user (ADR 0021) |
+| `PLIMSOLL_AUTH_OPERATORS` | unset | Users (from the tokens) who see every query in `system.runtime.queries`; others see their own (ADR 0022) |
 | `PLIMSOLL_AUTH` | `required` | `disabled` = no authentication, `user` trusted from the body (development only) |
 | `PLIMSOLL_MEMORY_LIMIT_BYTES` | `1073741824` | Memory ceiling (the load line) |
 | `PLIMSOLL_MAX_RUNNING` | `8` | Max concurrently running queries |

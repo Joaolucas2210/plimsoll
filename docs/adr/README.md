@@ -29,6 +29,7 @@ are allowed in place.
 | [0019](0019-query-latency-histograms.md) | Query latency histograms by phase | Accepted | 2026-10-30 | `plimsoll_query_duration_seconds{phase}` (queue, planning, execution, serialization, total) as hand-rolled fixed-bucket atomic histograms; no metrics crate | 0004, 0013, 0018 |
 | [0020](0020-concurrent-planning-fetches.md) | Concurrent metadata fetches during Iceberg planning | Accepted | 2026-10-30 | Manifests, delete files and DV blobs fetched `meta_fetch_concurrency` at a time, each reserved; decoded and merged in manifest order | 0007, 0010, 0012, 0014, 0016, 0017, 0018, 0019 |
 | [0021](0021-bearer-token-authentication.md) | Bearer-token authentication for the SQL endpoint | Accepted | 2026-10-30 | `Authorization: Bearer` mapped to a principal via SHA-256 digests in `PLIMSOLL_AUTH_TOKENS`; `user` = principal, impersonation 403; boot fails without tokens unless `PLIMSOLL_AUTH=disabled` | 0004, 0013, 0015 |
+| [0022](0022-principal-scoped-system-tables.md) | Principal-scoped system tables | Accepted | 2026-10-30 | The caller's `Viewer` rides in a per-query session config extension; `system.runtime.queries` shows own rows, all for `PLIMSOLL_AUTH_OPERATORS`, and fails closed without a viewer | 0002, 0021 |
 
 ## Reading order
 

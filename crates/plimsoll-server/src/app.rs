@@ -267,6 +267,7 @@ async fn sql(
         sql: req.sql,
     };
     let sql_text = request.sql.clone();
+    let viewer = st.auth.viewer(&request.user);
     let assigned = AtomicU64::new(0);
     let arrived = Instant::now();
     let result = st
@@ -275,7 +276,7 @@ async fn sql(
             assigned.store(id, Ordering::Relaxed);
             // Called once a slot is granted: everything before was queueing.
             st.latency.queue.observe(arrived.elapsed());
-            st.engine.execute(&sql_text)
+            st.engine.execute(&sql_text, viewer)
         })
         .await;
     let query_id = Some(assigned.load(Ordering::Relaxed)).filter(|id| *id != 0);
@@ -298,6 +299,7 @@ async fn sql(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::auth::Viewer;
     use crate::metrics::PoolStats;
     use async_trait::async_trait;
     use axum::body::{Body, to_bytes};
@@ -309,7 +311,7 @@ mod tests {
 
     #[async_trait]
     impl QueryEngine for FakeEngine {
-        async fn execute(&self, sql: &str) -> Result<QueryOutput, EngineError> {
+        async fn execute(&self, sql: &str, _viewer: Viewer) -> Result<QueryOutput, EngineError> {
             match sql {
                 "select 1" => Ok(QueryOutput::from_rows(vec!["x".into()], &[vec![json!(1)]])),
                 "oom" => Err(EngineError::MemoryLimitExceeded("needed 2GiB".into())),
@@ -472,6 +474,57 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["rows"], json!([["failed", true], ["running", false]]));
+    }
+
+    #[tokio::test]
+    async fn system_queries_are_scoped_to_the_principal() {
+        use plimsoll_core::engine::Engine;
+        use plimsoll_core::memory::CeilingPool;
+
+        let engine =
+            Arc::new(Engine::new(Arc::new(CeilingPool::new(64 << 20, 0).unwrap()), None).unwrap());
+        let mut st = Arc::into_inner(default_state()).unwrap();
+        crate::system::register(engine.context(), st.admission.registry().clone()).unwrap();
+        st.engine = Arc::new(crate::engine::CoreEngine(engine.clone()));
+        let hex = |t: &str| -> String {
+            crate::auth::token_digest(t)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        let tokens = format!(
+            "ana:sha256:{},bob:sha256:{},ops:sha256:{}",
+            hex("ta"),
+            hex("tb"),
+            hex("to")
+        );
+        st.auth = Auth::from_lookup(&|k| match k {
+            "PLIMSOLL_AUTH_TOKENS" => Some(tokens.clone()),
+            "PLIMSOLL_AUTH_OPERATORS" => Some("ops".into()),
+            _ => None,
+        })
+        .unwrap();
+        let st = Arc::new(st);
+        let run = async |token: &str, sql: &str| {
+            let req = Request::post("/v1/sql")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(json!({ "sql": sql }).to_string()))
+                .unwrap();
+            let (status, body) = call(router(st.clone()), req).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["rows"].clone()
+        };
+        run("ta", "SELECT 1").await;
+        run("tb", "SELECT 2").await;
+        let users = "SELECT DISTINCT \"user\" FROM system.runtime.queries ORDER BY 1";
+        // Each sees only their own queries; the operator sees everyone's.
+        assert_eq!(run("ta", users).await, json!([["ana"]]));
+        assert_eq!(run("tb", users).await, json!([["bob"]]));
+        assert_eq!(run("to", users).await, json!([["ana"], ["bob"], ["ops"]]));
+        // A query path that forgets the viewer fails closed, not open.
+        let err = engine.sql(users).await.unwrap_err().to_string();
+        assert!(err.contains("needs the caller's identity"), "{err}");
     }
 
     #[tokio::test]

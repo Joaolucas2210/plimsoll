@@ -7,8 +7,12 @@
 //! a secret, which leaks nothing an attacker can use, so no constant-time
 //! comparison is needed. Secure by default: without tokens the server
 //! refuses to start unless `PLIMSOLL_AUTH=disabled`.
+//!
+//! Authorization (ADR 0022): `PLIMSOLL_AUTH_OPERATORS=ana,ops` names the
+//! principals that see every query in `system.runtime.queries`; everyone
+//! else sees only their own.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use ring::digest::{SHA256, digest};
@@ -19,18 +23,27 @@ use crate::config::ConfigError;
 pub enum Auth {
     /// Development only: `user` is taken from the request body as sent.
     Disabled,
-    /// Token digest -> principal.
-    Tokens(HashMap<[u8; 32], String>),
+    /// Token digest -> principal, and the principals with operator rights.
+    Tokens {
+        tokens: HashMap<[u8; 32], String>,
+        operators: HashSet<String>,
+    },
 }
 
 impl fmt::Debug for Auth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Disabled => f.write_str("Disabled"),
-            Self::Tokens(t) => {
-                let mut users: Vec<&String> = t.values().collect();
+            Self::Tokens { tokens, operators } => {
+                let mut users: Vec<&String> = tokens.values().collect();
                 users.sort();
-                f.debug_tuple("Tokens").field(&users).finish()
+                users.dedup();
+                let mut ops: Vec<&String> = operators.iter().collect();
+                ops.sort();
+                f.debug_struct("Tokens")
+                    .field("users", &users)
+                    .field("operators", &ops)
+                    .finish()
             }
         }
     }
@@ -47,6 +60,7 @@ pub enum AuthError {
 
 const MODE: &str = "PLIMSOLL_AUTH";
 const TOKENS: &str = "PLIMSOLL_AUTH_TOKENS";
+const OPERATORS: &str = "PLIMSOLL_AUTH_OPERATORS";
 
 impl Auth {
     pub fn from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
@@ -57,7 +71,12 @@ impl Auth {
         };
         match lookup(MODE).as_deref().map(str::trim) {
             None | Some("required") => {}
-            Some("disabled") => return Ok(Self::Disabled),
+            Some("disabled") => {
+                if lookup(OPERATORS).is_some_and(|o| !o.trim().is_empty()) {
+                    return Err(err(OPERATORS, "", "operators need PLIMSOLL_AUTH=required"));
+                }
+                return Ok(Self::Disabled);
+            }
             Some(other) => return Err(err(MODE, other, "expected `required` or `disabled`")),
         }
         let raw = lookup(TOKENS).unwrap_or_default();
@@ -86,13 +105,36 @@ impl Auth {
                 "at least one token is required (or set PLIMSOLL_AUTH=disabled)",
             ));
         }
-        Ok(Self::Tokens(tokens))
+        let mut operators = HashSet::new();
+        for op in lookup(OPERATORS).unwrap_or_default().split(',') {
+            let op = op.trim();
+            if op.is_empty() {
+                continue;
+            }
+            // A typo would silently demote the operator: fail instead.
+            if !tokens.values().any(|u| u == op) {
+                return Err(err(OPERATORS, op, "not a user in PLIMSOLL_AUTH_TOKENS"));
+            }
+            operators.insert(op.to_owned());
+        }
+        Ok(Self::Tokens { tokens, operators })
+    }
+
+    /// Whose queries `principal` may see in `system.runtime.queries`.
+    pub fn viewer(&self, principal: &str) -> Viewer {
+        match self {
+            Self::Tokens { operators, .. } if !operators.contains(principal) => Viewer {
+                only: Some(principal.to_owned()),
+            },
+            // Operators, and everyone when auth is disabled (development).
+            _ => Viewer { only: None },
+        }
     }
 
     /// The principal for an `Authorization` header value; `None` when auth
     /// is disabled.
     pub fn principal(&self, authorization: Option<&str>) -> Result<Option<&str>, AuthError> {
-        let Self::Tokens(tokens) = self else {
+        let Self::Tokens { tokens, .. } = self else {
             return Ok(None);
         };
         let header = authorization.ok_or(AuthError::Missing)?;
@@ -106,6 +148,14 @@ impl Auth {
             .map(|user| Some(user.as_str()))
             .ok_or(AuthError::Invalid)
     }
+}
+
+/// Who is asking, carried into the query's session config so providers can
+/// scope what they return (`system.runtime.queries`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Viewer {
+    /// `Some(user)`: only that user's rows. `None`: all rows.
+    pub only: Option<String>,
 }
 
 /// SHA-256 of a token, as stored in `PLIMSOLL_AUTH_TOKENS`
@@ -165,9 +215,28 @@ mod tests {
         let ok = auth(&[(TOKENS, format!(" ana:sha256:{} ", hex("t1")))]).unwrap();
         assert_eq!(
             format!("{ok:?}"),
-            "Tokens([\"ana\"])",
+            "Tokens { users: [\"ana\"], operators: [] }",
             "Debug shows users only"
         );
+    }
+
+    #[test]
+    fn operators_see_all_queries_others_only_their_own() {
+        let tokens = format!("ana:sha256:{},ops:sha256:{}", hex("t1"), hex("t2"));
+        let a = auth(&[(TOKENS, tokens.clone()), (OPERATORS, "ops".into())]).unwrap();
+        assert_eq!(a.viewer("ops"), Viewer { only: None });
+        assert_eq!(
+            a.viewer("ana"),
+            Viewer {
+                only: Some("ana".into())
+            }
+        );
+        assert_eq!(Auth::Disabled.viewer("x"), Viewer { only: None });
+        // Unknown operator (typo) and operators without auth fail boot.
+        let e = auth(&[(TOKENS, tokens), (OPERATORS, "opz".into())]).unwrap_err();
+        assert_eq!(e.var, OPERATORS);
+        let e = auth(&[(MODE, "disabled".into()), (OPERATORS, "ops".into())]).unwrap_err();
+        assert_eq!(e.var, OPERATORS);
     }
 
     #[test]

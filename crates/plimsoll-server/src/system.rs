@@ -1,4 +1,7 @@
 //! `system.runtime.queries` as a DataFusion table over the live registry.
+//!
+//! Rows are scoped to the query's [`Viewer`] (ADR 0022): a user sees their
+//! own queries, an operator sees all. A query without a viewer fails closed.
 
 use std::sync::Arc;
 
@@ -16,10 +19,12 @@ use plimsoll_core::datafusion::catalog::{
 };
 use plimsoll_core::datafusion::datasource::TableType;
 use plimsoll_core::datafusion::datasource::memory::MemorySourceConfig;
-use plimsoll_core::datafusion::error::Result;
+use plimsoll_core::datafusion::error::{DataFusionError, Result};
 use plimsoll_core::datafusion::logical_expr::Expr;
 use plimsoll_core::datafusion::physical_plan::ExecutionPlan;
 use plimsoll_core::datafusion::prelude::SessionContext;
+
+use crate::auth::Viewer;
 
 struct QueriesTable {
     registry: Arc<QueryRegistry>,
@@ -71,12 +76,20 @@ impl TableProvider for QueriesTable {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let rows = system::queries_snapshot(&self.registry);
+        let viewer = state.config().get_extension::<Viewer>().ok_or_else(|| {
+            DataFusionError::Plan(
+                "system.runtime.queries needs the caller's identity (no viewer in session)".into(),
+            )
+        })?;
+        let mut rows = system::queries_snapshot(&self.registry);
+        if let Some(user) = &viewer.only {
+            rows.retain(|r| &r.user == user);
+        }
         let ts = |f: fn(&QueryInfo) -> Option<u64>| -> ArrayRef {
             Arc::new(
                 TimestampMillisecondArray::from_iter(rows.iter().map(|r| f(r).map(|v| v as i64)))

@@ -93,15 +93,32 @@ impl Engine {
     /// Runs one statement. Dropping the returned future cancels execution
     /// (the stream and its reservations are dropped with it).
     pub async fn sql(&self, sql: &str) -> Result<QueryResult> {
+        self.run(&self.ctx, sql).await
+    }
+
+    /// [`Engine::sql`] with `extension` in this query's session config, for
+    /// providers that depend on who is asking (e.g. the caller's identity).
+    /// Same catalogs, runtime and pool; only the config is per query.
+    pub async fn sql_with<T: Send + Sync + 'static>(
+        &self,
+        sql: &str,
+        extension: Arc<T>,
+    ) -> Result<QueryResult> {
+        let mut state = self.ctx.state();
+        state.config_mut().set_extension(extension);
+        self.run(&SessionContext::new_with_state(state), sql).await
+    }
+
+    async fn run(&self, ctx: &SessionContext, sql: &str) -> Result<QueryResult> {
         let started = Instant::now();
-        let df = self.ctx.sql(sql).await?;
+        let df = ctx.sql(sql).await?;
         let (state, plan) = df.into_parts();
         let plan = preevaluate_scalar_subqueries(&state, plan).await?;
         let physical = state.create_physical_plan(&plan).await?;
         let planning = started.elapsed();
 
         let mut output = self.pool.register("query-output", ConsumerKind::Output);
-        let mut stream = execute_stream(physical.clone(), self.ctx.task_ctx())?;
+        let mut stream = execute_stream(physical.clone(), state.task_ctx())?;
         let mut batches = Vec::new();
         let result = async {
             while let Some(batch) = stream.next().await {
