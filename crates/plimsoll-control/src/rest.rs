@@ -4,6 +4,7 @@
 //! and namespace separator; every other call goes to `/v1/{prefix}/...`.
 //! See ADR 0008.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -123,11 +124,23 @@ impl RestCatalog {
 
     /// GET returning `(status, json)`; a 401 renews client credentials once.
     async fn get(&self, url: &str) -> Result<(StatusCode, Value), CatalogError> {
+        self.get_with(url, &[]).await
+    }
+
+    async fn get_with(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<(StatusCode, Value), CatalogError> {
         let mut retried = false;
         loop {
             let token = self.token.read().await.clone();
+            let mut req = self.http.get(url);
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
             let resp = self
-                .authorized(self.http.get(url), token.as_deref())
+                .authorized(req, token.as_deref())
                 .send()
                 .await
                 .map_err(|e| CatalogError::Http(e.to_string()))?;
@@ -225,7 +238,12 @@ impl Catalog for RestCatalog {
             self.namespace_path(&ident.namespace),
             encode(&ident.name)
         );
-        let (status, mut body) = self.get(&url).await?;
+        let delegation: &[(&str, &str)] = if self.cfg.vended_credentials {
+            &[("X-Iceberg-Access-Delegation", "vended-credentials")]
+        } else {
+            &[]
+        };
+        let (status, mut body) = self.get_with(&url, delegation).await?;
         if status == StatusCode::NOT_FOUND {
             return Err(
                 if body["error"]["type"]
@@ -238,12 +256,39 @@ impl Catalog for RestCatalog {
                 },
             );
         }
+        let metadata = body["metadata"].take();
+        let storage = storage_properties(&body, metadata["location"].as_str().unwrap_or(""));
         Ok(LoadedTable {
             ident: ident.clone(),
             metadata_location: body["metadata-location"].as_str().map(str::to_owned),
-            metadata: body["metadata"].take(),
+            metadata,
+            storage,
         })
     }
+}
+
+/// `config` overlaid with the `storage-credentials` entry whose `prefix` is
+/// the longest match for the table `location` (spec: LoadTableResult).
+fn storage_properties(body: &Value, location: &str) -> BTreeMap<String, String> {
+    let strings = |v: &Value| -> BTreeMap<String, String> {
+        v.as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+            .collect()
+    };
+    let mut props = strings(&body["config"]);
+    let best = body["storage-credentials"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| Some((c["prefix"].as_str()?, &c["config"])))
+        .filter(|(prefix, _)| location.starts_with(prefix))
+        .max_by_key(|(prefix, _)| prefix.len());
+    if let Some((_, config)) = best {
+        props.extend(strings(config));
+    }
+    props
 }
 
 fn namespace(v: &Value) -> Result<Namespace, CatalogError> {
@@ -289,7 +334,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Spec-shaped stub. Matches on the raw (still encoded) URI so the test
-    /// pins the exact wire format. Token `t1` is "expired" to force a renewal.
+    /// pins the exact wire format. Token `t1` is "expired" to force a renewal; `t2`, `t3`, ... are valid.
     async fn stub() -> (String, Arc<AtomicUsize>) {
         let tokens = Arc::new(AtomicUsize::new(0));
         let issued = tokens.clone();
@@ -307,7 +352,7 @@ mod tests {
                         (_, "/api/v1/config?warehouse=lake") => {
                             (200, json!({"defaults": {}, "overrides": {"prefix": "lake prefix"}}))
                         }
-                        _ if auth != Some("Bearer t2") => {
+                        _ if auth.is_none_or(|a| !a.starts_with("Bearer t") || a == "Bearer t1") => {
                             (401, json!({"error": {"message": "expired", "code": 401}}))
                         }
                         (_, "/api/v1/lake%20prefix/namespaces") => (
@@ -321,6 +366,22 @@ mod tests {
                             200,
                             json!({"identifiers": [{"namespace": ["gold", "fin"], "name": "orders"}]}),
                         ),
+                        (_, "/api/v1/lake%20prefix/namespaces/bronze/tables/vended") => {
+                            let asked = headers
+                                .get("x-iceberg-access-delegation")
+                                .is_some_and(|v| v == "vended-credentials");
+                            (200, json!({
+                                "metadata-location": "s3://wh/v/m.metadata.json",
+                                "metadata": {"location": "s3://wh/bronze/vended"},
+                                "config": {"s3.endpoint": "http://s3", "s3.access-key-id": "shared"},
+                                "storage-credentials": if asked { json!([
+                                    {"prefix": "s3://wh/", "config": {"s3.access-key-id": "wide"}},
+                                    {"prefix": "s3://wh/bronze/vended", "config": {
+                                        "s3.access-key-id": "narrow", "s3.secret-access-key": "hush"}},
+                                    {"prefix": "s3://other/", "config": {"s3.access-key-id": "nope"}},
+                                ]) } else { json!([]) },
+                            }))
+                        }
                         (_, "/api/v1/lake%20prefix/namespaces/bronze/tables/trips") => (
                             200,
                             json!({"metadata-location": "file:///wh/m.metadata.json",
@@ -351,7 +412,29 @@ mod tests {
                 client_secret: "s3cret".into(),
                 scope: "PRINCIPAL_ROLE:ALL".into(),
             },
+            vended_credentials: false,
         }
+    }
+
+    #[tokio::test]
+    async fn vended_credentials_are_requested_and_best_prefix_wins() {
+        let (uri, _) = stub().await;
+        let ident = TableIdent::new(Namespace::new(&["bronze"]), "vended");
+
+        let plain = RestCatalog::connect(config(uri.clone())).await.unwrap();
+        let t = plain.load_table(&ident).await.unwrap();
+        assert_eq!(
+            t.storage["s3.access-key-id"], "shared",
+            "no header, no vending"
+        );
+
+        let mut cfg = config(uri);
+        cfg.vended_credentials = true;
+        let vending = RestCatalog::connect(cfg).await.unwrap();
+        let t = vending.load_table(&ident).await.unwrap();
+        assert_eq!(t.storage["s3.access-key-id"], "narrow");
+        assert_eq!(t.storage["s3.endpoint"], "http://s3", "config is the base");
+        assert!(!format!("{t:?}").contains("hush"));
     }
 
     #[tokio::test]

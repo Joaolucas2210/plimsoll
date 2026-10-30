@@ -61,11 +61,21 @@ jobs:
       - name: start SeaweedFS (S3) and apache/iceberg-rest-fixture
         run: |
           docker network create lake
-          docker run -d --name s3 --network lake -p 8333:8333 \
+          # admin writes (catalog, fixture); reader is what a vending catalog hands out.
+          mkdir -p "$RUNNER_TEMP/s3" && cat > "$RUNNER_TEMP/s3/s3.json" <<'JSON'
+          {"identities": [
+            {"name": "admin", "credentials": [{"accessKey": "admin", "secretKey": "password"}],
+             "actions": ["Admin", "Read", "List", "Write", "Tagging"]},
+            {"name": "reader", "credentials": [{"accessKey": "reader", "secretKey": "readersecret"}],
+             "actions": ["Read", "List"]}]}
+          JSON
+          docker run -d --name s3 --network lake -p 8333:8333 -v "$RUNNER_TEMP/s3:/etc/plimsoll:ro" \
             chrislusf/seaweedfs@sha256:c2658820e763294a9e9de7b36c81e59b879e3459148351aee4e31a126ca64860 \
-            server -s3 -dir=/data
-          for i in $(seq 1 60); do curl -sf -o /dev/null localhost:8333/ && break; sleep 2; done
-          curl -sf -X PUT localhost:8333/warehouse
+            server -s3 -s3.config=/etc/plimsoll/s3.json -dir=/data
+          for i in $(seq 1 60); do
+            echo "s3.bucket.create -name warehouse" | docker exec -i s3 weed shell 2>&1 | grep -q "created bucket" && break
+            sleep 2
+          done
           docker run -d --name rest --network lake -p 8181:8181 \
             -e AWS_ACCESS_KEY_ID=admin -e AWS_SECRET_ACCESS_KEY=password -e AWS_REGION=us-east-1 \
             -e CATALOG_WAREHOUSE=s3://warehouse/ -e CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO \
@@ -86,4 +96,14 @@ jobs:
           AWS_ALLOW_HTTP: "true"
           AWS_ACCESS_KEY_ID: admin
           AWS_SECRET_ACCESS_KEY: password
+          AWS_REGION: us-east-1
+      - name: catalog-vended credentials (env keys are wrong on purpose)
+        run: cargo test -p plimsoll-server reads_with_catalog_vended -- --ignored
+        env:
+          PLIMSOLL_CATALOG_URI: http://localhost:8181
+          PLIMSOLL_TEST_VENDED: reader:readersecret
+          AWS_ENDPOINT: http://localhost:8333
+          AWS_ALLOW_HTTP: "true"
+          AWS_ACCESS_KEY_ID: wrong
+          AWS_SECRET_ACCESS_KEY: wrong
           AWS_REGION: us-east-1

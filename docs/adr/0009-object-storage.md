@@ -24,18 +24,29 @@ default only `file://` is registered.
 - **Dependency:** `object_store` 0.13 (the version DataFusion already uses) with
   the `aws` feature.
 
+- **Catalog-vended credentials.** With `PLIMSOLL_CATALOG_VENDED_CREDENTIALS=true`
+  the REST client sends `X-Iceberg-Access-Delegation: vended-credentials`;
+  the response `config` plus the longest-prefix `storage-credentials` entry
+  become the table's storage properties. `scoped_s3_store` turns them into a
+  `ScopedStore` registered under a synthetic URL (`s3-<hash>://bucket`) keyed
+  by those credentials; the table's metadata, manifests and Parquet reads in
+  that bucket go through it. Credentials are refreshed for free: every query
+  calls `loadTable` (ADR 0008).
+
 ## Alternatives
 
 - **Register stores from config at boot:** needs the bucket list up front;
   catalogs can point anywhere.
-- **Catalog-vended credentials** (`X-Iceberg-Access-Delegation`): the right
-  end state for Polaris (per-table, short-lived), but credentials are scoped
-  per table while DataFusion keys stores by bucket. Deferred; see below.
+- **Replace the bucket's store with vended credentials:** one table's
+  short-lived, path-scoped keys would leak into every other table in the
+  bucket and break them.
 
 ## Consequences
 
 - Any S3-compatible store works; CI runs the REST catalog on SeaweedFS
   (the MinIO community images are no longer published).
-- Debt: GCS/ADLS (`gcp` / `azure` features, same few lines); vended
-  credentials, which need per-table store keys (e.g. a synthetic
-  `ObjectStoreUrl` per table) and refresh before expiry.
+- CI enforces credentials on S3: env keys are wrong on purpose and the read
+  only succeeds through the vended ones.
+- Debt: GCS/ADLS (`gcp` / `azure` features, same few lines); expired
+  scoped stores stay in the registry until restart (small, bounded by
+  credential rotations); a single query outliving its session token fails.

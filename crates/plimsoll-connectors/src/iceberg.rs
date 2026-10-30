@@ -10,7 +10,7 @@
 //! columns, non-Parquet files, nested types) is a typed error, never a
 //! silently wrong answer.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use apache_avro::types::Value as Avro;
@@ -31,6 +31,7 @@ use datafusion::object_store::ObjectStoreExt;
 use datafusion::physical_plan::ExecutionPlan;
 use plimsoll_core::federation::{Pushdown, PushdownPolicy};
 use plimsoll_core::memory::AccountedExec;
+use plimsoll_core::storage::{ScopedStore, scoped_s3_store};
 use serde_json::Value as Json;
 
 use crate::{Connector, ConnectorError};
@@ -55,7 +56,7 @@ impl IcebergConnector {
         state: &dyn Session,
     ) -> Result<Self, ConnectorError> {
         let metadata_path = resolve_metadata(location, state).await?;
-        let raw = read(&metadata_path, state).await?;
+        let raw = read(&metadata_path, state, None).await?;
         let meta: Json = serde_json::from_slice(&raw).map_err(|e| invalid(&metadata_path, e))?;
         Self::from_metadata(name, &metadata_path, &meta)
     }
@@ -77,6 +78,24 @@ impl IcebergConnector {
         })
     }
 
+    /// Read with storage credentials handed out by the catalog (Iceberg FileIO
+    /// properties from `loadTable`, e.g. `s3.access-key-id`) instead of the
+    /// process env. Scoped to the table's bucket; other buckets are untouched.
+    pub fn with_storage_properties(
+        mut self,
+        props: &BTreeMap<String, String>,
+    ) -> Result<Self, ConnectorError> {
+        let Some(location) = &self.table.location else {
+            return Ok(self);
+        };
+        if let Some(scoped) = scoped_s3_store(location, props)? {
+            let mut table = (*self.table).clone();
+            table.scoped = Some(scoped);
+            self.table = Arc::new(table);
+        }
+        Ok(self)
+    }
+
     pub fn snapshot_id(&self) -> Option<i64> {
         self.table.snapshot_id
     }
@@ -94,13 +113,17 @@ impl Connector for IcebergConnector {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct IcebergTable {
     name: String,
     schema: SchemaRef,
     snapshot_id: Option<i64>,
     /// `None` for a table without snapshots (empty).
     manifest_list: Option<String>,
+    /// Table base location (`location` in the metadata).
+    location: Option<String>,
+    /// Catalog-vended credentials for the table's bucket, if any.
+    scoped: Option<ScopedStore>,
 }
 
 impl IcebergTable {
@@ -144,6 +167,8 @@ impl IcebergTable {
             schema,
             snapshot_id,
             manifest_list,
+            location: meta["location"].as_str().map(str::to_owned),
+            scoped: None,
         })
     }
 
@@ -153,10 +178,11 @@ impl IcebergTable {
         let Some(list_path) = &self.manifest_list else {
             return Ok(vec![]);
         };
+        self.register_scoped(state);
         let reservation = MemoryConsumer::new(format!("IcebergManifests[{}]", self.name))
             .register(&state.runtime_env().memory_pool);
         let decode = async |path: &str| -> Result<Vec<Avro>> {
-            let bytes = read(path, state).await?;
+            let bytes = read(path, state, self.scoped.as_ref()).await?;
             reservation.try_grow(bytes.len())?;
             let rows = apache_avro::Reader::new(&bytes[..])
                 .and_then(|r| r.collect::<Result<Vec<_>, _>>())
@@ -224,25 +250,26 @@ impl TableProvider for IcebergTable {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let files = self.data_files(state).await?;
         let mut store: Option<ObjectStoreUrl> = None;
+        let scoped = self.scoped.as_ref();
         let mut groups = vec![Vec::new(); state.config().target_partitions().max(1)];
         for (i, path) in files.iter().enumerate() {
             let url = ListingTableUrl::parse(path)?;
+            let file_store = store_url(&url, scoped);
             match &store {
-                None => store = Some(url.object_store()),
-                Some(s) if *s != url.object_store() => {
+                None => store = Some(file_store.clone()),
+                Some(s) if *s != file_store => {
                     // ponytail: one object store per table; mixed locations
                     // (e.g. after a bucket migration) need one scan per store.
                     return Err(DataFusionError::NotImplemented(format!(
                         "iceberg table {} spans object stores {s:?} and {:?}",
-                        self.name,
-                        url.object_store()
+                        self.name, file_store
                     )));
                 }
                 Some(_) => {}
             }
             let size = state
                 .runtime_env()
-                .object_store(url.object_store())?
+                .object_store(&file_store)?
                 .head(url.prefix())
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?
@@ -279,6 +306,25 @@ impl TableProvider for IcebergTable {
             format!("IcebergScan[{}]", self.name),
             DataSourceExec::from_data_source(config),
         )))
+    }
+}
+
+impl IcebergTable {
+    /// Makes the vended store resolvable by DataFusion's scan. Idempotent.
+    fn register_scoped(&self, state: &dyn Session) {
+        if let Some(s) = &self.scoped {
+            state
+                .runtime_env()
+                .register_object_store(s.url.as_ref(), s.store.clone());
+        }
+    }
+}
+
+/// The registry key for `url`: the scoped store when it covers the bucket.
+fn store_url(url: &ListingTableUrl, scoped: Option<&ScopedStore>) -> ObjectStoreUrl {
+    match scoped {
+        Some(s) if url.object_store() == s.bucket => s.url.clone(),
+        _ => url.object_store(),
     }
 }
 
@@ -319,9 +365,13 @@ fn metadata_version(path: &str) -> Option<u64> {
     file.split('-').next()?.parse().ok()
 }
 
-async fn read(path: &str, state: &dyn Session) -> Result<bytes::Bytes, ConnectorError> {
+async fn read(
+    path: &str,
+    state: &dyn Session,
+    scoped: Option<&ScopedStore>,
+) -> Result<bytes::Bytes, ConnectorError> {
     let url = ListingTableUrl::parse(path)?;
-    let store = state.runtime_env().object_store(url.object_store())?;
+    let store = state.runtime_env().object_store(store_url(&url, scoped))?;
     let external = |e: datafusion::object_store::Error| {
         ConnectorError::DataFusion(DataFusionError::External(Box::new(e)))
     };

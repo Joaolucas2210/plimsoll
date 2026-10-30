@@ -21,6 +21,8 @@ pub const ENV_TOKEN: &str = "PLIMSOLL_CATALOG_TOKEN";
 /// OAuth2 client credentials as `client_id:client_secret` (Polaris).
 pub const ENV_CREDENTIAL: &str = "PLIMSOLL_CATALOG_CREDENTIAL";
 pub const ENV_SCOPE: &str = "PLIMSOLL_CATALOG_SCOPE";
+/// `true` to ask for catalog-vended storage credentials on `loadTable`.
+pub const ENV_VENDED: &str = "PLIMSOLL_CATALOG_VENDED_CREDENTIALS";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CatalogError {
@@ -78,7 +80,7 @@ impl fmt::Display for TableIdent {
 }
 
 /// Result of `loadTable`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct LoadedTable {
     pub ident: TableIdent,
     /// `metadata-location` from the spec: the current metadata JSON file.
@@ -86,6 +88,20 @@ pub struct LoadedTable {
     /// ponytail: raw Iceberg table metadata JSON, untyped until the Iceberg
     /// TableProvider needs specific fields (schema, snapshots, partition spec).
     pub metadata: serde_json::Value,
+    /// Storage (FileIO) properties for this table: the response `config`
+    /// plus the best-matching `storage-credentials` entry. May hold vended
+    /// secrets (`s3.secret-access-key`, ...): redacted in `Debug`.
+    pub storage: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for LoadedTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoadedTable")
+            .field("ident", &self.ident)
+            .field("metadata_location", &self.metadata_location)
+            .field("storage_keys", &self.storage.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
 }
 
 /// The one abstraction in this module: real REST client vs in-memory stub.
@@ -105,6 +121,8 @@ pub struct CatalogConfig {
     /// Sent as `?warehouse=` to `/v1/config` (Polaris: the catalog name).
     pub warehouse: Option<String>,
     pub auth: CatalogAuth,
+    /// Send `X-Iceberg-Access-Delegation: vended-credentials` on `loadTable`.
+    pub vended_credentials: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -133,6 +151,7 @@ impl fmt::Debug for CatalogConfig {
             .field("uri", &self.uri)
             .field("warehouse", &self.warehouse)
             .field("auth", &auth)
+            .field("vended_credentials", &self.vended_credentials)
             .finish()
     }
 }
@@ -174,10 +193,20 @@ impl CatalogConfig {
             }
             (None, None) => CatalogAuth::None,
         };
+        let vended_credentials = match get(ENV_VENDED).as_deref() {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(v) => {
+                return Err(CatalogError::Config(format!(
+                    "{ENV_VENDED} must be true or false, got {v:?}"
+                )));
+            }
+        };
         Ok(Some(Self {
             uri: uri.trim_end_matches('/').to_owned(),
             warehouse: get(ENV_WAREHOUSE),
             auth,
+            vended_credentials,
         }))
     }
 }
@@ -216,6 +245,7 @@ impl InMemoryCatalog {
             ident: ident.clone(),
             metadata_location,
             metadata,
+            storage: BTreeMap::new(),
         };
         self.lock()
             .entry(ident.namespace)
@@ -292,6 +322,13 @@ mod tests {
         assert!(!format!("{client:?}").contains("s3cret"));
         assert!(cfg(&[(ENV_CREDENTIAL, "no-colon")]).is_err());
         assert!(cfg(&[(ENV_TOKEN, "a"), (ENV_CREDENTIAL, "b:c")]).is_err());
+        assert!(
+            cfg(&[(ENV_VENDED, "true")])
+                .unwrap()
+                .unwrap()
+                .vended_credentials
+        );
+        assert!(cfg(&[(ENV_VENDED, "yes")]).is_err());
         assert_eq!(encode("gold\u{1f}fin ance"), "gold%1Ffin%20ance");
     }
 

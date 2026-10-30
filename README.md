@@ -110,6 +110,7 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_CATALOG_TOKEN` | unset | Bearer token. Secrets come from env only and are never logged. |
 | `PLIMSOLL_CATALOG_CREDENTIAL` | unset | OAuth2 `client_id:client_secret` (Polaris); exclusive with the token |
 | `PLIMSOLL_CATALOG_SCOPE` | `PRINCIPAL_ROLE:ALL` | OAuth2 scope |
+| `PLIMSOLL_CATALOG_VENDED_CREDENTIALS` | `false` | `true` asks the catalog for per-table storage credentials (Polaris credential vending) |
 
 ### SQL API
 

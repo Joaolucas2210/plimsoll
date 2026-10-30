@@ -32,6 +32,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Iceberg REST catalog contract + in-memory implementation (`plimsoll-control::catalog`)
 - [x] HTTP implementation of the catalog client (Polaris), `reqwest` + rustls (ADR 0008)
 - [x] Catalog namespaces as schemas; tables resolved per query (fresh snapshots)
+- [x] Catalog-vended storage credentials, scoped per table (ADR 0009)
 - [x] Admission: running/queued limits globally, per resource group, per user (RAII slots)
 - [x] Query registry + per-query deadline (queue wait + execution)
 - [x] `system.runtime.queries` schema + snapshot source
@@ -41,10 +42,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Catalog-vended credentials (Polaris)**: request
-`X-Iceberg-Access-Delegation: vended-credentials` on `loadTable` and scan
-with per-table, short-lived S3 credentials (ADR 0009). Then manifest pruning
-(partition summaries, column bounds) and delete-file support (ADR 0007).
+**Manifest pruning**: skip manifests by partition summaries and data files
+by column bounds before opening them, so selective queries on large tables
+read (and reserve) only what they need. Then delete-file support (ADR 0007).
 
 ## Later
 

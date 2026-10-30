@@ -44,8 +44,11 @@ impl SchemaProvider for CatalogSchema {
         let location = loaded.metadata_location.ok_or_else(|| {
             DataFusionError::Plan(format!("{ident} has no metadata-location (staged table?)"))
         })?;
+        // Vended credentials (if the catalog sent any) scope this table's
+        // reads; they are fetched fresh with every query.
         let connector =
-            IcebergConnector::from_metadata(ident.to_string(), &location, &loaded.metadata)?;
+            IcebergConnector::from_metadata(ident.to_string(), &location, &loaded.metadata)?
+                .with_storage_properties(&loaded.storage)?;
         Ok(Some(connector.provider()))
     }
 
@@ -100,6 +103,60 @@ mod tests {
         json!({"format-version": 2, "current-schema-id": 0, "current-snapshot-id": -1,
                "schemas": [{"schema-id": 0, "fields": [
                    {"id": 1, "name": column, "type": "long", "required": true}]}]})
+    }
+
+    /// Live: REST catalog + S3 that enforces credentials. The process env has
+    /// *wrong* AWS keys; `PLIMSOLL_TEST_VENDED=key:secret` are valid ones that
+    /// a vending catalog (simulated here) hands out with `loadTable`.
+    #[tokio::test]
+    #[ignore = "needs PLIMSOLL_CATALOG_URI, an S3 warehouse and PLIMSOLL_TEST_VENDED"]
+    async fn reads_with_catalog_vended_credentials() {
+        use plimsoll_control::catalog::{CatalogConfig, LoadedTable};
+        use plimsoll_control::rest::RestCatalog;
+        use plimsoll_core::engine::Engine;
+        use plimsoll_core::memory::CeilingPool;
+
+        let (Some(cfg), Ok(vended)) = (
+            CatalogConfig::from_lookup(|k| std::env::var(k).ok()).unwrap(),
+            std::env::var("PLIMSOLL_TEST_VENDED"),
+        ) else {
+            return;
+        };
+        let (key, secret) = vended.split_once(':').unwrap();
+
+        struct Vending(RestCatalog, String, String);
+        #[async_trait]
+        impl Catalog for Vending {
+            async fn list_namespaces(&self) -> Result<Vec<Namespace>, CatalogError> {
+                self.0.list_namespaces().await
+            }
+            async fn list_tables(&self, ns: &Namespace) -> Result<Vec<TableIdent>, CatalogError> {
+                self.0.list_tables(ns).await
+            }
+            async fn load_table(&self, id: &TableIdent) -> Result<LoadedTable, CatalogError> {
+                let mut t = self.0.load_table(id).await?;
+                t.storage.insert("s3.access-key-id".into(), self.1.clone());
+                t.storage
+                    .insert("s3.secret-access-key".into(), self.2.clone());
+                Ok(t)
+            }
+        }
+
+        let run = async |catalog: Arc<dyn Catalog>| {
+            let pool = Arc::new(CeilingPool::new(256 << 20, 32 << 20).unwrap());
+            let engine = Engine::new(pool, None).unwrap();
+            register(engine.context(), catalog).await.unwrap();
+            engine.sql("SELECT count(*) FROM bronze.trips").await
+        };
+        let plain = Arc::new(RestCatalog::connect(cfg.clone()).await.unwrap());
+        assert!(run(plain).await.is_err(), "env credentials are wrong");
+        let vending = Vending(
+            RestCatalog::connect(cfg).await.unwrap(),
+            key.to_owned(),
+            secret.to_owned(),
+        );
+        let batches = run(Arc::new(vending)).await.unwrap();
+        assert_eq!(batches[0].num_rows(), 1);
     }
 
     #[tokio::test]
