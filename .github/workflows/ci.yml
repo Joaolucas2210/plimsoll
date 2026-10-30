@@ -50,9 +50,12 @@ jobs:
             {"name": "reader", "credentials": [{"accessKey": "reader", "secretKey": "readersecret"}],
              "actions": ["Read", "List"]}]}
           JSON
+          # Small volumes, fixed slot count: by default SeaweedFS derives free
+          # slots from runner disk / 30 GB and can run out ("No writable volumes").
           docker run -d --name s3 --network lake -p 8333:8333 -v "$RUNNER_TEMP/s3:/etc/plimsoll:ro" \
             chrislusf/seaweedfs@sha256:c2658820e763294a9e9de7b36c81e59b879e3459148351aee4e31a126ca64860 \
-            server -s3 -s3.config=/etc/plimsoll/s3.json -dir=/data
+            server -s3 -s3.config=/etc/plimsoll/s3.json -dir=/data \
+            -master.volumeSizeLimitMB=64 -volume.max=64
           docker run -d --name rest --network lake -p 8181:8181 \
             -e AWS_ACCESS_KEY_ID=admin -e AWS_SECRET_ACCESS_KEY=password -e AWS_REGION=us-east-1 \
             -e CATALOG_WAREHOUSE=s3://warehouse/ -e CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO \
