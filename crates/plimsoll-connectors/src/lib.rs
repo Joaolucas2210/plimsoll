@@ -12,7 +12,7 @@ pub mod iceberg;
 pub mod parquet;
 pub mod postgres;
 
-pub use iceberg::IcebergConnector;
+pub use iceberg::{AsOf, IcebergConnector};
 pub use parquet::ParquetConnector;
 pub use postgres::{PG_URL_ENV, PostgresConnector};
 

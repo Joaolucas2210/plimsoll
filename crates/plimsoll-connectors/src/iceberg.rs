@@ -53,6 +53,61 @@ mod prune;
 use deletes::{DeleteFile, EqualityDelete};
 use prune::{PartitionField, Prim, Pruner, Summary};
 
+/// A point in a table's history for time travel (ADR 0028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsOf {
+    /// A snapshot id.
+    Snapshot(i64),
+    /// The snapshot that was current at this instant (ms since the epoch).
+    TimestampMs(i64),
+}
+
+impl AsOf {
+    /// `4876546583428101137` (snapshot id) or an RFC 3339 instant
+    /// (`2024-05-01T00:00:00Z`). Anything else is not a time-travel spec.
+    pub fn parse(spec: &str) -> Option<Self> {
+        if let Ok(id) = spec.parse::<i64>() {
+            return Some(Self::Snapshot(id));
+        }
+        chrono::DateTime::parse_from_rfc3339(spec)
+            .ok()
+            .map(|t| Self::TimestampMs(t.timestamp_millis()))
+    }
+}
+
+/// `metadata` with `as_of` made current: `current-snapshot-id`, and
+/// `current-schema-id` when the snapshot records the schema it was written
+/// with, so old snapshots read with their own columns. Timestamps resolve
+/// through `snapshot-log` (the main branch's history), never through
+/// `snapshots`, which may hold other branches. Errors are messages for the
+/// caller (a bad id or an instant before the first snapshot).
+pub fn at(metadata: &Json, as_of: AsOf) -> Result<Json, String> {
+    let id = match as_of {
+        AsOf::Snapshot(id) => id,
+        AsOf::TimestampMs(ts) => {
+            let log = metadata["snapshot-log"]
+                .as_array()
+                .ok_or("table has no snapshot-log to travel by time")?;
+            log.iter()
+                .filter_map(|e| Some((e["timestamp-ms"].as_i64()?, e["snapshot-id"].as_i64()?)))
+                .filter(|(t, _)| *t <= ts)
+                .max_by_key(|(t, _)| *t)
+                .map(|(_, id)| id)
+                .ok_or_else(|| format!("no snapshot at or before {ts} ms"))?
+        }
+    };
+    let snapshot = metadata["snapshots"]
+        .as_array()
+        .and_then(|s| s.iter().find(|s| s["snapshot-id"].as_i64() == Some(id)))
+        .ok_or_else(|| format!("snapshot {id} not found"))?;
+    let mut pinned = metadata.clone();
+    pinned["current-snapshot-id"] = Json::from(id);
+    if let Some(schema) = snapshot["schema-id"].as_i64() {
+        pinned["current-schema-id"] = Json::from(schema);
+    }
+    Ok(pinned)
+}
+
 #[derive(Debug)]
 pub struct IcebergConnector {
     name: String,
@@ -659,8 +714,10 @@ impl TableProvider for IcebergTable {
         }
         Ok(Arc::new(AccountedExec::new(
             format!(
-                "IcebergScan[{}] manifests={}/{} files={}/{} deletes={} deleted_rows={} equality_deletes={} delete_cache_hits={}",
+                "IcebergScan[{}] snapshot={} manifests={}/{} files={}/{} deletes={} deleted_rows={} equality_deletes={} delete_cache_hits={}",
                 self.name,
+                self.snapshot_id
+                    .map_or("none".to_owned(), |id| id.to_string()),
                 stats.manifests_read,
                 stats.manifests,
                 stats.files_kept,

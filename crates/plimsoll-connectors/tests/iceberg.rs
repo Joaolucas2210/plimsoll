@@ -812,3 +812,88 @@ async fn planning_fetches_manifests_concurrently() {
         "{concurrent:?} vs {sequential:?}"
     );
 }
+
+/// Time travel on the Spark MOR table (ADR 0028): the first snapshot is the
+/// plain insert (48 rows, no deletes yet); the second applies `DELETE id % 3
+/// = 0`; by instant, the first snapshot-log entry's time selects the first.
+#[tokio::test]
+#[ignore = "needs PLIMSOLL_ICEBERG_MOR from scripts/spark_mor_fixture.sh"]
+async fn time_travels_a_spark_table() {
+    use plimsoll_connectors::AsOf;
+    use plimsoll_connectors::iceberg::at;
+
+    let Ok(location) = std::env::var("PLIMSOLL_ICEBERG_MOR") else {
+        return;
+    };
+    // Hadoop catalog: newest vN.metadata.json.
+    let newest = std::fs::read_dir(Path::new(&location).join("metadata"))
+        .unwrap()
+        .filter_map(|e| {
+            let name = e.unwrap().file_name().into_string().unwrap();
+            let n: u64 = name
+                .strip_prefix('v')?
+                .strip_suffix(".metadata.json")?
+                .parse()
+                .ok()?;
+            Some((n, name))
+        })
+        .max()
+        .unwrap()
+        .1;
+    let path = format!("{location}/metadata/{newest}");
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let log = meta["snapshot-log"].as_array().unwrap();
+    let (first, second) = (&log[0], &log[1]);
+    let totals = async |as_of: AsOf| {
+        let pool = Arc::new(CeilingPool::new(256 << 20, 0).unwrap());
+        let ctx = session_context_with_ceiling(pool.clone(), None, SessionConfig::new()).unwrap();
+        let pinned = at(&meta, as_of).unwrap();
+        IcebergConnector::from_metadata("t", &path, &pinned)
+            .unwrap()
+            .register(&ctx)
+            .unwrap();
+        let b = ctx
+            .sql("SELECT count(*) AS n, sum(id) AS s FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let col = |i| {
+            b[0].column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(pool.used(), 0);
+        (col(0), col(1))
+    };
+    let id = |e: &serde_json::Value| e["snapshot-id"].as_i64().unwrap();
+    assert_eq!(totals(AsOf::Snapshot(id(first))).await, (48, 1128));
+    assert_eq!(totals(AsOf::Snapshot(id(second))).await, (32, 768));
+    let ts = first["timestamp-ms"].as_i64().unwrap();
+    assert_eq!(totals(AsOf::TimestampMs(ts)).await, (48, 1128));
+    // Before the first snapshot there is nothing to read.
+    assert!(at(&meta, AsOf::TimestampMs(ts - 1)).is_err());
+}
+
+#[test]
+fn as_of_parses_snapshot_ids_and_instants() {
+    use plimsoll_connectors::AsOf;
+    assert_eq!(
+        AsOf::parse("4876546583428101137"),
+        Some(AsOf::Snapshot(4876546583428101137))
+    );
+    assert_eq!(
+        AsOf::parse("2024-05-01T00:00:00Z"),
+        Some(AsOf::TimestampMs(1_714_521_600_000))
+    );
+    assert_eq!(
+        AsOf::parse("2024-05-01T02:00:00+02:00"),
+        Some(AsOf::TimestampMs(1_714_521_600_000)),
+        "offsets normalise to UTC"
+    );
+    assert_eq!(AsOf::parse("yesterday"), None);
+    assert_eq!(AsOf::parse("2024-05-01"), None, "a date is not an instant");
+}

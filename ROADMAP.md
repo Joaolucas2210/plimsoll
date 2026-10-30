@@ -47,6 +47,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Iceberg time travel: `"table@<snapshot-id>"` / `"table@<RFC 3339 instant>"`, snapshot's own schema, grants unchanged (ADR 0028)
 - [x] Structured JSON logs: one `query` line per request (identity, outcome, phase timings, SQL fingerprint, never SQL text) (ADR 0027)
 - [x] SIGTERM drain: readiness off, keep serving for `PLIMSOLL_DRAIN_DELAY_MS`, then close (ADR 0026)
 - [x] Per-schema data grants per principal, checked on every table scan before execution (ADR 0025)
@@ -59,10 +60,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Iceberg time travel**: read a table as of a snapshot id or timestamp
-(`snapshots` / `snapshot-log` are already in the metadata Plimsoll reads),
-under the same pruning, delete and grant rules; syntax to be decided in the
-ADR (DataFusion does not plan `FOR SYSTEM_TIME AS OF`).
+**Iceberg branches and tags**: `refs` in table metadata name snapshots
+(`main`, `audit-2024q1`); resolve `"trips@<ref>"` through them, keeping
+snapshot ids and instants as today (ADR 0028).
 
 ## Later
 

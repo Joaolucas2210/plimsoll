@@ -92,6 +92,9 @@ curl -s -XPOST localhost:8080/v1/sql -H 'content-type: application/json' \
 curl -s localhost:8080/metrics
 ```
 
+Time travel on catalog tables: `SELECT * FROM bronze."trips@<snapshot-id>"`
+or `bronze."trips@2024-05-01T00:00:00Z"` (ADR 0028).
+
 Local experiments without tokens: `PLIMSOLL_AUTH=disabled` (then `user` is
 read from the request body and trusted as sent).
 

@@ -3,11 +3,16 @@
 //! `SELECT * FROM bronze.trips` resolves `bronze.trips` through the catalog's
 //! `loadTable` on *every* query, so new commits are visible without a
 //! restart and a dropped table disappears. Read-only: DDL goes to the catalog.
+//!
+//! Time travel (ADR 0028): `bronze."trips@<snapshot-id>"` or
+//! `bronze."trips@2024-05-01T00:00:00Z"` reads the table as of that snapshot
+//! or instant. The reference stays in its schema, so grants apply unchanged.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use plimsoll_connectors::{Connector, IcebergConnector};
+use plimsoll_connectors::iceberg;
+use plimsoll_connectors::{AsOf, Connector, IcebergConnector};
 use plimsoll_control::catalog::{Catalog, CatalogError, Namespace, TableIdent};
 use plimsoll_core::datafusion::catalog::{SchemaProvider, TableProvider};
 use plimsoll_core::datafusion::error::{DataFusionError, Result};
@@ -35,7 +40,15 @@ impl SchemaProvider for CatalogSchema {
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        let ident = TableIdent::new(self.namespace.clone(), name);
+        // `table@spec` only when `spec` parses; otherwise `@` is part of a name.
+        let (base, as_of) = match name
+            .rsplit_once('@')
+            .and_then(|(t, spec)| Some((t, AsOf::parse(spec)?)))
+        {
+            Some((t, a)) => (t, Some(a)),
+            None => (name, None),
+        };
+        let ident = TableIdent::new(self.namespace.clone(), base);
         let loaded = match self.catalog.load_table(&ident).await {
             Ok(t) => t,
             Err(CatalogError::TableNotFound(_)) => return Ok(None),
@@ -46,9 +59,17 @@ impl SchemaProvider for CatalogSchema {
         })?;
         // Vended credentials (if the catalog sent any) scope this table's
         // reads; they are fetched fresh with every query.
-        let connector =
-            IcebergConnector::from_metadata(ident.to_string(), &location, &loaded.metadata)?
-                .with_storage_properties(&loaded.storage)?;
+        let metadata = match as_of {
+            None => loaded.metadata,
+            Some(as_of) => iceberg::at(&loaded.metadata, as_of)
+                .map_err(|m| DataFusionError::Plan(format!("{ident}@: {m}")))?,
+        };
+        let connector = IcebergConnector::from_metadata(
+            format!("{}.{name}", self.namespace),
+            &location,
+            &metadata,
+        )?
+        .with_storage_properties(&loaded.storage)?;
         Ok(Some(connector.provider()))
     }
 
@@ -200,5 +221,66 @@ mod tests {
 
         let err = ctx.sql("SELECT * FROM silver.nope").await.unwrap_err();
         assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    /// Two snapshots with different schemas: `a` (snapshot 1, t=100 ms),
+    /// then `b` (snapshot 2, t=200 ms, current).
+    fn two_snapshots() -> serde_json::Value {
+        let schema = |id, col: &str| {
+            json!({"schema-id": id, "fields": [
+            {"id": id + 1, "name": col, "type": "long", "required": true}]})
+        };
+        json!({"format-version": 2, "current-schema-id": 1, "current-snapshot-id": 2,
+               "schemas": [schema(0, "a"), schema(1, "b")],
+               "snapshots": [
+                   {"snapshot-id": 1, "schema-id": 0, "timestamp-ms": 100, "manifest-list": "file:///l1.avro"},
+                   {"snapshot-id": 2, "schema-id": 1, "timestamp-ms": 200, "manifest-list": "file:///l2.avro"}],
+               "snapshot-log": [
+                   {"snapshot-id": 1, "timestamp-ms": 100},
+                   {"snapshot-id": 2, "timestamp-ms": 200}]})
+    }
+
+    #[tokio::test]
+    async fn time_travel_by_snapshot_id_or_instant() {
+        let cat = Arc::new(InMemoryCatalog::default());
+        let ident = TableIdent::new(Namespace::new(&["silver"]), "users");
+        cat.put_table(
+            ident,
+            Some("file:///wh/silver/users/metadata/2.metadata.json".to_owned()),
+            two_snapshots(),
+        );
+        let ctx = SessionContext::new();
+        register(&ctx, cat).await.unwrap();
+        // Logical planning resolves the table and its schema at that point.
+        let plans = async |sql: &str| ctx.sql(sql).await.map(|_| ()).map_err(|e| e.to_string());
+        assert!(plans("SELECT b FROM silver.users").await.is_ok());
+        assert!(plans("SELECT a FROM silver.\"users@1\"").await.is_ok());
+        assert!(
+            plans("SELECT b FROM silver.\"users@1\"").await.is_err(),
+            "old schema"
+        );
+        assert!(
+            plans("SELECT a FROM silver.\"users@1970-01-01T00:00:00.150Z\"")
+                .await
+                .is_ok()
+        );
+        assert!(
+            plans("SELECT b FROM silver.\"users@1970-01-01T00:00:00.250Z\"")
+                .await
+                .is_ok()
+        );
+        let err = plans("SELECT * FROM silver.\"users@1970-01-01T00:00:00.050Z\"")
+            .await
+            .unwrap_err();
+        assert!(err.contains("no snapshot at or before"), "{err}");
+        let err = plans("SELECT * FROM silver.\"users@999\"")
+            .await
+            .unwrap_err();
+        assert!(err.contains("snapshot 999 not found"), "{err}");
+        // Not a time-travel spec: the whole name is looked up (and missing).
+        let err = plans("SELECT * FROM silver.\"users@yesterday\"")
+            .await
+            .unwrap_err();
+        assert!(err.contains("not found"), "{err}");
     }
 }
