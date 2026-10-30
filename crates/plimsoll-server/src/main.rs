@@ -82,6 +82,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }),
         query_timeout: cfg.query_timeout,
         ready: AtomicBool::new(false),
+        serving: AtomicBool::new(false),
         started: Instant::now(),
         errors: Default::default(),
         latency: Default::default(),
@@ -102,21 +103,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else if !cfg.auth.grants_enforced() {
         eprintln!("WARNING: PLIMSOLL_AUTH_GRANTS unset: every principal reads every schema");
     }
+    state.serving.store(true, Ordering::Relaxed);
     state.ready.store(true, Ordering::Relaxed);
 
     axum::serve(listener, app::router(state.clone()))
-        .with_graceful_shutdown(shutdown_signal(state))
+        .with_graceful_shutdown(shutdown_signal(state, cfg.drain_delay))
         .await?;
     eprintln!("plimsoll-server stopped");
     Ok(())
 }
 
-/// Resolves on SIGTERM or ctrl-c and marks the node not ready.
-///
-/// ponytail: no drain delay between "not ready" and closing the listener.
-/// Upgrade path: sleep `PLIMSOLL_DRAIN_DELAY_MS` here so load balancers observe
-/// `/readyz` = 503 before connections are refused.
-async fn shutdown_signal(state: Arc<AppState>) {
+/// Resolves when the listener should close. SIGTERM (an orchestrator) drains
+/// first: `/readyz` turns 503 and queries are still served for `delay`
+/// (ADR 0026). ctrl-c (a person at a terminal) closes at once.
+async fn shutdown_signal(state: Arc<AppState>, delay: std::time::Duration) {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
             eprintln!("ctrl-c handler failed: {e}");
@@ -138,10 +138,11 @@ async fn shutdown_signal(state: Arc<AppState>) {
     #[cfg(not(unix))]
     let term = std::future::pending::<()>();
 
-    tokio::select! {
-        () = ctrl_c => {},
-        () = term => {},
-    }
-    state.ready.store(false, Ordering::Relaxed);
-    eprintln!("shutdown requested: draining in-flight queries");
+    let delay = tokio::select! {
+        () = ctrl_c => std::time::Duration::ZERO,
+        () = term => delay,
+    };
+    eprintln!("shutdown requested: not ready, serving for {delay:?} before closing");
+    app::drain(&state, delay).await;
+    eprintln!("closing the listener; draining in-flight queries");
 }

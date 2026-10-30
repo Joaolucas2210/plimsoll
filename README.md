@@ -111,6 +111,7 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_MAX_QUEUED` | `64` | Max queued queries (0 = reject when busy) |
 | `PLIMSOLL_MAX_RUNNING_PER_USER` | `PLIMSOLL_MAX_RUNNING` | Per-user running limit |
 | `PLIMSOLL_QUERY_TIMEOUT_MS` | `30000` | Deadline for queue wait + execution |
+| `PLIMSOLL_DRAIN_DELAY_MS` | `5000` | After SIGTERM: `/readyz` is 503 but queries are still served for this long, then the listener closes (ctrl-c skips it) (ADR 0026) |
 | `PLIMSOLL_SPILL_DIR` | unset | Spill directory; unset = no spill, pressure fails the query |
 | `PLIMSOLL_PARQUET_TABLES` | unset | `bronze.trips=/data/trips/,gold.daily=/data/d.parquet` |
 | `PLIMSOLL_ICEBERG_TABLES` | unset | `bronze.trips=/wh/bronze/trips` (table dir or `*.metadata.json`) |

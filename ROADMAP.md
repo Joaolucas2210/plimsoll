@@ -47,6 +47,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] SIGTERM drain: readiness off, keep serving for `PLIMSOLL_DRAIN_DELAY_MS`, then close (ADR 0026)
 - [x] Per-schema data grants per principal, checked on every table scan before execution (ADR 0025)
 - [x] Read-only query API: no DDL/DML/COPY/SET through `/v1/sql` (closed arbitrary file read/write, ADR 0024)
 - [x] Configurable resource groups with their own limits, bound to principals; unknown group 400, unbound 403 (ADR 0023)
@@ -57,10 +58,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Readiness drain delay**: on SIGTERM, readiness flips and the listener
-closes at once, so a load balancer still routing to the pod gets connection
-errors during its probe interval. Keep serving for a configurable delay after
-readiness flips, then stop accepting.
+**Structured logs**: one JSON line per finished query (`query_id`, `user`,
+`resource_group`, `code`, phase timings) instead of `eprintln!`, so failures
+can be found by user or code without the registry (ADRs 0013, 0019).
 
 ## Later
 

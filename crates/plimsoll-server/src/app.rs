@@ -28,8 +28,12 @@ pub struct AppState {
     pub admission: Admission,
     pub pool_stats: PoolStatsProvider,
     pub query_timeout: Duration,
-    /// False while starting and while draining after SIGTERM.
+    /// `/readyz`: false while starting and from SIGTERM on, so load
+    /// balancers stop routing here.
     pub ready: AtomicBool,
+    /// `/v1/sql` accepts queries: false only while starting. Stays true
+    /// while draining, so requests still routed here are served (ADR 0026).
+    pub serving: AtomicBool,
     pub started: Instant,
     /// `/v1/sql` errors by `code`, for `plimsoll_query_errors_total`.
     pub errors: ErrorCounts,
@@ -106,6 +110,15 @@ async fn metrics_handler(State(st): State<Arc<AppState>>) -> Response {
         &st.latency,
     );
     ([(header::CONTENT_TYPE, metrics::CONTENT_TYPE)], body).into_response()
+}
+
+/// SIGTERM handling (ADR 0026): stop advertising readiness, keep serving for
+/// `delay` so load balancers that still route here (until their next probe)
+/// get answers instead of refused connections, then return so the caller
+/// closes the listener and drains in-flight requests.
+pub async fn drain(state: &AppState, delay: Duration) {
+    state.ready.store(false, Ordering::Relaxed);
+    tokio::time::sleep(delay).await;
 }
 
 /// `{"query_id":..,"columns":..,"rows":<rows_json>}` sent as three chunks, so
@@ -228,7 +241,7 @@ async fn sql(
             return r;
         }
     };
-    if !st.ready.load(Ordering::Relaxed) {
+    if !st.serving.load(Ordering::Relaxed) {
         return ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "not_ready", true).respond(
             &st,
             "server is not accepting queries",
@@ -379,6 +392,7 @@ mod tests {
             }),
             query_timeout: timeout,
             ready: AtomicBool::new(true),
+            serving: AtomicBool::new(true),
             started: Instant::now(),
             errors: ErrorCounts::default(),
             latency: Latency::default(),
@@ -798,10 +812,35 @@ mod tests {
         assert!(metrics.contains("plimsoll_query_errors_total{code=\"unsupported_feature\"} 1"));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn drain_unadvertises_but_keeps_serving_for_the_delay() {
+        let st = default_state();
+        let drain = tokio::spawn({
+            let st = st.clone();
+            async move { drain(&st, Duration::from_secs(5)).await }
+        });
+        tokio::task::yield_now().await;
+        // Load balancers see "not ready" at once...
+        assert_eq!(
+            call(router(st.clone()), get_req("/readyz")).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // ...but requests they still send are served during the delay.
+        let (status, body) = call(
+            router(st.clone()),
+            sql_req(json!({"sql": "select 1", "user": "ana"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!drain.is_finished());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        drain.await.unwrap();
+    }
+
     #[tokio::test]
     async fn sql_rejected_when_not_ready() {
         let st = default_state();
-        st.ready.store(false, Ordering::Relaxed);
+        st.serving.store(false, Ordering::Relaxed);
         let (status, body) = call(
             router(st),
             sql_req(json!({"sql": "select 1", "user": "ana"})),

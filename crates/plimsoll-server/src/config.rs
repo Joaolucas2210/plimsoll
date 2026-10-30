@@ -25,6 +25,8 @@ pub struct Config {
     pub admission: AdmissionConfig,
     /// Deadline covering queue wait + execution.
     pub query_timeout: Duration,
+    /// SIGTERM: how long to keep serving after `/readyz` turns 503.
+    pub drain_delay: Duration,
     /// Who may run SQL (ADR 0021).
     pub auth: Auth,
 }
@@ -51,6 +53,14 @@ impl Config {
         )?;
         let user_running = positive(&lookup, "PLIMSOLL_MAX_RUNNING_PER_USER", max_running)?;
         let timeout_ms = positive(&lookup, "PLIMSOLL_QUERY_TIMEOUT_MS", 30_000)?;
+        // Longer than a typical readiness probe period (Kubernetes: 10 s
+        // period, often 5 s); 0 disables the delay.
+        let drain_ms: u64 = parse(
+            &lookup,
+            "PLIMSOLL_DRAIN_DELAY_MS",
+            Some(5_000),
+            "expected a non-negative integer",
+        )?;
 
         let global = Limits {
             max_running,
@@ -72,6 +82,7 @@ impl Config {
             memory_limit_bytes,
             admission,
             query_timeout: Duration::from_millis(timeout_ms),
+            drain_delay: Duration::from_millis(drain_ms),
             auth,
         })
     }

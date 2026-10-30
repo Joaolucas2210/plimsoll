@@ -33,6 +33,7 @@ are allowed in place.
 | [0023](0023-resource-groups.md) | Configurable resource groups bound to principals | Accepted | 2026-10-30 | Closed set of groups (`default` + `PLIMSOLL_RESOURCE_GROUPS`) with own running/queued limits; `PLIMSOLL_AUTH_GROUPS` binds principals, first = default; unknown 400, unbound 403 | 0004, 0013, 0021, 0022 |
 | [0024](0024-read-only-query-api.md) | Read-only query API | Accepted | 2026-10-30 | User SQL runs with DDL, DML (incl. `COPY`) and statements (`SET`) disabled: closes arbitrary server file read/write and shared-catalog mutation | 0002, 0004, 0013, 0021 |
 | [0025](0025-schema-grants.md) | Per-schema data grants | Accepted | 2026-10-30 | `PLIMSOLL_AUTH_GRANTS` lists readable schemas per principal; the engine checks every `TableScan` (subqueries, CTEs, joins) through a `TableAccess` policy before anything executes; denial is 403 | 0002, 0013, 0021, 0022, 0024 |
+| [0026](0026-shutdown-drain.md) | Shutdown drain: unadvertise, keep serving, then close | Accepted | 2026-10-30 | Readiness and serving are separate flags; SIGTERM turns `/readyz` 503 but serves queries for `PLIMSOLL_DRAIN_DELAY_MS` (5 s) before closing; ctrl-c closes at once | 0004, 0013 |
 
 ## Reading order
 

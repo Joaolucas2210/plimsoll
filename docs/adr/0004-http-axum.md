@@ -61,7 +61,7 @@ Six series rendered from values read at scrape time (`metrics::render`) vs
   valid but cannot complete (ceiling, unsupported or broken table); a 5xx
   would signal an unhealthy node.
 - Shutdown: SIGTERM or ctrl-c flips `ready` to false, the listener stops
-  accepting, in-flight requests finish.
+  accepting, in-flight requests finish. SIGTERM drains first since ADR 0026.
 - Metrics (`text/plain; version=0.0.4`): `plimsoll_pool_used_bytes`,
   `plimsoll_pool_limit_bytes`, `plimsoll_spill_bytes_total`,
   `plimsoll_queries_running`, `plimsoll_queries_queued`,
@@ -80,6 +80,7 @@ table-tested. Metrics never disagree with their owners.
 - No HTTP/2 and no in-process TLS: expected behind an ingress/proxy.
 - No drain delay between "not ready" and closing the listener (`ponytail:`
   in `shutdown_signal`); load balancers may see refused connections.
+  Resolved by ADR 0026.
 - `user` in the request body was trusted as sent (`ponytail:`): no authN.
   Resolved by ADR 0021 (bearer tokens; `user` = principal).
 - Results are JSON rows built from Arrow's JSON writer; no Arrow IPC.
