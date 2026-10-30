@@ -104,6 +104,7 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_ICEBERG_TABLES` | unset | `bronze.trips=/wh/bronze/trips` (table dir or `*.metadata.json`) |
 | `PLIMSOLL_PG_TABLES` | unset | `silver.users=public.users` (needs `PLIMSOLL_PG_URL`) |
 | `PLIMSOLL_PG_URL` | unset | Postgres connection string (secret, env only) |
+| `AWS_ENDPOINT`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, ... | unset | S3 / S3-compatible storage for `s3://` tables (standard AWS env; `AWS_ALLOW_HTTP=true` for plain HTTP) |
 | `PLIMSOLL_CATALOG_URI` | unset | Iceberg REST base URI (e.g. Polaris `http://host:8181/api/catalog`) |
 | `PLIMSOLL_CATALOG_WAREHOUSE` | unset | Sent to `/v1/config` (Polaris: catalog name) |
 | `PLIMSOLL_CATALOG_TOKEN` | unset | Bearer token. Secrets come from env only and are never logged. |
@@ -154,6 +155,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 - [ADR 0006 — Pushdown policy](docs/adr/0006-pushdown-policy.md)
 - [ADR 0007 — Iceberg read path under the ceiling](docs/adr/0007-iceberg-read-path.md)
 - [ADR 0008 — Iceberg REST catalog client](docs/adr/0008-rest-catalog-client.md)
+- [ADR 0009 — Object storage](docs/adr/0009-object-storage.md)
 
 Roadmap: [ROADMAP.md](ROADMAP.md).
 

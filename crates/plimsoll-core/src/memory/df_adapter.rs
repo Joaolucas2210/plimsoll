@@ -74,6 +74,7 @@ pub fn runtime_env(pool: Arc<CeilingPool>, spill_dir: Option<PathBuf>) -> Result
     RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
         .with_disk_manager_builder(DiskManagerBuilder::default().with_mode(mode))
+        .with_object_store_registry(Arc::new(crate::storage::LazyObjectStores::default()))
         .build_arc()
 }
 

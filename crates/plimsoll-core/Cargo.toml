@@ -12,6 +12,9 @@ async-trait.workspace = true
 futures.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# ADR 0009: S3 (and S3-compatible) object stores; same version DataFusion uses.
+object_store = { version = "0.13", default-features = false, features = ["aws"] }
+url = "2"
 
 [lints]
 workspace = true

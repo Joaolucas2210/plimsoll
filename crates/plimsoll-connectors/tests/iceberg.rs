@@ -251,14 +251,17 @@ async fn read_path_runs_under_the_ceiling() {
     }
 }
 
-/// `uv run scripts/iceberg_fixture.py` prints the env for this test.
+/// `uv run scripts/iceberg_fixture.py` prints the env for this test; the
+/// location may be local or `s3://` (with `AWS_ENDPOINT` etc. set).
 #[tokio::test]
 #[ignore = "needs PLIMSOLL_ICEBERG_FIXTURE from scripts/iceberg_fixture.py"]
 async fn reads_a_pyiceberg_table() {
     let Ok(location) = std::env::var("PLIMSOLL_ICEBERG_FIXTURE") else {
         return;
     };
-    let ctx = SessionContext::new();
+    // Engine runtime: object stores (file://, s3:// from AWS_* env) on demand.
+    let pool = Arc::new(CeilingPool::new(256 << 20, 0).unwrap());
+    let ctx = session_context_with_ceiling(pool, None, SessionConfig::new()).unwrap();
     IcebergConnector::try_new("t", &location, &ctx.state())
         .await
         .unwrap()

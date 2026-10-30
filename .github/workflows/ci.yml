@@ -47,7 +47,7 @@ jobs:
       - run: cargo test -p plimsoll-connectors -- --ignored
 
   iceberg-interop:
-    name: iceberg interop (pyiceberg, REST catalog)
+    name: iceberg interop (pyiceberg, REST catalog, S3)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,16 +56,34 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv run scripts/iceberg_fixture.py "$RUNNER_TEMP/wh" | tail -1 >> "$GITHUB_ENV"
       - run: cargo test -p plimsoll-connectors --test iceberg -- --ignored
-      # Reference REST catalog sharing the warehouse path with the runner.
-      - name: start apache/iceberg-rest-fixture
+      # Reference REST catalog with an S3 warehouse (SeaweedFS): no shared
+      # filesystem, and Plimsoll reads metadata and data through s3://.
+      - name: start SeaweedFS (S3) and apache/iceberg-rest-fixture
         run: |
-          mkdir -m 777 /tmp/iceberg_warehouse
-          docker run -d --user "$(id -u):$(id -g)" -p 8181:8181 \
-            -e CATALOG_WAREHOUSE=/tmp/iceberg_warehouse \
-            -v /tmp/iceberg_warehouse:/tmp/iceberg_warehouse apache/iceberg-rest-fixture
+          docker network create lake
+          docker run -d --name s3 --network lake -p 8333:8333 \
+            chrislusf/seaweedfs@sha256:c2658820e763294a9e9de7b36c81e59b879e3459148351aee4e31a126ca64860 \
+            server -s3 -dir=/data
+          for i in $(seq 1 60); do curl -sf -o /dev/null localhost:8333/ && break; sleep 2; done
+          curl -sf -X PUT localhost:8333/warehouse
+          docker run -d --name rest --network lake -p 8181:8181 \
+            -e AWS_ACCESS_KEY_ID=admin -e AWS_SECRET_ACCESS_KEY=password -e AWS_REGION=us-east-1 \
+            -e CATALOG_WAREHOUSE=s3://warehouse/ -e CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO \
+            -e CATALOG_S3_ENDPOINT=http://s3:8333 -e CATALOG_S3_PATH__STYLE__ACCESS=true \
+            apache/iceberg-rest-fixture
           for i in $(seq 1 60); do curl -sf localhost:8181/v1/config && exit 0; sleep 2; done
-          exit 1
-      - run: uv run scripts/iceberg_fixture.py http://localhost:8181
-      - run: cargo test -p plimsoll-control live_rest_catalog -- --ignored
+          docker logs rest; exit 1
+      - run: >-
+          uv run scripts/iceberg_fixture.py http://localhost:8181
+          s3.endpoint=http://localhost:8333 s3.access-key-id=admin
+          s3.secret-access-key=password s3.region=us-east-1 | tail -1 >> "$GITHUB_ENV"
+      - run: |
+          cargo test -p plimsoll-control live_rest_catalog -- --ignored
+          cargo test -p plimsoll-connectors --test iceberg -- --ignored
         env:
           PLIMSOLL_CATALOG_URI: http://localhost:8181
+          AWS_ENDPOINT: http://localhost:8333
+          AWS_ALLOW_HTTP: "true"
+          AWS_ACCESS_KEY_ID: admin
+          AWS_SECRET_ACCESS_KEY: password
+          AWS_REGION: us-east-1

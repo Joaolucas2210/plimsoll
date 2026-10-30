@@ -6,7 +6,10 @@
 implementation) for the interop test in crates/plimsoll-connectors/tests/iceberg.rs.
 
     uv run scripts/iceberg_fixture.py <warehouse-dir>   # local SQL catalog
-    uv run scripts/iceberg_fixture.py http://host:8181  # via an Iceberg REST catalog
+    uv run scripts/iceberg_fixture.py http://host:8181 [prop=value ...]  # via a REST catalog
+
+Extra `prop=value` args are pyiceberg catalog properties, e.g. for S3:
+`s3.endpoint=http://localhost:8333 s3.access-key-id=... s3.region=us-east-1`.
 
 Prints PLIMSOLL_ICEBERG_FIXTURE=<metadata location>.
 """
@@ -20,7 +23,8 @@ from pyiceberg.catalog.sql import SqlCatalog
 
 target = sys.argv[1]
 if target.startswith("http"):
-    catalog = load_catalog("fixture", type="rest", uri=target)
+    props = dict(arg.split("=", 1) for arg in sys.argv[2:])
+    catalog = load_catalog("fixture", type="rest", uri=target, **props)
 else:
     warehouse = Path(target).resolve()
     warehouse.mkdir(parents=True, exist_ok=True)
