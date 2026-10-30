@@ -96,6 +96,47 @@ mod tests {
         dir
     }
 
+    /// A directory table sees files added after registration (no stale
+    /// listing cache, ADR 0018).
+    #[tokio::test]
+    async fn directory_tables_see_new_files() {
+        let dir = write_parquet();
+        let pool = Arc::new(
+            plimsoll_core::memory::CeilingPool::new(64 << 20, 0)
+                .unwrap()
+                .with_cache_reserve(8 << 20)
+                .unwrap(),
+        );
+        let ctx = plimsoll_core::memory::session_context_with_ceiling(
+            pool,
+            None,
+            datafusion::prelude::SessionConfig::new(),
+        )
+        .unwrap();
+        let conn =
+            ParquetConnector::try_new("cities", &format!("{}/", dir.display()), &ctx.state())
+                .await
+                .unwrap();
+        conn.register(&ctx).unwrap();
+        let count = async || {
+            let b = ctx
+                .sql("SELECT count(*) FROM cities")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            b[0].column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(count().await, 4);
+        std::fs::copy(dir.join("part-0.parquet"), dir.join("part-1.parquet")).unwrap();
+        assert_eq!(count().await, 8);
+    }
+
     #[tokio::test]
     async fn parquet_connector_scans_and_filters() {
         let dir = write_parquet();

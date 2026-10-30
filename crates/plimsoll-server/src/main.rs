@@ -44,9 +44,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let admission = Admission::new(cfg.admission, registry);
 
     // The Plimsoll line: one pool for the whole process. 1/8 is kept for
-    // result/exchange buffers so working operators can't starve the output.
+    // result/exchange buffers so working operators can't starve the output;
+    // 1/16 (at most 64 MiB) is DataFusion's caches, so they sit under the
+    // line too (ADR 0018). ponytail: fixed split; make it config when a
+    // deployment needs a bigger footer/delete cache.
     let limit = usize::try_from(cfg.memory_limit_bytes)?;
-    let pool = Arc::new(CeilingPool::new(limit, limit / 8)?);
+    let pool = Arc::new(
+        CeilingPool::new(limit, limit / 8)?.with_cache_reserve((limit / 16).min(64 << 20))?,
+    );
     // Unset = no spill: memory pressure fails the query (never the process).
     let spill_dir = std::env::var_os("PLIMSOLL_SPILL_DIR").map(std::path::PathBuf::from);
     if let Some(dir) = &spill_dir {
@@ -71,6 +76,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         pool_stats: Arc::new(move || PoolStats {
             used_bytes: pool.used() as u64,
             limit_bytes: pool.limit() as u64,
+            cache_reserve_bytes: pool.cache_reserve() as u64,
             spill_bytes_total: stats_engine.spilled_bytes_total(),
         }),
         query_timeout: cfg.query_timeout,

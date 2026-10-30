@@ -39,6 +39,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Error taxonomy (`code`, `retryable`, `dependency`), `plimsoll_query_errors_total{code}`, dependency failure budgets (ADR 0013)
 - [x] Merge-on-read position deletes, validated against Spark (ADR 0014)
 - [x] Equality deletes (upserts/CDC), validated against Iceberg Java writers (ADR 0016)
+- [x] Caches under the ceiling (cache reserve), stale directory listings fixed, decoded delete files cached (ADR 0018)
 - [x] Format v3: deletion vectors (Puffin + Roaring), `timestamp_ns`; defaults/encryption refused (ADR 0017)
 - [x] Admission: running/queued limits globally, per resource group, per user (RAII slots)
 - [x] Query registry + per-query deadline (queue wait + execution)
@@ -49,14 +50,13 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Delete-file cache per snapshot**: delete files (position, DV, equality)
-are read on every query (ADRs 0014, 0016, 0017).
+**Query latency histograms** in `/metrics` (admission wait, planning,
+execution), so the effect of caches and pruning is measurable in production.
 
 ## Later
 
 - OTLP traces and metrics export (OpenTelemetry), query-level spans
   (admission wait, planning, execution). No OpenTelemetry dependency until then.
-- Query latency histograms in `/metrics`.
 - Configurable resource groups (per-group limits from config).
 - Authentication (bearer / mTLS) deriving `user` from the principal.
 - Readiness drain delay before closing the listener.

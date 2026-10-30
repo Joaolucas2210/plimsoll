@@ -16,6 +16,8 @@ use plimsoll_control::governance::QueryTotals;
 pub struct PoolStats {
     pub used_bytes: u64,
     pub limit_bytes: u64,
+    /// Part of the limit set aside for DataFusion's caches (ADR 0018).
+    pub cache_reserve_bytes: u64,
     pub spill_bytes_total: u64,
 }
 
@@ -50,6 +52,12 @@ pub fn render(
         "gauge",
         "Memory pool ceiling (the load line).",
         &[("", pool.limit_bytes)],
+    );
+    metric(
+        "plimsoll_pool_cache_reserve_bytes",
+        "gauge",
+        "Part of the ceiling reserved for file metadata/statistics/delete caches.",
+        &[("", pool.cache_reserve_bytes)],
     );
     metric(
         "plimsoll_spill_bytes_total",
@@ -104,6 +112,7 @@ mod tests {
         let pool = PoolStats {
             used_bytes: 10,
             limit_bytes: 100,
+            cache_reserve_bytes: 6,
             spill_bytes_total: 3,
         };
         let totals = QueryTotals {
@@ -116,6 +125,7 @@ mod tests {
         for line in [
             "plimsoll_pool_used_bytes 10",
             "plimsoll_pool_limit_bytes 100",
+            "plimsoll_pool_cache_reserve_bytes 6",
             "plimsoll_spill_bytes_total 3",
             "plimsoll_queries_running 2",
             "plimsoll_queries_queued 1",

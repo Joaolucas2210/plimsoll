@@ -1,5 +1,9 @@
 //! Merge-on-read deletes.
 //!
+//! Decoded delete files are cached in DataFusion's file metadata cache, sized
+//! to the pool's cache reserve (ADR 0018): they are immutable, so a path is a
+//! complete key and repeated queries skip the read and the decode.
+//!
 //! Position deletes: `(file_path, pos)` pairs. Spec v2: they apply to a data
 //! file when `file_path` matches and the data file's sequence number is <= the
 //! delete file's. Plimsoll turns the surviving positions of each data file
@@ -18,12 +22,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use apache_avro::types::Value as Avro;
+use chrono::{DateTime, Utc};
 use datafusion::arrow::array::{Array, AsArray, RecordBatch};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{Field, Int64Type, Schema};
 use datafusion::catalog::Session;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::cache::cache_manager::{CachedFileMetadataEntry, FileMetadata};
 use datafusion::execution::memory_pool::MemoryReservation;
+use datafusion::object_store::ObjectMeta;
+use datafusion::object_store::path::Path;
 use datafusion::parquet::arrow::ProjectionMask;
 use datafusion::parquet::arrow::arrow_reader::{
     ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
@@ -72,66 +80,88 @@ impl EqualityDelete {
 }
 
 /// Key rows of an equality delete file, cast to the table's types, columns
-/// named after the table's `key` fields. The whole file is read; its bytes and
-/// the decoded keys are reserved while planning (the hash join reserves them
-/// again when it builds, ADR 0016).
+/// named after the table's `key` fields. Cached per (file, key types); on a
+/// miss the file is read whole. The keys are reserved while planning (the hash
+/// join reserves them again when it builds, ADR 0016).
 pub(super) async fn equality_keys(
     state: &dyn Session,
     scoped: Option<&ScopedStore>,
     path: &str,
     key: &[Field],
     reservation: &MemoryReservation,
+    hits: &mut usize,
 ) -> Result<Vec<RecordBatch>> {
-    let bytes = super::read(path, state, scoped).await?;
-    reservation.try_grow(bytes.len())?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?;
-    let mask = ProjectionMask::columns(
-        builder.parquet_schema(),
-        key.iter().map(|f| f.name().as_str()),
-    );
-    let schema = Arc::new(Schema::new(
-        key.iter()
-            .map(|f| f.clone().with_nullable(true))
-            .collect::<Vec<_>>(),
-    ));
-    let mut out = Vec::new();
-    for batch in builder.with_projection(mask).build()? {
-        let batch = batch?;
-        let columns = key
-            .iter()
-            .map(|f| {
-                let c = batch.column_by_name(f.name()).ok_or_else(|| {
-                    invalid_delete(
-                        path,
-                        "equality delete",
-                        &format!("missing key column {}", f.name()),
-                    )
-                })?;
-                Ok(cast(c, f.data_type())?)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let keys = RecordBatch::try_new(schema.clone(), columns)?;
-        reservation.try_grow(keys.get_array_memory_size())?;
-        out.push(keys);
+    let types = key
+        .iter()
+        .map(|f| format!("{}:{}", f.name(), f.data_type()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let (keys, held) = cached(
+        state,
+        &format!("{path}?eq={types}"),
+        reservation,
+        hits,
+        async {
+            let bytes = super::read(path, state, scoped).await?;
+            reservation.try_grow(bytes.len())?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?;
+            let mask = ProjectionMask::columns(
+                builder.parquet_schema(),
+                key.iter().map(|f| f.name().as_str()),
+            );
+            let schema = Arc::new(Schema::new(
+                key.iter()
+                    .map(|f| f.clone().with_nullable(true))
+                    .collect::<Vec<_>>(),
+            ));
+            let mut out = Vec::new();
+            for batch in builder.with_projection(mask).build()? {
+                let batch = batch?;
+                let columns = key
+                    .iter()
+                    .map(|f| {
+                        let c = batch.column_by_name(f.name()).ok_or_else(|| {
+                            invalid_delete(
+                                path,
+                                "equality delete",
+                                &format!("missing key column {}", f.name()),
+                            )
+                        })?;
+                        Ok(cast(c, f.data_type())?)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                out.push(RecordBatch::try_new(schema.clone(), columns)?);
+            }
+            reservation.shrink(bytes.len());
+            let size = out.iter().map(RecordBatch::get_array_memory_size).sum();
+            Ok((out, size))
+        },
+    )
+    .await?;
+    // Kept reserved until planning ends, hit or miss.
+    if held == 0 {
+        reservation.try_grow(keys.iter().map(RecordBatch::get_array_memory_size).sum())?;
     }
-    reservation.shrink(bytes.len());
-    Ok(out)
+    Ok(keys.as_ref().clone())
 }
 
 /// Data file path -> its data sequence number, for the files being scanned.
 pub(super) type Targets<'a> = HashMap<&'a str, i64>;
 
 /// Deleted positions per data file (sorted, unique), read from the delete
-/// files that apply to `targets`. Positions are reserved in `reservation`
-/// (8 bytes each) because they grow with the number of deletes.
+/// files that apply to `targets`. Decoded delete files are cached (ADR 0018);
+/// the positions a query keeps are reserved in `reservation` (8 bytes each)
+/// because they grow with the number of deletes.
 pub(super) async fn positions(
     state: &dyn Session,
     scoped: Option<&ScopedStore>,
     deletes: &[DeleteFile],
     targets: &Targets<'_>,
     reservation: &MemoryReservation,
+    hits: &mut usize,
 ) -> Result<HashMap<String, Vec<u64>>> {
     let mut out: HashMap<String, Vec<u64>> = HashMap::new();
+    let word = std::mem::size_of::<u64>();
     for delete in deletes {
         // `referenced_data_file` lets us skip delete files for pruned data.
         if delete
@@ -153,66 +183,156 @@ pub(super) async fn positions(
                 Some(&data_seq) if data_seq <= delete.seq => {}
                 _ => continue,
             }
-            let blob =
-                super::read_range(&delete.path, offset..offset + size, state, scoped).await?;
-            reservation.try_grow(blob.len())?;
-            let bitmap = deletion_vector(&blob)
-                .map_err(|e| invalid_delete(&delete.path, "deletion vector", &e))?;
-            reservation.shrink(blob.len());
+            let key = format!("{}#{offset}+{size}", delete.path);
+            let (bitmap, held) = cached(state, &key, reservation, hits, async {
+                let blob =
+                    super::read_range(&delete.path, offset..offset + size, state, scoped).await?;
+                reservation.try_grow(blob.len())?;
+                let bitmap = deletion_vector(&blob)
+                    .map_err(|e| invalid_delete(&delete.path, "deletion vector", &e));
+                reservation.shrink(blob.len());
+                let bitmap = bitmap?;
+                let bytes = bitmap.serialized_size();
+                Ok((bitmap, bytes))
+            })
+            .await?;
             let n = usize::try_from(bitmap.len())
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            reservation.try_grow(n * std::mem::size_of::<u64>())?;
+            reservation.try_grow(n * word)?;
             out.entry(target.to_owned())
                 .or_default()
                 .extend(bitmap.iter());
+            reservation.shrink(held);
             continue;
         }
-        // Whole file in memory, reserved while decoded. Position delete files
-        // are small relative to data (two narrow columns).
-        let bytes = super::read(&delete.path, state, scoped).await?;
-        reservation.try_grow(bytes.len())?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?;
-        let mask = ProjectionMask::columns(builder.parquet_schema(), ["file_path", "pos"]);
-        let batches = builder.with_projection(mask).build()?;
-        for batch in batches {
-            let batch = batch?;
-            let (Some(paths), Some(pos)) = (
-                batch.column_by_name("file_path"),
-                batch.column_by_name("pos"),
-            ) else {
-                return Err(invalid(&delete.path, "missing file_path/pos columns"));
-            };
-            let paths = paths
-                .as_string_opt::<i32>()
-                .ok_or_else(|| invalid(&delete.path, "file_path is not a string column"))?;
-            let pos = pos
-                .as_primitive_opt::<Int64Type>()
-                .ok_or_else(|| invalid(&delete.path, "pos is not a long column"))?;
-            for i in 0..batch.num_rows() {
-                if paths.is_null(i) || pos.is_null(i) {
-                    return Err(invalid(&delete.path, "null file_path/pos"));
-                }
-                let path = paths.value(i);
-                // Spec: applies only when data seq <= delete seq.
-                let Some(&data_seq) = targets.get(path) else {
-                    continue;
-                };
-                if data_seq > delete.seq {
-                    continue;
-                }
-                let p = u64::try_from(pos.value(i))
-                    .map_err(|_| invalid(&delete.path, "negative pos"))?;
-                reservation.try_grow(std::mem::size_of::<u64>())?;
-                out.entry(path.to_owned()).or_default().push(p);
+        let (all, held) = cached(state, &delete.path, reservation, hits, async {
+            decode_positions(&delete.path, state, scoped, reservation).await
+        })
+        .await?;
+        for (path, positions) in all.iter() {
+            // Spec: applies only when data seq <= delete seq.
+            match targets.get(path.as_str()) {
+                Some(&data_seq) if data_seq <= delete.seq => {}
+                _ => continue,
             }
+            reservation.try_grow(positions.len() * word)?;
+            out.entry(path.clone()).or_default().extend(positions);
         }
-        reservation.shrink(bytes.len());
+        reservation.shrink(held);
     }
     for positions in out.values_mut() {
         positions.sort_unstable();
         positions.dedup();
     }
     Ok(out)
+}
+
+/// Every `(file_path, pos)` of a position delete file, read whole. Returns
+/// the map and its size in bytes.
+async fn decode_positions(
+    path: &str,
+    state: &dyn Session,
+    scoped: Option<&ScopedStore>,
+    reservation: &MemoryReservation,
+) -> Result<(HashMap<String, Vec<u64>>, usize)> {
+    let bytes = super::read(path, state, scoped).await?;
+    reservation.try_grow(bytes.len())?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?;
+    let mask = ProjectionMask::columns(builder.parquet_schema(), ["file_path", "pos"]);
+    let mut out: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut size = 0;
+    for batch in builder.with_projection(mask).build()? {
+        let batch = batch?;
+        let (Some(paths), Some(pos)) = (
+            batch.column_by_name("file_path"),
+            batch.column_by_name("pos"),
+        ) else {
+            return Err(invalid(path, "missing file_path/pos columns"));
+        };
+        let paths = paths
+            .as_string_opt::<i32>()
+            .ok_or_else(|| invalid(path, "file_path is not a string column"))?;
+        let pos = pos
+            .as_primitive_opt::<Int64Type>()
+            .ok_or_else(|| invalid(path, "pos is not a long column"))?;
+        for i in 0..batch.num_rows() {
+            if paths.is_null(i) || pos.is_null(i) {
+                return Err(invalid(path, "null file_path/pos"));
+            }
+            let p = u64::try_from(pos.value(i)).map_err(|_| invalid(path, "negative pos"))?;
+            let file = paths.value(i);
+            reservation.try_grow(std::mem::size_of::<u64>())?;
+            size += std::mem::size_of::<u64>();
+            if let Some(v) = out.get_mut(file) {
+                v.push(p);
+            } else {
+                reservation.try_grow(file.len())?;
+                size += file.len();
+                out.insert(file.to_owned(), vec![p]);
+            }
+        }
+    }
+    reservation.shrink(bytes.len() + size);
+    Ok((out, size))
+}
+
+/// Decoded delete state in DataFusion's file metadata cache, whose budget is
+/// the pool's cache reserve (ADR 0018).
+struct Cached<T> {
+    value: Arc<T>,
+    bytes: usize,
+}
+
+impl<T: Send + Sync + 'static> FileMetadata for Cached<T> {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn memory_size(&self) -> usize {
+        self.bytes
+    }
+    fn extra_info(&self) -> datafusion::common::HashMap<String, String> {
+        Default::default()
+    }
+}
+
+/// `load`ed value for `key`, or the cached one. Delete files are immutable,
+/// so the path (plus blob range / key types) is a complete key. On a miss
+/// the value's bytes are reserved and returned as `held`: the caller shrinks
+/// them once done (the cache, if it kept the value, accounts for it).
+async fn cached<T: Send + Sync + 'static>(
+    state: &dyn Session,
+    key: &str,
+    reservation: &MemoryReservation,
+    hits: &mut usize,
+    load: impl Future<Output = Result<(T, usize)>>,
+) -> Result<(Arc<T>, usize)> {
+    let cache = state.runtime_env().cache_manager.get_file_metadata_cache();
+    let meta = ObjectMeta {
+        location: Path::from(format!("plimsoll-deletes/{key}")),
+        last_modified: DateTime::<Utc>::UNIX_EPOCH,
+        size: 0,
+        e_tag: None,
+        version: None,
+    };
+    if let Some(entry) = cache.get(&meta.location)
+        && entry.is_valid_for(&meta)
+        && let Some(hit) = entry.file_metadata.as_any().downcast_ref::<Cached<T>>()
+    {
+        *hits += 1;
+        return Ok((hit.value.clone(), 0));
+    }
+    let (value, bytes) = load.await?;
+    reservation.try_grow(bytes)?;
+    let value = Arc::new(value);
+    let entry = Cached {
+        value: value.clone(),
+        bytes,
+    };
+    cache.put(
+        &meta.location.clone(),
+        CachedFileMetadataEntry::new(meta, Arc::new(entry)),
+    );
+    Ok((value, bytes))
 }
 
 /// Magic of a `deletion-vector-v1` blob.

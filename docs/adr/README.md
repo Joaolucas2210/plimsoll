@@ -25,10 +25,11 @@ are allowed in place.
 | [0015](0015-one-http-tls-stack.md) | One HTTP/TLS stack | Accepted | 2026-10-30 | Catalog client on the same `reqwest 0.12` + `ring` as `object_store`; `aws-lc-rs` and 14 other crates leave the build | 0008, 0009, 0011 |
 | [0016](0016-equality-deletes.md) | Merge-on-read: equality deletes as grouped hash anti-joins | Accepted | 2026-10-30 | Files grouped by the equality delete sets that apply (strict seq, same partition or global); each group anti-joins the keys with null = null; reference-writer interop | 0007, 0010, 0011, 0012, 0013, 0014 |
 | [0017](0017-format-v3-deletion-vectors.md) | Format v3: deletion vectors, and what v3 must not silently change | Accepted | 2026-10-30 | Accept v3; DV blobs read by range, length/magic/CRC verified, Roaring decoded with `roaring`, applied as row selections; refuse column defaults and encryption | 0007, 0013, 0014, 0016 |
+| [0018](0018-caches-under-the-ceiling.md) | Caches under the ceiling, and a delete-file cache | Accepted | 2026-10-30 | DataFusion caches sized to a `CeilingPool` cache reserve queries never get; listing cache off (stale directories); decoded delete files cached by immutable path | 0003, 0012, 0014, 0016, 0017 |
 
 ## Reading order
 
-- Invariant first: 0003 (memory), 0005 (correctness).
+- Invariant first: 0003 (memory, with 0012 and 0018), 0005 (correctness).
 - Shape of the system: 0001, 0002, 0004.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017.
 - Federation: 0005 → 0006.

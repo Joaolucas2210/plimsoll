@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-10-29
 - Owner: JoaoLucas2210
-- Related: ADR 0001, ADR 0007, ADR 0009, ADR 0012 (closes the edge bypasses)
+- Related: ADR 0001, ADR 0007, ADR 0009, ADR 0012 (closes the edge bypasses), ADR 0018 (cache reserve)
 - Scope: `plimsoll_core::memory` (`CeilingPool`, `AccountedExec`, `df_adapter`), `plimsoll_core::engine`, `plimsoll-server` (`main.rs`, `engine.rs`)
 
 ## Context

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::cache::cache_manager::CacheManagerConfig;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
@@ -71,7 +72,17 @@ pub fn runtime_env(pool: Arc<CeilingPool>, spill_dir: Option<PathBuf>) -> Result
         Some(dir) => DiskManagerMode::Directories(vec![dir]),
         None => DiskManagerMode::Disabled,
     };
+    // DataFusion's caches live outside any MemoryPool, so they are sized to
+    // the pool's cache reserve (ADR 0018): 3/4 file metadata (Parquet footers,
+    // Iceberg delete files), 1/4 file statistics. The listing cache is off: its
+    // TTL is infinite, so directory tables would never see new files.
+    let cache = pool.cache_reserve();
+    let caches = CacheManagerConfig::default()
+        .with_metadata_cache_limit(cache - cache / 4)
+        .with_file_statistics_cache_limit(cache / 4)
+        .with_list_files_cache_limit(0);
     RuntimeEnvBuilder::new()
+        .with_cache_manager(caches)
         .with_memory_pool(pool)
         .with_disk_manager_builder(DiskManagerBuilder::default().with_mode(mode))
         .with_object_store_registry(Arc::new(crate::storage::LazyObjectStores::default()))

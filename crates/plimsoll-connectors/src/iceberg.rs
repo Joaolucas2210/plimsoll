@@ -185,6 +185,8 @@ struct PlanStats {
     delete_files: usize,
     deleted_rows: usize,
     equality_files: usize,
+    /// Delete files served from the cache (ADR 0018).
+    cache_hits: usize,
 }
 
 impl IcebergTable {
@@ -471,6 +473,7 @@ impl IcebergTable {
                 &deletes,
                 &targets,
                 &reservation,
+                &mut stats.cache_hits,
             )
             .await?;
             stats.delete_files = deletes.len();
@@ -523,6 +526,7 @@ impl IcebergTable {
                 &delete.path,
                 &key,
                 &reservation,
+                &mut stats.cache_hits,
             )
             .await?;
             for i in targets {
@@ -614,7 +618,7 @@ impl TableProvider for IcebergTable {
         }
         Ok(Arc::new(AccountedExec::new(
             format!(
-                "IcebergScan[{}] manifests={}/{} files={}/{} deletes={} deleted_rows={} equality_deletes={}",
+                "IcebergScan[{}] manifests={}/{} files={}/{} deletes={} deleted_rows={} equality_deletes={} delete_cache_hits={}",
                 self.name,
                 stats.manifests_read,
                 stats.manifests,
@@ -623,6 +627,7 @@ impl TableProvider for IcebergTable {
                 stats.delete_files,
                 stats.deleted_rows,
                 stats.equality_files,
+                stats.cache_hits,
             ),
             UnionExec::try_new(plans)?,
         )))

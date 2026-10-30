@@ -8,10 +8,14 @@
 //! Budget layout (`limit` bytes total):
 //!
 //! ```text
-//! |<------------- limit - output_reserve ------------->|<- output_reserve ->|
-//! |  working operators (spillable + non-spillable)     |  output/exchange   |
-//! |<------------------- output/exchange may use the whole limit ----------->|
+//! |<- cache_reserve ->|<------ limit - cache - output ------>|<- output_reserve ->|
+//! |  DataFusion caches|  working operators (spill + no-spill) |  output/exchange   |
+//! |                   |<---- output/exchange may use all of limit - cache -------->|
 //! ```
+//!
+//! The cache reserve is never handed to queries: DataFusion's caches (Parquet
+//! footers, file statistics, Iceberg delete files) are sized to it, so caches
+//! sit under the line by construction (ADR 0018).
 //!
 //! Working operators can never eat the output slice, so a query that has
 //! produced results can always ship them out.
@@ -66,7 +70,8 @@ pub enum CeilingError {
     /// The reservation would cross the Plimsoll line.
     #[error(
         "memory ceiling: '{consumer}' ({kind:?}) requested {requested}B, {available}B available \
-         (limit {limit}B, output reserve {output_reserve}B); top consumers: [{}]",
+         (limit {limit}B, output reserve {output_reserve}B, cache reserve {cache_reserve}B); \
+         top consumers: [{}]",
         join(top)
     )]
     Exhausted {
@@ -76,11 +81,18 @@ pub enum CeilingError {
         available: usize,
         limit: usize,
         output_reserve: usize,
+        cache_reserve: usize,
         top: Vec<ConsumerUsage>,
     },
-    /// `output_reserve` larger than `limit`.
-    #[error("output reserve {output_reserve}B exceeds limit {limit}B")]
-    InvalidConfig { limit: usize, output_reserve: usize },
+    /// Output + cache reserves larger than `limit`.
+    #[error(
+        "output reserve {output_reserve}B + cache reserve {cache_reserve}B exceed limit {limit}B"
+    )]
+    InvalidConfig {
+        limit: usize,
+        output_reserve: usize,
+        cache_reserve: usize,
+    },
     /// Grow/shrink on a consumer id that was never registered.
     #[error("unknown memory consumer id {0}")]
     UnknownConsumer(usize),
@@ -123,6 +135,7 @@ impl State {
 pub struct CeilingPool {
     limit: usize,
     output_reserve: usize,
+    cache_reserve: usize,
     // ponytail: one Mutex for all accounting; contention is per reservation
     // call (operators reserve in chunks), not per row. Shard if it shows up in profiles.
     state: Mutex<State>,
@@ -132,17 +145,27 @@ impl CeilingPool {
     /// `limit` total bytes, of which `output_reserve` are only usable by
     /// [`ConsumerKind::Output`] consumers.
     pub fn new(limit: usize, output_reserve: usize) -> Result<Self, CeilingError> {
-        if output_reserve > limit {
-            return Err(CeilingError::InvalidConfig {
-                limit,
-                output_reserve,
-            });
-        }
-        Ok(Self {
+        Self {
             limit,
             output_reserve,
+            cache_reserve: 0,
             state: Mutex::default(),
-        })
+        }
+        .with_cache_reserve(0)
+    }
+
+    /// Sets aside `bytes` of `limit` for DataFusion's caches; queries can
+    /// never reserve them. See [`runtime_env`].
+    pub fn with_cache_reserve(mut self, bytes: usize) -> Result<Self, CeilingError> {
+        if self.output_reserve.saturating_add(bytes) > self.limit {
+            return Err(CeilingError::InvalidConfig {
+                limit: self.limit,
+                output_reserve: self.output_reserve,
+                cache_reserve: bytes,
+            });
+        }
+        self.cache_reserve = bytes;
+        Ok(self)
     }
 
     pub fn limit(&self) -> usize {
@@ -151,6 +174,10 @@ impl CeilingPool {
 
     pub fn output_reserve(&self) -> usize {
         self.output_reserve
+    }
+
+    pub fn cache_reserve(&self) -> usize {
+        self.cache_reserve
     }
 
     /// Total bytes currently reserved (working + output).
@@ -166,7 +193,7 @@ impl CeilingPool {
 
     /// True when working memory is above the spill threshold.
     pub fn spill_hint(&self) -> bool {
-        let budget = self.limit - self.output_reserve;
+        let budget = self.limit - self.output_reserve - self.cache_reserve;
         self.lock().work * 100 >= budget * SPILL_HINT_PERCENT
     }
 
@@ -235,7 +262,7 @@ impl CeilingPool {
             ConsumerKind::Output => s.work + s.output,
             _ => s.work + s.output.max(self.output_reserve),
         };
-        let available = self.limit.saturating_sub(taken);
+        let available = (self.limit - self.cache_reserve).saturating_sub(taken);
         if additional > available {
             let name = s
                 .consumers
@@ -249,6 +276,7 @@ impl CeilingPool {
                 available,
                 limit: self.limit,
                 output_reserve: self.output_reserve,
+                cache_reserve: self.cache_reserve,
                 top: top_of(&s, TOP_CONSUMERS),
             });
         }
@@ -380,6 +408,30 @@ mod tests {
             CeilingPool::new(10, 11),
             Err(CeilingError::InvalidConfig { .. })
         ));
+    }
+
+    #[test]
+    fn cache_reserve_is_never_handed_to_queries() {
+        assert!(matches!(
+            CeilingPool::new(100, 60).unwrap().with_cache_reserve(41),
+            Err(CeilingError::InvalidConfig { .. })
+        ));
+        let p = Arc::new(
+            CeilingPool::new(100, 20)
+                .unwrap()
+                .with_cache_reserve(30)
+                .unwrap(),
+        );
+        // Working memory: 100 - 30 cache - 20 output.
+        let mut w = p.register("sort", Spillable);
+        assert!(w.try_grow(51).is_err());
+        w.try_grow(50).unwrap();
+        // Output may use its slice, never the cache's.
+        let mut o = p.register("out", Output);
+        assert!(o.try_grow(21).is_err());
+        o.try_grow(20).unwrap();
+        let err = o.try_grow(1).unwrap_err().to_string();
+        assert!(err.contains("cache reserve 30B"), "{err}");
     }
 
     #[test]

@@ -296,6 +296,7 @@ mod tests {
             pool_stats: Arc::new(|| PoolStats {
                 used_bytes: 5,
                 limit_bytes: 1024,
+                cache_reserve_bytes: 0,
                 spill_bytes_total: 0,
             }),
             query_timeout: timeout,

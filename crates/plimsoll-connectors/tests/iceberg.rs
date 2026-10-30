@@ -666,3 +666,50 @@ async fn reads_reference_deletion_vectors() {
     );
     assert_eq!(pool.used(), 0);
 }
+
+/// Decoded delete files are cached inside the pool's cache reserve: the
+/// second query reads no delete file and returns the same rows (ADR 0018).
+#[tokio::test]
+async fn delete_files_are_cached_within_the_cache_reserve() {
+    let explain = async |ctx: &SessionContext, sql: &str| {
+        let df = ctx.sql(sql).await.unwrap();
+        format!(
+            "{}",
+            datafusion::physical_plan::displayable(
+                df.create_physical_plan().await.unwrap().as_ref()
+            )
+            .indent(true)
+        )
+    };
+    for (deletes, expected) in [
+        (Deletes::Position { seq: 3 }, vec![1, 3]),
+        (Deletes::Equality, vec![1, 3, 4, 5, 6]),
+    ] {
+        let dir = tmp("cache");
+        table(&dir, deletes, false);
+        let pool = Arc::new(
+            CeilingPool::new(64 << 20, 0)
+                .unwrap()
+                .with_cache_reserve(8 << 20)
+                .unwrap(),
+        );
+        let ctx = session_context_with_ceiling(pool.clone(), None, SessionConfig::new()).unwrap();
+        register(&ctx, &dir).await.unwrap();
+        let sql = "SELECT id FROM t ORDER BY id";
+        assert!(explain(&ctx, sql).await.contains("delete_cache_hits=0"));
+        assert!(explain(&ctx, sql).await.contains("delete_cache_hits=1"));
+        // Cached state is not query memory: nothing stays reserved.
+        assert_eq!(ids(&ctx, sql).await.unwrap(), expected);
+        assert_eq!(pool.used(), 0);
+        // Without a cache reserve nothing is cached.
+        let plain = session_context_with_ceiling(
+            Arc::new(CeilingPool::new(64 << 20, 0).unwrap()),
+            None,
+            SessionConfig::new(),
+        )
+        .unwrap();
+        register(&plain, &dir).await.unwrap();
+        explain(&plain, sql).await;
+        assert!(explain(&plain, sql).await.contains("delete_cache_hits=0"));
+    }
+}
