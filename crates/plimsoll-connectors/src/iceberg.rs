@@ -227,18 +227,18 @@ impl IcebergTable {
         self.register_scoped(state);
         let reservation = MemoryConsumer::new(format!("IcebergManifests[{}]", self.name))
             .register(&state.runtime_env().memory_pool);
-        let decode = async |path: &str| -> Result<Vec<Avro>> {
+        // Raw Avro bytes are reserved while in use; entries are decoded one at
+        // a time (never collected), so decoded state stays O(one entry).
+        let load = async |path: &str| -> Result<bytes::Bytes> {
             let bytes = read(path, state, self.scoped.as_ref()).await?;
             reservation.try_grow(bytes.len())?;
-            let rows = apache_avro::Reader::new(&bytes[..])
-                .and_then(|r| r.collect::<Result<Vec<_>, _>>())
-                .map_err(|e| invalid(path, e))?;
-            reservation.shrink(bytes.len());
-            Ok(rows)
+            Ok(bytes)
         };
 
         let mut files = Vec::new();
-        for manifest in decode(list_path).await? {
+        let list_bytes = load(list_path).await?;
+        for manifest in avro_entries(list_path, &list_bytes)? {
+            let manifest = manifest?;
             let manifest_path = str_field(&manifest, "manifest_path")
                 .ok_or_else(|| invalid(list_path, "manifest_path missing"))?
                 .to_owned();
@@ -256,7 +256,9 @@ impl IcebergTable {
                 }
             }
             stats.manifests_read += 1;
-            for entry in decode(&manifest_path).await? {
+            let manifest_bytes = load(&manifest_path).await?;
+            for entry in avro_entries(&manifest_path, &manifest_bytes)? {
+                let entry = entry?;
                 // status 2 = deleted in this snapshot.
                 if long_field(&entry, "status") == Some(2) {
                     continue;
@@ -288,6 +290,10 @@ impl IcebergTable {
                     continue;
                 }
                 stats.files_kept += 1;
+                // The planned file list grows with the table: reserve it too.
+                // ponytail: released when planning returns; the list then
+                // lives in the plan (O(files) paths) until the query ends.
+                reservation.try_grow(path.len() + std::mem::size_of::<DataFile>())?;
                 files.push(DataFile {
                     path: path.to_owned(),
                     size: long_field(file, "file_size_in_bytes")
@@ -295,7 +301,9 @@ impl IcebergTable {
                         .filter(|s| *s > 0),
                 });
             }
+            reservation.shrink(manifest_bytes.len());
         }
+        reservation.shrink(list_bytes.len());
         Ok((files, stats))
     }
 }
@@ -542,6 +550,16 @@ fn arrow_type(path: &str, ty: &str) -> Result<DataType, ConnectorError> {
             parsed.ok_or_else(|| unsupported(path, format!("type {t:?}")))?
         }
     })
+}
+
+/// Avro records decoded lazily, one at a time.
+fn avro_entries<'a>(
+    path: &str,
+    bytes: &'a [u8],
+) -> Result<impl Iterator<Item = Result<Avro, ConnectorError>> + 'a, ConnectorError> {
+    let owned = path.to_owned();
+    let reader = apache_avro::Reader::new(bytes).map_err(|e| invalid(path, e))?;
+    Ok(reader.map(move |e| e.map_err(|e| invalid(&owned, e))))
 }
 
 /// Iceberg `map<int, binary>` (Avro array of `{key, value}` records), e.g.

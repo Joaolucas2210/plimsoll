@@ -155,8 +155,8 @@ mod tests {
             key.to_owned(),
             secret.to_owned(),
         );
-        let batches = run(Arc::new(vending)).await.unwrap();
-        assert_eq!(batches[0].num_rows(), 1);
+        let result = run(Arc::new(vending)).await.unwrap();
+        assert_eq!(result.batches[0].num_rows(), 1);
     }
 
     #[tokio::test]

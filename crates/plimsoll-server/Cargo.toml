@@ -17,6 +17,7 @@ thiserror.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", default-features = false, features = ["util"] }

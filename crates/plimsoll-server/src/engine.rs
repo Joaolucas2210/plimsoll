@@ -9,14 +9,28 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use plimsoll_core::datafusion::arrow::json::ArrayWriter;
 use plimsoll_core::datafusion::error::DataFusionError;
-use plimsoll_core::engine::Engine;
-use serde::Serialize;
+use plimsoll_core::engine::{Engine, QueryResult};
+use plimsoll_core::memory::Reservation;
+use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// A result ready for the wire. `rows_json` is already serialized (a JSON
+/// array of row arrays aligned with `columns`) and stays reserved in the
+/// pool through `memory` until the response body has been handed off.
 pub struct QueryOutput {
     pub columns: Vec<String>,
-    /// Row-major values, one inner vec per row, aligned with `columns`.
-    pub rows: Vec<Vec<serde_json::Value>>,
+    pub rows_json: Vec<u8>,
+    pub memory: Option<Reservation>,
+}
+
+impl QueryOutput {
+    /// Unaccounted output from plain values (tests, fakes).
+    pub fn from_rows(columns: Vec<String>, rows: &[Vec<Value>]) -> Self {
+        Self {
+            columns,
+            rows_json: serde_json::to_vec(rows).unwrap_or_else(|_| b"[]".to_vec()),
+            memory: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -41,7 +55,10 @@ pub struct CoreEngine(pub Arc<Engine>);
 #[async_trait]
 impl QueryEngine for CoreEngine {
     async fn execute(&self, sql: &str) -> Result<QueryOutput, EngineError> {
-        let batches = self.0.sql(sql).await.map_err(map_err)?;
+        let QueryResult {
+            batches,
+            mut memory,
+        } = self.0.sql(sql).await.map_err(map_err)?;
         let columns: Vec<String> = batches
             .first()
             .map(|b| {
@@ -52,26 +69,44 @@ impl QueryEngine for CoreEngine {
                     .collect()
             })
             .unwrap_or_default();
-        let mut writer = ArrayWriter::new(Vec::new());
-        writer
-            .write_batches(&batches.iter().collect::<Vec<_>>())
-            .and_then(|()| writer.finish())
-            .map_err(|e| EngineError::Internal(e.to_string()))?;
-        let objects: Vec<serde_json::Map<String, serde_json::Value>> =
-            serde_json::from_slice(&writer.into_inner())
-                .map_err(|e| EngineError::Internal(e.to_string()))?;
-        // ponytail: JSON objects -> rows by column name; arrow's writer omits
-        // nulls, which become `null` here. Upgrade path: Arrow IPC responses.
-        let rows = objects
-            .into_iter()
-            .map(|mut o| {
-                columns
+        let internal = |e: &dyn std::fmt::Display| EngineError::Internal(e.to_string());
+        let mut rows_json = b"[".to_vec();
+        let mem_err = |e: plimsoll_core::memory::CeilingError| {
+            EngineError::MemoryLimitExceeded(e.to_string())
+        };
+        memory.try_grow(2).map_err(mem_err)?; // `[` and `]`
+        // Batch by batch: each batch leaves the pool as its JSON enters it, so
+        // only one batch's transient JSON objects are ever unaccounted.
+        for batch in batches {
+            let mut writer = ArrayWriter::new(Vec::new());
+            writer
+                .write(&batch)
+                .and_then(|()| writer.finish())
+                .map_err(|e| internal(&e))?;
+            let objects: Vec<serde_json::Map<String, Value>> =
+                serde_json::from_slice(&writer.into_inner()).map_err(|e| internal(&e))?;
+            let before = rows_json.len();
+            for mut object in objects {
+                if rows_json.len() > 1 {
+                    rows_json.push(b',');
+                }
+                // Arrow's writer omits nulls: absent columns are `null`.
+                let row: Vec<Value> = columns
                     .iter()
-                    .map(|c: &String| o.remove(c).unwrap_or(serde_json::Value::Null))
-                    .collect()
-            })
-            .collect();
-        Ok(QueryOutput { columns, rows })
+                    .map(|c| object.remove(c).unwrap_or(Value::Null))
+                    .collect();
+                serde_json::to_writer(&mut rows_json, &row).map_err(|e| internal(&e))?;
+            }
+            memory.shrink(batch.get_array_memory_size());
+            drop(batch);
+            memory.try_grow(rows_json.len() - before).map_err(mem_err)?;
+        }
+        rows_json.push(b']');
+        Ok(QueryOutput {
+            columns,
+            rows_json,
+            memory: Some(memory),
+        })
     }
 }
 
@@ -98,7 +133,8 @@ mod tests {
         let e = CoreEngine(Arc::new(Engine::new(pool, None).unwrap()));
         let out = e.execute("SELECT 1 AS a, NULL AS b").await.unwrap();
         assert_eq!(out.columns, ["a", "b"]);
-        assert_eq!(out.rows, [[serde_json::json!(1), serde_json::Value::Null]]);
+        let rows: Value = serde_json::from_slice(&out.rows_json).unwrap();
+        assert_eq!(rows, serde_json::json!([[1, null]]));
         assert!(matches!(
             e.execute("SELEC").await,
             Err(EngineError::InvalidQuery(_))
@@ -108,5 +144,31 @@ mod tests {
                 .await,
             Err(EngineError::MemoryLimitExceeded(_))
         ));
+    }
+
+    /// The JSON copy is accounted: a result whose Arrow form fits under the
+    /// ceiling but whose JSON does not fails the query (and frees everything).
+    #[tokio::test]
+    async fn serialized_response_is_accounted() {
+        let pool = Arc::new(CeilingPool::new(4 << 20, 2 << 20).unwrap());
+        let e = CoreEngine(Arc::new(Engine::new(pool.clone(), None).unwrap()));
+        let small = e.execute("SELECT value FROM range(1000)").await.unwrap();
+        let held = small.memory.as_ref().map(Reservation::size).unwrap();
+        assert_eq!(
+            held,
+            small.rows_json.len(),
+            "exactly the JSON bytes are reserved"
+        );
+        drop(small);
+        assert_eq!(pool.used(), 0);
+
+        // NULL columns are ~0 bytes as Arrow (NullArray) but ~22 bytes per
+        // row as JSON (`[null,null,null,null]`): 200k rows only cross the
+        // 4 MiB ceiling once serialized.
+        let err = e
+            .execute("SELECT NULL AS a, NULL AS b, NULL AS c, NULL AS d FROM range(200000)")
+            .await;
+        assert!(matches!(err, Err(EngineError::MemoryLimitExceeded(_))));
+        assert_eq!(pool.used(), 0);
     }
 }

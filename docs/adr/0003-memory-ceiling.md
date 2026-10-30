@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-10-29
 - Owner: JoaoLucas2210
-- Related: ADR 0001, ADR 0007, ADR 0009
+- Related: ADR 0001, ADR 0007, ADR 0009, ADR 0012 (closes the edge bypasses)
 - Scope: `plimsoll_core::memory` (`CeilingPool`, `AccountedExec`, `df_adapter`), `plimsoll_core::engine`, `plimsoll-server` (`main.rs`, `engine.rs`)
 
 ## Context
@@ -146,4 +146,5 @@ sustained non-zero `used_bytes` with no running queries indicates a leak or a
 - DataFusion exposes per-scan reservations for Parquet decode or an
   output/exchange consumer class (remove `AccountedExec` / extend the slice).
 - Multi-tenant fairness is required: add per-query or per-group caps on top.
-- Results are streamed to clients (shrink the `Output` reservation per batch).
+- Results are streamed to clients (shrink the `Output` reservation per batch;
+  ADR 0012 keeps the reservation through serialization until then).

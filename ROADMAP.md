@@ -25,7 +25,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] `PushdownPolicy`: which predicates/projections/limits may be pushed (ADR 0006)
 - [x] `FilterGuard`: re-apply filters locally when pushdown semantics differ
       (collation, NULLs, types) — correctness over speed (ADR 0005)
-- [ ] Connector buffers accounted against the ceiling
+- [x] Connector buffers accounted against the ceiling (ADR 0012)
 
 ## Phase 3 — Control plane
 
@@ -34,6 +34,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Catalog namespaces as schemas; tables resolved per query (fresh snapshots)
 - [x] Catalog-vended storage credentials, scoped per table (ADR 0009)
 - [x] Scan pruning: manifests by partition summaries, files by column bounds (ADR 0010)
+- [x] Memory at the edges: Postgres streamed + accounted, response JSON accounted, manifests decoded lazily (ADR 0012)
 - [x] Admission: running/queued limits globally, per resource group, per user (RAII slots)
 - [x] Query registry + per-query deadline (queue wait + execution)
 - [x] `system.runtime.queries` schema + snapshot source
@@ -42,15 +43,6 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Wire pool/spill metrics to the live `CeilingPool`
 
 ## Next obvious PR
-
-**Close the gaps in the ceiling** (found in the ADR review; each one can
-still OOM the node, contradicting ADR 0003):
-1. Postgres results stream in bounded batches through `AccountedExec`
-   instead of one unreserved `RecordBatch`.
-2. The server streams results to the client (or reserves its JSON copy in
-   the `Output` slice) instead of materializing an unaccounted copy.
-3. Decoded Iceberg manifest entries and `metadata.json` are reserved, not
-   only the raw Avro bytes.
 
 **Error taxonomy**: "unsupported table feature" (e.g. delete files) and
 "dependency down" (catalog, object store) are typed and mapped to distinct

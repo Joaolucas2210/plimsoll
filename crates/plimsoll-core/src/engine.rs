@@ -17,10 +17,29 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 
 use crate::federation::preevaluate_scalar_subqueries;
-use crate::memory::{CeilingPool, ConsumerKind, session_context_with_ceiling, spilled_bytes};
+use crate::memory::{
+    CeilingPool, ConsumerKind, Reservation, session_context_with_ceiling, spilled_bytes,
+};
 
 /// Medallion convention: these schemas always exist in the default catalog.
 pub const MEDALLION: [&str; 3] = ["bronze", "silver", "gold"];
+
+/// A query's result and the `Output` reservation that accounts for it. Keep
+/// `memory` alive for as long as the result (or anything derived from it, such
+/// as a serialized response) is held; shrink/grow it as the result changes form.
+pub struct QueryResult {
+    pub batches: Vec<RecordBatch>,
+    pub memory: Reservation,
+}
+
+impl std::fmt::Debug for QueryResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryResult")
+            .field("batches", &self.batches.len())
+            .field("reserved_bytes", &self.memory.size())
+            .finish()
+    }
+}
 
 pub struct Engine {
     ctx: SessionContext,
@@ -67,7 +86,7 @@ impl Engine {
 
     /// Runs one statement. Dropping the returned future cancels execution
     /// (the stream and its reservations are dropped with it).
-    pub async fn sql(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+    pub async fn sql(&self, sql: &str) -> Result<QueryResult> {
         let df = self.ctx.sql(sql).await?;
         let (state, plan) = df.into_parts();
         let plan = preevaluate_scalar_subqueries(&state, plan).await?;
@@ -90,10 +109,10 @@ impl Engine {
         self.spilled_total
             .fetch_add(spilled_bytes(&physical) as u64, Ordering::Relaxed);
         result?;
-        // ponytail: the reservation is released when batches leave the engine;
-        // the server's JSON copy is unaccounted. Upgrade path: stream rows to
-        // the client and shrink per batch sent.
-        Ok(batches)
+        Ok(QueryResult {
+            batches,
+            memory: output,
+        })
     }
 }
 
@@ -110,11 +129,15 @@ mod tests {
     #[tokio::test]
     async fn runs_sql_and_releases_memory() {
         let e = engine(64 << 20);
-        let batches = e
+        let result = e
             .sql("SELECT count(*) AS n FROM range(1000)")
             .await
             .unwrap();
-        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(result.batches[0].num_rows(), 1);
+        // The result is accounted for as long as the caller holds it.
+        assert_eq!(e.pool().output_used(), result.memory.size());
+        assert!(result.memory.size() > 0);
+        drop(result);
         assert_eq!(e.pool().used(), 0);
     }
 
@@ -138,7 +161,7 @@ mod tests {
     async fn medallion_schemas_exist() {
         let e = engine(64 << 20);
         e.sql("CREATE TABLE gold.t AS SELECT 1 AS x").await.unwrap();
-        let b = e.sql("SELECT x FROM gold.t").await.unwrap();
+        let b = e.sql("SELECT x FROM gold.t").await.unwrap().batches;
         assert_eq!(b[0].num_rows(), 1);
     }
 }

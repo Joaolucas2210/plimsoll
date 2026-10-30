@@ -19,6 +19,7 @@ are allowed in place.
 | [0009](0009-object-storage.md) | Object storage and catalog-vended credentials | Accepted | 2026-10-30 | Lazy `s3://` stores from AWS env; vended keys in per-credential `ScopedStore`s under synthetic URLs | 0003, 0007, 0008 |
 | [0010](0010-iceberg-scan-pruning.md) | Iceberg scan planning: manifest and file pruning | Accepted | 2026-10-30 | Prune manifests and data files before the scan instead of decoding and `HEAD`-ing every file | 0003, 0005, 0007, 0009 |
 | [0011](0011-ci-cost-and-build-reuse.md) | CI cost: one build, one job, one cache | Accepted | 2026-10-30 | Single job building once with `--workspace`; live tests reuse the build; shared main-only cache; docs-only pushes skip CI | 0001, 0007, 0010 |
+| [0012](0012-memory-at-the-edges.md) | Memory at the edges: connectors, planning and the response | Accepted | 2026-10-30 | Postgres streams in accounted batches; results keep their reservation through JSON serialization; manifests decode lazily under reservation | 0003, 0004, 0006, 0007, 0010 |
 
 ## Reading order
 

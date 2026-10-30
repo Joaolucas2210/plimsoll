@@ -15,8 +15,9 @@ use plimsoll_control::governance::{Admission, AdmissionError, GovernedError, Que
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::engine::{EngineError, QueryEngine};
+use crate::engine::{EngineError, QueryEngine, QueryOutput};
 use crate::metrics::{self, PoolStatsProvider};
+use futures::StreamExt;
 
 pub struct AppState {
     pub engine: Arc<dyn QueryEngine>,
@@ -74,6 +75,29 @@ async fn metrics_handler(State(st): State<Arc<AppState>>) -> Response {
         st.admission.registry().totals(),
     );
     ([(header::CONTENT_TYPE, metrics::CONTENT_TYPE)], body).into_response()
+}
+
+/// `{"query_id":..,"columns":..,"rows":<rows_json>}` sent as three chunks, so
+/// the (possibly large) rows are never copied. The pool reservation covering
+/// them is dropped only once the body stream is exhausted, i.e. after hyper
+/// has taken the last chunk.
+fn json_body(query_id: Option<u64>, out: QueryOutput) -> Response {
+    let head = json!({ "query_id": query_id, "columns": out.columns }).to_string();
+    // `{"query_id":..,"columns":[..]}` -> `{"query_id":..,"columns":[..],"rows":`
+    let head = format!("{},\"rows\":", head.trim_end_matches('}'));
+    let chunks = [head.into_bytes(), out.rows_json, b"}".to_vec()];
+    let memory = out.memory;
+    let stream = futures::stream::iter(chunks.map(Ok::<_, std::convert::Infallible>)).chain(
+        futures::stream::once(async move {
+            drop(memory);
+            Ok(Vec::new())
+        }),
+    );
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,8 +169,7 @@ async fn sql(
     let query_id = Some(assigned.load(Ordering::Relaxed)).filter(|id| *id != 0);
 
     match result {
-        Ok(out) => Json(json!({ "query_id": query_id, "columns": out.columns, "rows": out.rows }))
-            .into_response(),
+        Ok(out) => json_body(query_id, out),
         Err(e) => {
             let (status, code) = match &e {
                 GovernedError::Rejected(AdmissionError::QueueFull { .. }) => {
@@ -178,7 +201,6 @@ async fn sql(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::engine::QueryOutput;
     use crate::metrics::PoolStats;
     use async_trait::async_trait;
     use axum::body::{Body, to_bytes};
@@ -192,10 +214,7 @@ mod tests {
     impl QueryEngine for FakeEngine {
         async fn execute(&self, sql: &str) -> Result<QueryOutput, EngineError> {
             match sql {
-                "select 1" => Ok(QueryOutput {
-                    columns: vec!["x".into()],
-                    rows: vec![vec![json!(1)]],
-                }),
+                "select 1" => Ok(QueryOutput::from_rows(vec!["x".into()], &[vec![json!(1)]])),
                 "oom" => Err(EngineError::MemoryLimitExceeded("needed 2GiB".into())),
                 "slow" => {
                     tokio::time::sleep(Duration::from_secs(60)).await;
