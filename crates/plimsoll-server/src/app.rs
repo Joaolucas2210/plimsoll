@@ -183,6 +183,7 @@ impl ApiError {
                 EngineError::InvalidTable(_) => {
                     Self::new(S::UNPROCESSABLE_ENTITY, "invalid_table", false)
                 }
+                EngineError::Forbidden(_) => Self::new(S::FORBIDDEN, "forbidden", false),
                 // 502: an upstream failed, not this node.
                 EngineError::Dependency { dependency, .. } => Self {
                     dependency: Some(dependency),
@@ -560,6 +561,65 @@ mod tests {
         // A query path that forgets the viewer fails closed, not open.
         let err = engine.sql(users).await.unwrap_err().to_string();
         assert!(err.contains("needs the caller's identity"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn grants_limit_readable_schemas_over_http() {
+        use plimsoll_core::engine::Engine;
+        use plimsoll_core::memory::CeilingPool;
+
+        let engine =
+            Arc::new(Engine::new(Arc::new(CeilingPool::new(64 << 20, 0).unwrap()), None).unwrap());
+        for t in ["gold.g", "bronze.b"] {
+            engine
+                .context()
+                .sql(&format!("CREATE TABLE {t} AS SELECT 1 AS x"))
+                .await
+                .unwrap();
+        }
+        let mut st = Arc::into_inner(default_state()).unwrap();
+        crate::system::register(engine.context(), st.admission.registry().clone()).unwrap();
+        st.engine = Arc::new(crate::engine::CoreEngine(engine));
+        let hex: String = crate::auth::token_digest("ta")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        st.auth = Auth::from_lookup(
+            &|k| match k {
+                "PLIMSOLL_AUTH_TOKENS" => Some(format!("ana:sha256:{hex}")),
+                "PLIMSOLL_AUTH_GRANTS" => Some("ana=gold".into()),
+                _ => None,
+            },
+            &|g| g == DEFAULT_GROUP,
+        )
+        .unwrap();
+        let st = Arc::new(st);
+        for (sql, status) in [
+            ("SELECT x FROM gold.g", StatusCode::OK),
+            ("SELECT x FROM bronze.b", StatusCode::FORBIDDEN),
+            (
+                "SELECT x FROM gold.g WHERE x IN (SELECT x FROM bronze.b)",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "SELECT count(*) FROM system.runtime.queries",
+                StatusCode::OK,
+            ),
+        ] {
+            let req = Request::post("/v1/sql")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer ta")
+                .body(Body::from(json!({ "sql": sql }).to_string()))
+                .unwrap();
+            let (got, body) = call(router(st.clone()), req).await;
+            assert_eq!(got, status, "{sql}: {body}");
+            if status == StatusCode::FORBIDDEN {
+                assert!(
+                    body.contains("access denied to table datafusion.bronze.b"),
+                    "{body}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

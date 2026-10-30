@@ -14,7 +14,7 @@ use plimsoll_core::datafusion::arrow::json::ArrayWriter;
 use plimsoll_core::datafusion::error::DataFusionError;
 use plimsoll_core::datafusion::object_store::Error as ObjectStoreError;
 use plimsoll_core::datafusion::parquet::errors::ParquetError;
-use plimsoll_core::engine::{Engine, QueryResult};
+use plimsoll_core::engine::{AccessDenied, Engine, QueryResult};
 
 use crate::auth::Viewer;
 use plimsoll_core::memory::Reservation;
@@ -65,6 +65,9 @@ pub enum EngineError {
     /// The table itself is broken: malformed metadata, a missing data file.
     #[error("invalid table: {0}")]
     InvalidTable(String),
+    /// The caller may not read a table the query uses (ADR 0025).
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     /// An upstream system failed or refused us. Retrying may succeed.
     #[error("{dependency} failed: {message}")]
     Dependency {
@@ -180,6 +183,9 @@ fn external(inner: &(dyn std::error::Error + 'static), msg: String) -> EngineErr
         dependency,
         message: msg.clone(),
     };
+    if inner.downcast_ref::<AccessDenied>().is_some() {
+        return EngineError::Forbidden(msg);
+    }
     if let Some(e) = inner.downcast_ref::<ConnectorError>() {
         return match e {
             ConnectorError::Unsupported(_) | ConnectorError::UnsupportedType { .. } => {
@@ -233,20 +239,20 @@ mod tests {
         let pool = Arc::new(CeilingPool::new(1 << 20, 1 << 17).unwrap());
         let e = CoreEngine(Arc::new(Engine::new(pool, None).unwrap()));
         let out = e
-            .execute("SELECT 1 AS a, NULL AS b", Viewer { only: None })
+            .execute("SELECT 1 AS a, NULL AS b", Viewer::default())
             .await
             .unwrap();
         assert_eq!(out.columns, ["a", "b"]);
         let rows: Value = serde_json::from_slice(&out.rows_json).unwrap();
         assert_eq!(rows, serde_json::json!([[1, null]]));
         assert!(matches!(
-            e.execute("SELEC", Viewer { only: None }).await,
+            e.execute("SELEC", Viewer::default()).await,
             Err(EngineError::InvalidQuery(_))
         ));
         assert!(matches!(
             e.execute(
                 "SELECT value, repeat('x', 100) FROM range(200000)",
-                Viewer { only: None }
+                Viewer::default()
             )
             .await,
             Err(EngineError::MemoryLimitExceeded(_))
@@ -331,7 +337,7 @@ mod tests {
         let pool = Arc::new(CeilingPool::new(4 << 20, 2 << 20).unwrap());
         let e = CoreEngine(Arc::new(Engine::new(pool.clone(), None).unwrap()));
         let small = e
-            .execute("SELECT value FROM range(1000)", Viewer { only: None })
+            .execute("SELECT value FROM range(1000)", Viewer::default())
             .await
             .unwrap();
         let held = small.memory.as_ref().map(Reservation::size).unwrap();
@@ -349,7 +355,7 @@ mod tests {
         let err = e
             .execute(
                 "SELECT NULL AS a, NULL AS b, NULL AS c, NULL AS d FROM range(200000)",
-                Viewer { only: None },
+                Viewer::default(),
             )
             .await;
         assert!(matches!(err, Err(EngineError::MemoryLimitExceeded(_))));

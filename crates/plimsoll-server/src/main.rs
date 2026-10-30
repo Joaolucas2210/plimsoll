@@ -99,6 +99,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     if cfg.auth == Auth::Disabled {
         eprintln!("WARNING: PLIMSOLL_AUTH=disabled: `user` is trusted as sent (development only)");
+    } else if !cfg.auth.grants_enforced() {
+        eprintln!("WARNING: PLIMSOLL_AUTH_GRANTS unset: every principal reads every schema");
     }
     state.ready.store(true, Ordering::Relaxed);
 

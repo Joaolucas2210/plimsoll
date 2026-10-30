@@ -13,6 +13,8 @@
 //! else sees only their own. `PLIMSOLL_AUTH_GROUPS=etl=batch,ana=interactive|batch`
 //! binds principals to the resource groups they may use, the first being
 //! their default; unlisted principals get `default` only (ADR 0023).
+//! `PLIMSOLL_AUTH_GRANTS=ana=gold|silver,etl=*` lists the schemas each
+//! principal may read; once set, unlisted principals read no data (ADR 0025).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -20,6 +22,9 @@ use std::fmt;
 use ring::digest::{SHA256, digest};
 
 use plimsoll_control::governance::DEFAULT_GROUP;
+use plimsoll_core::datafusion::common::ResolvedTableReference;
+use plimsoll_core::datafusion::error::{DataFusionError, Result as DfResult};
+use plimsoll_core::engine::{AccessDenied, TableAccess};
 
 use crate::config::ConfigError;
 
@@ -33,6 +38,9 @@ pub enum Auth {
         operators: HashSet<String>,
         /// Principal -> resource groups it may use (first = its default).
         groups: HashMap<String, Vec<String>>,
+        /// Principal -> readable schemas (`*` = all). `None`: not
+        /// configured, every principal reads every schema.
+        grants: Option<HashMap<String, HashSet<String>>>,
     },
 }
 
@@ -70,6 +78,7 @@ const MODE: &str = "PLIMSOLL_AUTH";
 const TOKENS: &str = "PLIMSOLL_AUTH_TOKENS";
 const OPERATORS: &str = "PLIMSOLL_AUTH_OPERATORS";
 const GROUPS: &str = "PLIMSOLL_AUTH_GROUPS";
+const GRANTS: &str = "PLIMSOLL_AUTH_GRANTS";
 
 impl Auth {
     /// `has_group`: whether a resource group exists (bindings are checked
@@ -86,7 +95,7 @@ impl Auth {
         match lookup(MODE).as_deref().map(str::trim) {
             None | Some("required") => {}
             Some("disabled") => {
-                for var in [OPERATORS, GROUPS] {
+                for var in [OPERATORS, GROUPS, GRANTS] {
                     if lookup(var).is_some_and(|o| !o.trim().is_empty()) {
                         return Err(err(var, "", "needs PLIMSOLL_AUTH=required"));
                     }
@@ -158,10 +167,35 @@ impl Auth {
                 return Err(err(GROUPS, user, "user bound twice"));
             }
         }
+        let grants = match lookup(GRANTS) {
+            None => None,
+            Some(raw) => {
+                let mut grants = HashMap::new();
+                for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+                    let (user, list) = entry.split_once('=').ok_or_else(|| {
+                        err(GRANTS, entry, "expected `user=schema|schema` entries")
+                    })?;
+                    let user = user.trim();
+                    if !tokens.values().any(|u| u == user) {
+                        return Err(err(GRANTS, user, "not a user in PLIMSOLL_AUTH_TOKENS"));
+                    }
+                    let schemas: HashSet<String> = list
+                        .split('|')
+                        .map(|s| s.trim().to_owned())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if grants.insert(user.to_owned(), schemas).is_some() {
+                        return Err(err(GRANTS, user, "user granted twice"));
+                    }
+                }
+                Some(grants)
+            }
+        };
         Ok(Self::Tokens {
             tokens,
             operators,
             groups,
+            grants,
         })
     }
 
@@ -178,13 +212,35 @@ impl Auth {
     }
 
     /// Whose queries `principal` may see in `system.runtime.queries`.
+    /// Whether data access is restricted per principal (ADR 0025).
+    pub fn grants_enforced(&self) -> bool {
+        matches!(
+            self,
+            Self::Tokens {
+                grants: Some(_),
+                ..
+            }
+        )
+    }
+
+    /// What `principal` may see: its rows in `system.runtime.queries`
+    /// (operators: all) and the schemas it may read.
     pub fn viewer(&self, principal: &str) -> Viewer {
-        match self {
-            Self::Tokens { operators, .. } if !operators.contains(principal) => Viewer {
-                only: Some(principal.to_owned()),
-            },
-            // Operators, and everyone when auth is disabled (development).
-            _ => Viewer { only: None },
+        let Self::Tokens {
+            operators, grants, ..
+        } = self
+        else {
+            // Development: everything.
+            return Viewer {
+                only: None,
+                schemas: None,
+            };
+        };
+        Viewer {
+            only: (!operators.contains(principal)).then(|| principal.to_owned()),
+            schemas: grants
+                .as_ref()
+                .map(|g| g.get(principal).cloned().unwrap_or_default()),
         }
     }
 
@@ -208,11 +264,32 @@ impl Auth {
 }
 
 /// Who is asking, carried into the query's session config so providers can
-/// scope what they return (`system.runtime.queries`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// scope what they return (`system.runtime.queries`), and checked by the
+/// engine on every table scan (ADR 0025).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Viewer {
     /// `Some(user)`: only that user's rows. `None`: all rows.
     pub only: Option<String>,
+    /// Readable schemas (`*` = all). `None`: grants not configured.
+    pub schemas: Option<HashSet<String>>,
+}
+
+impl TableAccess for Viewer {
+    fn check(&self, table: &ResolvedTableReference) -> DfResult<()> {
+        let Some(schemas) = &self.schemas else {
+            return Ok(());
+        };
+        // System tables scope their own rows (ADR 0022); information_schema
+        // exposes names only (accepted, ADR 0025).
+        let open =
+            table.catalog.as_ref() == "system" || table.schema.as_ref() == "information_schema";
+        if open || schemas.contains("*") || schemas.contains(table.schema.as_ref()) {
+            return Ok(());
+        }
+        Err(DataFusionError::External(Box::new(AccessDenied {
+            table: table.to_string(),
+        })))
+    }
 }
 
 /// SHA-256 of a token, as stored in `PLIMSOLL_AUTH_TOKENS`
@@ -284,14 +361,9 @@ mod tests {
     fn operators_see_all_queries_others_only_their_own() {
         let tokens = format!("ana:sha256:{},ops:sha256:{}", hex("t1"), hex("t2"));
         let a = auth(&[(TOKENS, tokens.clone()), (OPERATORS, "ops".into())]).unwrap();
-        assert_eq!(a.viewer("ops"), Viewer { only: None });
-        assert_eq!(
-            a.viewer("ana"),
-            Viewer {
-                only: Some("ana".into())
-            }
-        );
-        assert_eq!(Auth::Disabled.viewer("x"), Viewer { only: None });
+        assert_eq!(a.viewer("ops").only, None);
+        assert_eq!(a.viewer("ana").only, Some("ana".into()));
+        assert_eq!(Auth::Disabled.viewer("x"), Viewer::default());
         // Unknown operator (typo) and operators without auth fail boot.
         let e = auth(&[(TOKENS, tokens), (OPERATORS, "opz".into())]).unwrap_err();
         assert_eq!(e.var, OPERATORS);
@@ -314,6 +386,45 @@ mod tests {
         for bad in ["etl=nightly", "zed=batch", "etl", "etl=batch,etl=default"] {
             let e = auth(&[(TOKENS, tokens.clone()), (GROUPS, bad.into())]).unwrap_err();
             assert_eq!(e.var, GROUPS, "{bad}");
+        }
+    }
+
+    #[test]
+    fn grants_limit_readable_schemas() {
+        let tokens = format!(
+            "ana:sha256:{},etl:sha256:{},bob:sha256:{}",
+            hex("t1"),
+            hex("t2"),
+            hex("t3")
+        );
+        let t = |schema: &str| ResolvedTableReference {
+            catalog: "datafusion".into(),
+            schema: schema.into(),
+            table: "t".into(),
+        };
+        let sys = ResolvedTableReference {
+            catalog: "system".into(),
+            schema: "runtime".into(),
+            table: "queries".into(),
+        };
+        // Not configured: everyone reads everything.
+        let open = auth(&[(TOKENS, tokens.clone())]).unwrap();
+        assert!(open.viewer("bob").check(&t("gold")).is_ok());
+        let a = auth(&[
+            (TOKENS, tokens.clone()),
+            (GRANTS, "ana=gold|silver, etl=*".into()),
+        ])
+        .unwrap();
+        assert!(a.viewer("ana").check(&t("gold")).is_ok());
+        assert!(a.viewer("ana").check(&t("bronze")).is_err());
+        assert!(a.viewer("etl").check(&t("bronze")).is_ok());
+        // Configured but unlisted: no data, still system and information_schema.
+        assert!(a.viewer("bob").check(&t("gold")).is_err());
+        assert!(a.viewer("bob").check(&sys).is_ok());
+        assert!(a.viewer("bob").check(&t("information_schema")).is_ok());
+        for bad in ["zed=gold", "ana", "ana=gold,ana=silver"] {
+            let e = auth(&[(TOKENS, tokens.clone()), (GRANTS, bad.into())]).unwrap_err();
+            assert_eq!(e.var, GRANTS, "{bad}");
         }
     }
 

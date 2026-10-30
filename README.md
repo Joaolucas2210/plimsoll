@@ -104,6 +104,7 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_AUTH_OPERATORS` | unset | Users (from the tokens) who see every query in `system.runtime.queries`; others see their own (ADR 0022) |
 | `PLIMSOLL_RESOURCE_GROUPS` | unset | `interactive=4/16,batch=2/64`: per group, max running / max queued; `default` always exists with the global limits (ADR 0023) |
 | `PLIMSOLL_AUTH_GROUPS` | unset | `etl=batch,ana=interactive\|batch`: groups each user may use, first = their default; unlisted users get `default` (ADR 0023) |
+| `PLIMSOLL_AUTH_GRANTS` | unset | `ana=gold\|silver,etl=*`: schemas each user may read; once set, unlisted users read no data (system tables stay scoped per user) (ADR 0025) |
 | `PLIMSOLL_AUTH` | `required` | `disabled` = no authentication, `user` trusted from the body (development only) |
 | `PLIMSOLL_MEMORY_LIMIT_BYTES` | `1073741824` | Memory ceiling (the load line) |
 | `PLIMSOLL_MAX_RUNNING` | `8` | Max concurrently running queries |

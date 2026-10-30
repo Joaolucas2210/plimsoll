@@ -91,9 +91,8 @@ registering N times.
   per-namespace grants.
 - `Engine::sql` (no viewer) remains for internal callers. Any of them that
   touches the system table gets the fail-closed error, by design.
-- Data tables (bronze/silver/gold) have no authorization yet. Any principal
-  can read any table. That belongs with resource groups and namespace grants
-  (ROADMAP: per-layer governance).
+- Data tables (bronze/silver/gold) had no authorization; resolved by ADR 0025
+  (per-schema grants through the same `Viewer`).
 
 **Operational**
 - Grant operator rights to on-call or service accounts through

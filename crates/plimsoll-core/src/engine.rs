@@ -12,8 +12,11 @@ use std::time::{Duration, Instant};
 
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::MemorySchemaProvider;
+use datafusion::common::ResolvedTableReference;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SQLOptions;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::execute_stream;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
@@ -46,6 +49,21 @@ impl std::fmt::Debug for QueryResult {
             .field("reserved_bytes", &self.memory.size())
             .finish()
     }
+}
+
+/// Who may read which table (ADR 0025). Implemented by the front door (the
+/// server's caller identity); the engine only asks.
+pub trait TableAccess: Send + Sync + 'static {
+    fn check(&self, table: &ResolvedTableReference) -> Result<()>;
+}
+
+/// The caller may not read `table`. Returned (wrapped in
+/// `DataFusionError::External`) by [`TableAccess`] implementations so front
+/// doors can classify it.
+#[derive(Debug, thiserror::Error)]
+#[error("access denied to table {table}")]
+pub struct AccessDenied {
+    pub table: String,
 }
 
 pub struct Engine {
@@ -94,23 +112,27 @@ impl Engine {
     /// Runs one statement. Dropping the returned future cancels execution
     /// (the stream and its reservations are dropped with it).
     pub async fn sql(&self, sql: &str) -> Result<QueryResult> {
-        self.run(&self.ctx, sql).await
+        self.run(&self.ctx, sql, None).await
     }
 
-    /// [`Engine::sql`] with `extension` in this query's session config, for
-    /// providers that depend on who is asking (e.g. the caller's identity).
-    /// Same catalogs, runtime and pool; only the config is per query.
-    pub async fn sql_with<T: Send + Sync + 'static>(
-        &self,
-        sql: &str,
-        extension: Arc<T>,
-    ) -> Result<QueryResult> {
+    /// [`Engine::sql`] on behalf of `access`: every table the plan scans,
+    /// subqueries included, must pass [`TableAccess::check`] before anything
+    /// executes (ADR 0025). `access` is also put in this query's session
+    /// config for providers that depend on who is asking (ADR 0022). Same
+    /// catalogs, runtime and pool; only the config is per query.
+    pub async fn sql_with<T: TableAccess>(&self, sql: &str, access: Arc<T>) -> Result<QueryResult> {
         let mut state = self.ctx.state();
-        state.config_mut().set_extension(extension);
-        self.run(&SessionContext::new_with_state(state), sql).await
+        state.config_mut().set_extension(access.clone());
+        let ctx = SessionContext::new_with_state(state);
+        self.run(&ctx, sql, Some(access.as_ref())).await
     }
 
-    async fn run(&self, ctx: &SessionContext, sql: &str) -> Result<QueryResult> {
+    async fn run(
+        &self,
+        ctx: &SessionContext,
+        sql: &str,
+        access: Option<&dyn TableAccess>,
+    ) -> Result<QueryResult> {
         let started = Instant::now();
         // Read-only SQL (ADR 0024): DDL would let any caller read or write
         // server files (`CREATE EXTERNAL TABLE ... LOCATION '/etc/...'`,
@@ -123,6 +145,20 @@ impl Engine {
             .with_allow_statements(false);
         let df = ctx.sql_with_options(sql, read_only).await?;
         let (state, plan) = df.into_parts();
+        // Before subquery pre-evaluation, which already executes.
+        if let Some(access) = access {
+            let options = state.config_options();
+            let (catalog, schema) = (
+                &options.catalog.default_catalog,
+                &options.catalog.default_schema,
+            );
+            plan.apply_with_subqueries(|node| {
+                if let LogicalPlan::TableScan(scan) = node {
+                    access.check(&scan.table_name.clone().resolve(catalog, schema))?;
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+        }
         let plan = preevaluate_scalar_subqueries(&state, plan).await?;
         let physical = state.create_physical_plan(&plan).await?;
         let planning = started.elapsed();
@@ -249,5 +285,55 @@ mod tests {
                 .schema("bronze")
                 .is_some()
         );
+    }
+
+    /// Denies the `gold` schema.
+    struct NoGold;
+    impl TableAccess for NoGold {
+        fn check(&self, table: &ResolvedTableReference) -> Result<()> {
+            if table.schema.as_ref() == "gold" {
+                return Err(DataFusionError::External(Box::new(AccessDenied {
+                    table: table.to_string(),
+                })));
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn table_access_is_checked_on_every_scan() {
+        let e = engine(64 << 20);
+        let ctx = e.context();
+        ctx.sql("CREATE TABLE gold.g AS SELECT 1 AS x")
+            .await
+            .unwrap();
+        ctx.sql("CREATE TABLE silver.s AS SELECT 2 AS x")
+            .await
+            .unwrap();
+        let access = Arc::new(NoGold);
+        let ok = e
+            .sql_with("SELECT x FROM silver.s", access.clone())
+            .await
+            .unwrap();
+        assert_eq!(ok.batches[0].num_rows(), 1);
+        drop(ok);
+        for sql in [
+            "SELECT x FROM gold.g",
+            // Hidden in a CTE, a join, and a scalar subquery (which is
+            // pre-evaluated, i.e. executed, during planning).
+            "WITH c AS (SELECT * FROM gold.g) SELECT * FROM c",
+            "SELECT s.x FROM silver.s s JOIN gold.g g ON s.x = g.x",
+            "SELECT x FROM silver.s WHERE x > (SELECT max(x) FROM gold.g)",
+        ] {
+            let err = e.sql_with(sql, access.clone()).await.unwrap_err();
+            let denied = matches!(err.find_root(), DataFusionError::External(inner)
+                if inner.downcast_ref::<AccessDenied>().is_some());
+            assert!(denied, "{sql}: {err}");
+            assert!(
+                err.to_string()
+                    .contains("access denied to table datafusion.gold.g")
+            );
+        }
+        assert_eq!(e.pool().used(), 0);
     }
 }

@@ -47,6 +47,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Per-schema data grants per principal, checked on every table scan before execution (ADR 0025)
 - [x] Read-only query API: no DDL/DML/COPY/SET through `/v1/sql` (closed arbitrary file read/write, ADR 0024)
 - [x] Configurable resource groups with their own limits, bound to principals; unknown group 400, unbound 403 (ADR 0023)
 - [x] `system.runtime.queries` scoped to the principal; operators see all; fail closed without a viewer (ADR 0022)
@@ -56,14 +57,13 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Per-layer data governance**: any authenticated principal can read any
-table. Grants per principal on the medallion namespaces (`bronze`, `silver`,
-`gold`) and catalog namespaces, checked at planning through the same
-per-query `Viewer` extension (ADR 0022).
+**Readiness drain delay**: on SIGTERM, readiness flips and the listener
+closes at once, so a load balancer still routing to the pod gets connection
+errors during its probe interval. Keep serving for a configurable delay after
+readiness flips, then stop accepting.
 
 ## Later
 
 - OTLP traces and metrics export (OpenTelemetry), query-level spans
   (admission wait, planning, execution). No OpenTelemetry dependency until then.
-- Readiness drain delay before closing the listener.
 - Coordinator/worker split along the existing plane boundary.
