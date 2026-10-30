@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-10-30
 - Owner: JoaoLucas2210
-- Related: ADR 0007 (refines: deletes no longer refused), ADR 0010 (delete manifests now pruned), ADR 0012, ADR 0013, ADR 0011, ADR 0016 (equality deletes)
+- Related: ADR 0007 (refines: deletes no longer refused), ADR 0010 (delete manifests now pruned), ADR 0012, ADR 0013, ADR 0011, ADR 0016 (equality deletes), ADR 0017 (deletion vectors)
 - Scope: `plimsoll-connectors::iceberg` (`iceberg/deletes.rs`, `IcebergTable::data_files`, `scan`), `.github/workflows/interop.yml`
 
 ## Context
@@ -92,7 +92,7 @@ Option A for position deletes; equality deletes stay refused (typed
   cost planning time and memory until compacted.
 - Positions are reserved during planning only; the resulting selections live
   in the plan (O(runs)) unaccounted.
-- Equality deletes and v3 deletion vectors are refused.
+- Equality deletes and v3 deletion vectors were refused (since: ADR 0016, ADR 0017).
 - Delete files are not pruned by their `file_path` column bounds.
 
 **Operational**

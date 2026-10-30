@@ -6,6 +6,9 @@
 //! into a file-level `RowSelection`, so DataFusion's Parquet scan never
 //! decodes deleted rows (ADR 0014).
 //!
+//! Deletion vectors (v3): the same positions as a Roaring bitmap blob inside a
+//! Puffin file, one per data file, applied like position deletes (ADR 0017).
+//!
 //! Equality deletes: rows of key values. Spec v2: they apply to a data file
 //! with a *strictly lower* sequence number in the same partition (or to every
 //! partition when the delete's spec is unpartitioned). Loaded here as key
@@ -26,16 +29,20 @@ use datafusion::parquet::arrow::arrow_reader::{
     ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
 };
 use plimsoll_core::storage::ScopedStore;
+use roaring::RoaringTreemap;
 
 use crate::ConnectorError;
 
-/// A live position delete file from a delete manifest.
+/// A live position delete file (or v3 deletion vector) from a delete manifest.
 pub(super) struct DeleteFile {
     pub path: String,
     /// Data sequence number (inherited from the manifest when absent).
     pub seq: i64,
     /// v2 `referenced_data_file`: when set, the only data file it touches.
     pub referenced: Option<String>,
+    /// Deletion vector: `(content_offset, content_size_in_bytes)` of its blob
+    /// in the Puffin file at `path`; `referenced` is then required.
+    pub blob: Option<(u64, u64)>,
 }
 
 /// A live equality delete file from a delete manifest.
@@ -134,6 +141,32 @@ pub(super) async fn positions(
         {
             continue;
         }
+        if let Some((offset, size)) = delete.blob {
+            let Some(target) = delete.referenced.as_deref() else {
+                return Err(invalid_delete(
+                    &delete.path,
+                    "deletion vector",
+                    "no referenced_data_file",
+                ));
+            };
+            match targets.get(target) {
+                Some(&data_seq) if data_seq <= delete.seq => {}
+                _ => continue,
+            }
+            let blob =
+                super::read_range(&delete.path, offset..offset + size, state, scoped).await?;
+            reservation.try_grow(blob.len())?;
+            let bitmap = deletion_vector(&blob)
+                .map_err(|e| invalid_delete(&delete.path, "deletion vector", &e))?;
+            reservation.shrink(blob.len());
+            let n = usize::try_from(bitmap.len())
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            reservation.try_grow(n * std::mem::size_of::<u64>())?;
+            out.entry(target.to_owned())
+                .or_default()
+                .extend(bitmap.iter());
+            continue;
+        }
         // Whole file in memory, reserved while decoded. Position delete files
         // are small relative to data (two narrow columns).
         let bytes = super::read(&delete.path, state, scoped).await?;
@@ -180,6 +213,43 @@ pub(super) async fn positions(
         positions.dedup();
     }
     Ok(out)
+}
+
+/// Magic of a `deletion-vector-v1` blob.
+const DV_MAGIC: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
+
+/// Decodes a `deletion-vector-v1` blob: big-endian length of magic + bitmap,
+/// magic, portable 64-bit Roaring bitmap, big-endian CRC-32 of magic + bitmap.
+fn deletion_vector(blob: &[u8]) -> std::result::Result<RoaringTreemap, String> {
+    let n = blob.len();
+    if n < 12 {
+        return Err(format!("blob of {n} bytes"));
+    }
+    let be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    let body = &blob[4..n - 4];
+    if usize::try_from(be(&blob[..4])).ok() != Some(body.len()) {
+        return Err("length prefix does not match the blob size".to_owned());
+    }
+    if body[..4] != DV_MAGIC {
+        return Err("bad magic".to_owned());
+    }
+    if crc32(body) != be(&blob[n - 4..]) {
+        return Err("CRC mismatch".to_owned());
+    }
+    RoaringTreemap::deserialize_from(&body[4..]).map_err(|e| e.to_string())
+}
+
+/// CRC-32 (IEEE), bitwise. ponytail: ~10 ms/MB; DV blobs are KBs. Table-driven
+/// or `crc32fast` if profiles ever show it.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+        }
+    }
+    !crc
 }
 
 /// Rows `0..rows` minus the sorted, unique `deleted` positions.
@@ -239,5 +309,30 @@ mod tests {
         assert_eq!(selection(&[], 5).unwrap().row_count(), 5);
         assert_eq!(selection(&[0, 1, 2], 3).unwrap().row_count(), 0);
         assert!(selection(&[5], 5).is_err(), "position past the end");
+    }
+
+    fn blob(bitmap: &RoaringTreemap) -> Vec<u8> {
+        let mut body = DV_MAGIC.to_vec();
+        bitmap.serialize_into(&mut body).unwrap();
+        let mut out = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
+        out.extend(&body);
+        out.extend(crc32(&body).to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn deletion_vectors_decode_and_are_verified() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926, "IEEE check value");
+        // Positions beyond 2^32 exercise the 64-bit (treemap) layout.
+        let bitmap: RoaringTreemap = [0u64, 7, 70_000, (1 << 32) + 3].into_iter().collect();
+        let mut b = blob(&bitmap);
+        assert_eq!(deletion_vector(&b).unwrap(), bitmap);
+        let last = b.len() - 1;
+        b[last] ^= 1;
+        assert!(deletion_vector(&b).unwrap_err().contains("CRC"));
+        let mut b = blob(&bitmap);
+        b[4] = 0;
+        assert!(deletion_vector(&b).unwrap_err().contains("magic"));
+        assert!(deletion_vector(&blob(&bitmap)[..20]).is_err(), "truncated");
     }
 }

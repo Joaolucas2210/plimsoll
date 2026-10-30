@@ -6,7 +6,7 @@
 //! session's pool, so the whole read path runs under the `CeilingPool`.
 //! See ADR 0007.
 //!
-//! Correctness first: anything we can't read exactly (v3 deletion vectors, renamed
+//! Correctness first: anything we can't read exactly (column defaults, encryption, renamed
 //! columns, non-Parquet files, nested types) is a typed error, never a
 //! silently wrong answer.
 
@@ -191,8 +191,14 @@ impl IcebergTable {
     fn from_metadata(name: &str, path: &str, meta: &Json) -> Result<Self, ConnectorError> {
         let err = |m: &str| invalid(path, m);
         let version = meta["format-version"].as_i64().unwrap_or(1);
-        if !(1..=2).contains(&version) {
+        if !(1..=3).contains(&version) {
             return Err(unsupported(path, format!("format-version {version}")));
+        }
+        if meta["encryption-keys"]
+            .as_array()
+            .is_some_and(|k| !k.is_empty())
+        {
+            return Err(unsupported(path, "encrypted tables".to_owned()));
         }
         let schemas: Vec<&Json> = match meta["schemas"].as_array() {
             Some(s) => s.iter().collect(),
@@ -207,6 +213,22 @@ impl IcebergTable {
             None => schemas.first().copied().ok_or_else(|| err("no schema"))?,
         };
         check_name_mapping(path, &schemas)?;
+        // v3 defaults: files written before a column was added must read its
+        // `initial-default`; the Parquet scan would return NULL instead.
+        if let Some(f) = current["fields"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|f| !f["initial-default"].is_null())
+        {
+            return Err(unsupported(
+                path,
+                format!(
+                    "column default values ({:?})",
+                    f["name"].as_str().unwrap_or_default()
+                ),
+            ));
+        }
         let schema = Arc::new(arrow_schema(path, current)?);
 
         let snapshot_id = meta["current-snapshot-id"].as_i64().filter(|id| *id != -1);
@@ -332,9 +354,17 @@ impl IcebergTable {
                 let file = field(&entry, "data_file")
                     .ok_or_else(|| invalid(&manifest_path, "data_file missing"))?;
                 let format = str_field(file, "file_format").unwrap_or("");
-                if !format.eq_ignore_ascii_case("parquet") {
+                // v3 deletion vectors live in Puffin files (ADR 0017).
+                let dv = is_delete && format.eq_ignore_ascii_case("puffin");
+                if !format.eq_ignore_ascii_case("parquet") && !dv {
                     return Err(
                         unsupported(&manifest_path, format!("{format:?} data files")).into(),
+                    );
+                }
+                // Encrypted files would decode as garbage; refuse them.
+                if field(file, "key_metadata").is_some_and(|k| *k != Avro::Null) {
+                    return Err(
+                        unsupported(&manifest_path, "encrypted data files".to_owned()).into(),
                     );
                 }
                 let path = str_field(file, "file_path")
@@ -345,11 +375,28 @@ impl IcebergTable {
                 match (is_delete, long_field(file, "content").unwrap_or(0)) {
                     (false, 0) => {}
                     (true, 1) => {
+                        let blob = if dv {
+                            let offset = long_field(file, "content_offset")
+                                .and_then(|o| u64::try_from(o).ok());
+                            let size = long_field(file, "content_size_in_bytes")
+                                .and_then(|s| u64::try_from(s).ok());
+                            let (Some(offset), Some(size)) = (offset, size) else {
+                                return Err(invalid(
+                                    path,
+                                    "deletion vector without content offset/size",
+                                )
+                                .into());
+                            };
+                            Some((offset, size))
+                        } else {
+                            None
+                        };
                         reservation.try_grow(path.len() + std::mem::size_of::<DeleteFile>())?;
                         deletes.push(DeleteFile {
                             path: path.to_owned(),
                             seq,
                             referenced: str_field(file, "referenced_data_file").map(str::to_owned),
+                            blob,
                         });
                         continue;
                     }
@@ -817,6 +864,8 @@ fn arrow_type(path: &str, ty: &str) -> Result<DataType, ConnectorError> {
         "time" => DataType::Time64(us),
         "timestamp" => DataType::Timestamp(us, None),
         "timestamptz" => DataType::Timestamp(us, Some("UTC".into())),
+        "timestamp_ns" => DataType::Timestamp(TimeUnit::Nanosecond, None),
+        "timestamptz_ns" => DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
         "string" => DataType::Utf8,
         "uuid" => DataType::FixedSizeBinary(16),
         "binary" => DataType::Binary,
@@ -837,6 +886,21 @@ fn arrow_type(path: &str, ty: &str) -> Result<DataType, ConnectorError> {
             parsed.ok_or_else(|| unsupported(path, format!("type {t:?}")))?
         }
     })
+}
+
+/// Bytes `range` of the object at `path` (a deletion vector blob).
+async fn read_range(
+    path: &str,
+    range: std::ops::Range<u64>,
+    state: &dyn Session,
+    scoped: Option<&ScopedStore>,
+) -> Result<bytes::Bytes, ConnectorError> {
+    let url = ListingTableUrl::parse(path)?;
+    let store = state.runtime_env().object_store(store_url(&url, scoped))?;
+    store
+        .get_range(url.prefix(), range)
+        .await
+        .map_err(|e| ConnectorError::DataFusion(DataFusionError::External(Box::new(e))))
 }
 
 /// Avro records decoded lazily, one at a time.

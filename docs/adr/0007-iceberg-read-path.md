@@ -74,7 +74,7 @@ Wrong: reads files that are not in the snapshot.
    partition's in-flight batch reserved. Over-counting one batch may fail a
    query early; it never lets the node overshoot.
 4. **Refuse instead of guessing** — `ConnectorError::Iceberg("unsupported
-   at …")`: `format-version` other than 1–2, nested types, unknown primitive
+   at …")`: `format-version` other than 1–3 (v3 since ADR 0017), nested types, unknown primitive
    types, a v1 snapshot without `manifest-list` and any schema history where a
    field id and a name disagree (rename, drop + re-add) at registration;
    non-Parquet data files at scan. Position deletes (merge-on-read) are
@@ -139,4 +139,4 @@ mapping: `ConnectorError::Iceberg` reaches the server as
 - Planning time dominates query latency (ADR 0010 is the first answer).
 - An Iceberg crate supports our DataFusion major and reserves through the
   session `MemoryPool`: re-evaluate Option B/C.
-- Format v3 tables appear in a target catalog.
+- Format v3 features beyond ADR 0017 (defaults, encryption, variant/geo types) are needed.

@@ -2,10 +2,11 @@
 # Writes merge-on-read Iceberg tables with Apache Spark and Iceberg's Java
 # writers (the reference implementation) for tests/iceberg.rs:
 # position deletes (reads_a_spark_merge_on_read_table) and equality deletes
-# (reads_reference_equality_deletes).
+# (reads_reference_equality_deletes), and v3 deletion vectors
+# (reads_reference_deletion_vectors).
 #
 #   scripts/spark_mor_fixture.sh <warehouse-dir>
-#   # prints PLIMSOLL_ICEBERG_MOR=... and PLIMSOLL_ICEBERG_EQ=...
+#   # prints PLIMSOLL_ICEBERG_{MOR,EQ,DV}=...
 #
 # The warehouse is mounted at the same absolute path inside the container, so
 # the paths Spark records in the metadata are valid on the host.
@@ -71,6 +72,20 @@ try {
   // Newer than the delete: must survive although city = 'x'.
   spark.sql("INSERT INTO local.db.eq VALUES (6, 'x', 'a')")
 
+  // Format v3: deletes become deletion vectors (Puffin blobs). Two deletes
+  // on the same file so the second DV must replace the first.
+  Seq(
+    """CREATE TABLE local.db.dv (id BIGINT, name STRING) USING iceberg
+       TBLPROPERTIES ('format-version'='3', 'write.delete.mode'='merge-on-read',
+                      'write.update.mode'='merge-on-read')""",
+    "INSERT INTO local.db.dv SELECT id, concat('n', id) FROM range(0, 100000)",
+    "DELETE FROM local.db.dv WHERE id % 7 = 0",
+    "DELETE FROM local.db.dv WHERE id < 10",
+    "UPDATE local.db.dv SET name = 'updated' WHERE id = 99999"
+  ).foreach(spark.sql)
+  val dv = spark.sql("SELECT count(*), sum(id) FROM local.db.dv").collect()(0)
+  println(s"DV-CHECK ${dv.getLong(0)} ${dv.getLong(1)}")
+
   // The fixture is only useful if the reference engine agrees with it.
   val ids = spark.sql("SELECT id FROM local.db.eq ORDER BY id").collect().map(_.getLong(0)).toSeq
   require(ids == Seq(2L, 4L, 5L, 6L), s"Spark reads $ids")
@@ -90,3 +105,4 @@ docker run --rm -e TZ=UTC -v "$wh:$wh" -v "$jars:/jars:ro" -v "$scala:/fixture.s
 rm -f "$scala"
 echo "PLIMSOLL_ICEBERG_MOR=$wh/db/mor"
 echo "PLIMSOLL_ICEBERG_EQ=$wh/db/eq"
+echo "PLIMSOLL_ICEBERG_DV=$wh/db/dv"

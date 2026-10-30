@@ -19,6 +19,8 @@ chrono = { version = "0.4", default-features = false }
 apache-avro = { version = "0.22", default-features = false }
 serde_json.workspace = true
 bytes = "1"
+# ADR 0017: Iceberg v3 deletion vectors are portable 64-bit Roaring bitmaps.
+roaring = "0.12"
 
 [lints]
 workspace = true

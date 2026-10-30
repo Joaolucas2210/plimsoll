@@ -146,5 +146,5 @@ problem yet.
 
 - Upsert tables arrive with hundreds of small delete files per partition
   (merge sets by `equality_ids`, or option B).
-- Format v3 (deletion vectors) is in scope.
+- Format v3 equality-delete semantics change (none as of v3; DVs: ADR 0017).
 - Planning profiles show delete-file reads dominating (cache per snapshot).

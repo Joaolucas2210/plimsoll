@@ -61,7 +61,7 @@ would need wrappers. More code than A for the same result.
 |---|---|---|---|---|
 | `InvalidQuery` | 400 | `invalid_query` | no | parse/plan errors, unknown table/namespace |
 | `MemoryLimitExceeded` | 422 | `memory_limit_exceeded` | no | `ResourcesExhausted` (ADR 0003/0012) |
-| `Unsupported` | 422 | `unsupported_feature` | no | Iceberg v3 / deletion vectors, nested types, equality keys on dropped fields; Postgres type |
+| `Unsupported` | 422 | `unsupported_feature` | no | Iceberg v3 column defaults / encryption, nested types, equality keys on dropped fields; Postgres type |
 | `InvalidTable` | 422 | `invalid_table` | no | malformed metadata, data file `NotFound`, undecodable Parquet |
 | `Dependency{dependency}` | 502 | `dependency_failed` + `dependency` | yes | catalog (`Http`, `Auth`, `Status`, `Protocol`), `object_store` (anything but `NotFound`), `postgres` (SQLSTATE 08/28/53/57 or no response) |
 | (admission) | 429 / 503 / 504 | `queue_full` / `not_ready` / `query_timeout` | yes | governance |

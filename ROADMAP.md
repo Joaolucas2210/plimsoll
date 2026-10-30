@@ -39,6 +39,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Error taxonomy (`code`, `retryable`, `dependency`), `plimsoll_query_errors_total{code}`, dependency failure budgets (ADR 0013)
 - [x] Merge-on-read position deletes, validated against Spark (ADR 0014)
 - [x] Equality deletes (upserts/CDC), validated against Iceberg Java writers (ADR 0016)
+- [x] Format v3: deletion vectors (Puffin + Roaring), `timestamp_ns`; defaults/encryption refused (ADR 0017)
 - [x] Admission: running/queued limits globally, per resource group, per user (RAII slots)
 - [x] Query registry + per-query deadline (queue wait + execution)
 - [x] `system.runtime.queries` schema + snapshot source
@@ -48,7 +49,8 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Format v3 deletion vectors** (Puffin): row selections like ADR 0014.
+**Delete-file cache per snapshot**: delete files (position, DV, equality)
+are read on every query (ADRs 0014, 0016, 0017).
 
 ## Later
 

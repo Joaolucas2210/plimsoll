@@ -406,6 +406,44 @@ async fn empty_table_has_no_rows() {
 }
 
 #[tokio::test]
+async fn v3_features_that_change_answers_are_refused() {
+    let register_meta = async |tag: &str, meta: serde_json::Value| {
+        let dir = tmp(tag);
+        std::fs::write(dir.join("metadata/v1.metadata.json"), meta.to_string()).unwrap();
+        register(&SessionContext::new(), &dir).await
+    };
+    let schema = |field: serde_json::Value| json!([{"schema-id": 0, "fields": [{"id": 1, "name": "id", "type": "long", "required": true}, field]}]);
+    // A column added with a default: old files must read 'x', not NULL.
+    let err = register_meta(
+        "v3-default",
+        json!({"format-version": 3, "current-schema-id": 0,
+        "current-snapshot-id": -1, "schemas": schema(json!({"id": 2, "name": "c",
+        "type": "string", "required": false, "initial-default": "x"}))}),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("column default values"), "{err}");
+    let err = register_meta(
+        "v3-encrypted",
+        json!({"format-version": 3, "current-schema-id": 0,
+        "current-snapshot-id": -1, "encryption-keys": [{"key-id": "k"}],
+        "schemas": schema(json!({"id": 2, "name": "c", "type": "string", "required": false}))}),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("encrypted"), "{err}");
+    // Plain v3 with a nanosecond timestamp is readable.
+    register_meta(
+        "v3-plain",
+        json!({"format-version": 3, "current-schema-id": 0,
+        "current-snapshot-id": -1, "schemas": schema(json!({"id": 2, "name": "ts",
+        "type": "timestamp_ns", "required": false}))}),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn read_path_runs_under_the_ceiling() {
     let dir = tmp("ceiling");
     table(&dir, Deletes::None, false);
@@ -588,5 +626,43 @@ async fn reads_reference_equality_deletes() {
         [4, 5]
     );
     assert_eq!(ids(&ctx, "SELECT count(*) FROM eq").await.unwrap(), [4]);
+    assert_eq!(pool.used(), 0);
+}
+
+/// Format v3 table written by Spark with merge-on-read deletes, i.e. deletion
+/// vectors in Puffin files (`scripts/spark_mor_fixture.sh`): 100 000 rows,
+/// `DELETE id % 7 = 0`, then `DELETE id < 10` (replaces DVs), then an `UPDATE`.
+/// Spark reads 85 706 rows summing to 4 285 685 677.
+#[tokio::test]
+#[ignore = "needs PLIMSOLL_ICEBERG_DV from scripts/spark_mor_fixture.sh"]
+async fn reads_reference_deletion_vectors() {
+    let Ok(location) = std::env::var("PLIMSOLL_ICEBERG_DV") else {
+        return;
+    };
+    let pool = Arc::new(CeilingPool::new(256 << 20, 0).unwrap());
+    let ctx = session_context_with_ceiling(pool.clone(), None, SessionConfig::new()).unwrap();
+    IcebergConnector::try_new("dv", &location, &ctx.state())
+        .await
+        .unwrap()
+        .register(&ctx)
+        .unwrap();
+    let out = |sql: &'static str| {
+        let ctx = ctx.clone();
+        async move {
+            let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+                .unwrap()
+                .to_string()
+        }
+    };
+    let totals = out("SELECT count(*) AS n, sum(id) AS s FROM dv").await;
+    assert!(totals.contains("| 85706 | 4285685677 |"), "{totals}");
+    let gone = out("SELECT count(*) AS n FROM dv WHERE id % 7 = 0 OR id < 10").await;
+    assert!(gone.contains("| 0 |"), "{gone}");
+    let updated = out("SELECT name FROM dv WHERE id = 99999").await;
+    assert!(
+        updated.contains("| updated |") && !updated.contains("n99999"),
+        "{updated}"
+    );
     assert_eq!(pool.used(), 0);
 }

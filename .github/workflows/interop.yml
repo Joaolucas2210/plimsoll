@@ -1,9 +1,9 @@
 name: interop
 
 # Merge-on-read interop against the reference implementation: Spark position
-# deletes (ADR 0014) and Iceberg Java equality deletes (ADR 0016). Heavy
-# (Spark image + JVM), so it runs only when the Iceberg reader changes,
-# weekly, or on demand (ADR 0011).
+# deletes (ADR 0014), Iceberg Java equality deletes (ADR 0016) and v3
+# deletion vectors (ADR 0017). Heavy (Spark image + JVM), so it runs only
+# when the Iceberg reader changes, weekly, or on demand (ADR 0011).
 on:
   push:
     branches: [main]
@@ -44,9 +44,9 @@ jobs:
       - run: cargo test --workspace --no-run
       - name: wait for Spark
         run: |
-          for i in $(seq 1 180); do grep -q PLIMSOLL_ICEBERG_EQ "$RUNNER_TEMP/mor.env" 2>/dev/null && break; sleep 2; done
+          for i in $(seq 1 180); do grep -q PLIMSOLL_ICEBERG_DV "$RUNNER_TEMP/mor.env" 2>/dev/null && break; sleep 2; done
           cat "$RUNNER_TEMP/mor.err" >&2 || true
           cat "$RUNNER_TEMP/mor.env" >> "$GITHUB_ENV"
       - run: |
-          test -n "$PLIMSOLL_ICEBERG_MOR" && test -n "$PLIMSOLL_ICEBERG_EQ"
-          cargo test --workspace -- --ignored reads_a_spark_merge_on_read_table reads_reference_equality_deletes
+          test -n "$PLIMSOLL_ICEBERG_MOR" && test -n "$PLIMSOLL_ICEBERG_EQ" && test -n "$PLIMSOLL_ICEBERG_DV"
+          cargo test --workspace -- --ignored reads_a_spark_merge_on_read_table reads_reference_equality_deletes reads_reference_deletion_vectors

@@ -24,12 +24,13 @@ are allowed in place.
 | [0014](0014-merge-on-read-position-deletes.md) | Merge-on-read: position deletes as Parquet row selections | Accepted | 2026-10-30 | Position delete files become `ParquetRowSelection`s so deleted rows are never decoded; seq-number rule, reserved positions; equality deletes refused; Spark interop workflow | 0007, 0010, 0011, 0012, 0013 |
 | [0015](0015-one-http-tls-stack.md) | One HTTP/TLS stack | Accepted | 2026-10-30 | Catalog client on the same `reqwest 0.12` + `ring` as `object_store`; `aws-lc-rs` and 14 other crates leave the build | 0008, 0009, 0011 |
 | [0016](0016-equality-deletes.md) | Merge-on-read: equality deletes as grouped hash anti-joins | Accepted | 2026-10-30 | Files grouped by the equality delete sets that apply (strict seq, same partition or global); each group anti-joins the keys with null = null; reference-writer interop | 0007, 0010, 0011, 0012, 0013, 0014 |
+| [0017](0017-format-v3-deletion-vectors.md) | Format v3: deletion vectors, and what v3 must not silently change | Accepted | 2026-10-30 | Accept v3; DV blobs read by range, length/magic/CRC verified, Roaring decoded with `roaring`, applied as row selections; refuse column defaults and encryption | 0007, 0013, 0014, 0016 |
 
 ## Reading order
 
 - Invariant first: 0003 (memory), 0005 (correctness).
 - Shape of the system: 0001, 0002, 0004.
-- Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016.
+- Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017.
 - Federation: 0005 → 0006.
 
 ## Conventions
