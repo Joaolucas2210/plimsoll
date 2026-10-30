@@ -3,6 +3,7 @@
 //! integrator can build the router without a network socket.
 
 pub mod app;
+pub mod auth;
 pub mod config;
 pub mod engine;
 pub mod lakehouse;

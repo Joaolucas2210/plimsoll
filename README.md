@@ -82,18 +82,26 @@ per layer (e.g. read-only `bronze` for analysts) build on it later.
 Requires a stable Rust toolchain (edition 2024, rust ≥ 1.85).
 
 ```bash
+# Tokens are configured as SHA-256 digests; the server never sees them raw.
+TOKEN=$(openssl rand -hex 32)
+export PLIMSOLL_AUTH_TOKENS="ana:sha256:$(printf %s "$TOKEN" | sha256sum | cut -d' ' -f1)"
 cargo run -p plimsoll-server
 curl -s localhost:8080/healthz
 curl -s -XPOST localhost:8080/v1/sql -H 'content-type: application/json' \
-     -d '{"sql": "select 1", "user": "ana"}'
+     -H "authorization: Bearer $TOKEN" -d '{"sql": "select 1"}'
 curl -s localhost:8080/metrics
 ```
+
+Local experiments without tokens: `PLIMSOLL_AUTH=disabled` (then `user` is
+read from the request body and trusted as sent).
 
 Configuration is environment-only; invalid values abort startup.
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `PLIMSOLL_BIND` | `127.0.0.1:8080` | Listen address |
+| `PLIMSOLL_AUTH_TOKENS` | required | `ana:sha256:<hex>,etl:sha256:<hex>`: SHA-256 of each bearer token and its user (ADR 0021) |
+| `PLIMSOLL_AUTH` | `required` | `disabled` = no authentication, `user` trusted from the body (development only) |
 | `PLIMSOLL_MEMORY_LIMIT_BYTES` | `1073741824` | Memory ceiling (the load line) |
 | `PLIMSOLL_MAX_RUNNING` | `8` | Max concurrently running queries |
 | `PLIMSOLL_MAX_QUEUED` | `64` | Max queued queries (0 = reject when busy) |

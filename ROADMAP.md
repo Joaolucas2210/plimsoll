@@ -47,14 +47,16 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Bearer-token authentication, `user` = principal, SHA-256 digests in env, secure by default (ADR 0021)
 - [x] Query latency histograms by phase: queue, planning, execution, serialization, total (ADR 0019)
 - [x] Wire pool/spill metrics to the live `CeilingPool`
 
 ## Next obvious PR
 
-**Authentication**: bearer tokens (then mTLS) deriving `user` from the
-principal; today `user` is trusted as sent, so per-user admission limits are
-advisory (ADR 0004, `ponytail:` in `app::sql`).
+**Authorization after authentication**: `system.runtime.queries` shows
+every user's SQL to any authenticated caller, and the resource group is still
+chosen by the client. Scope both to the principal (own queries; an operator
+role sees all; group bound to the token) (ADR 0021 debt).
 
 ## Later
 

@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use plimsoll_control::governance::{AdmissionConfig, Limits};
 
+use crate::auth::Auth;
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("invalid {var}={value:?}: {reason}")]
 pub struct ConfigError {
@@ -22,6 +24,8 @@ pub struct Config {
     pub admission: AdmissionConfig,
     /// Deadline covering queue wait + execution.
     pub query_timeout: Duration,
+    /// Who may run SQL (ADR 0021).
+    pub auth: Auth,
 }
 
 impl Config {
@@ -65,6 +69,7 @@ impl Config {
                 },
             },
             query_timeout: Duration::from_millis(timeout_ms),
+            auth: Auth::from_lookup(&lookup)?,
         })
     }
 }
@@ -106,13 +111,21 @@ where
 mod tests {
     use super::*;
 
+    /// Auth is required by default; these tests are about other settings.
     fn cfg(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
         Config::from_lookup(|k| {
             pairs
                 .iter()
+                .chain(&[("PLIMSOLL_AUTH", "disabled")])
                 .find(|(n, _)| *n == k)
                 .map(|(_, v)| (*v).to_owned())
         })
+    }
+
+    #[test]
+    fn auth_is_required_by_default() {
+        let err = Config::from_lookup(|_| None).unwrap_err();
+        assert_eq!(err.var, "PLIMSOLL_AUTH_TOKENS");
     }
 
     #[test]

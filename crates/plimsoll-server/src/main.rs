@@ -16,6 +16,7 @@ use plimsoll_control::rest::RestCatalog;
 use plimsoll_core::engine::Engine;
 use plimsoll_core::memory::CeilingPool;
 use plimsoll_server::app::{self, AppState};
+use plimsoll_server::auth::Auth;
 use plimsoll_server::config::Config;
 use plimsoll_server::engine::CoreEngine;
 use plimsoll_server::metrics::PoolStats;
@@ -84,16 +85,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         started: Instant::now(),
         errors: Default::default(),
         latency: Default::default(),
+        auth: cfg.auth.clone(),
     });
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     // ponytail: eprintln instead of a tracing subscriber; one less dependency
     // until structured logs / OTLP land (ROADMAP).
     eprintln!(
-        "plimsoll-server listening on {} (catalog: {})",
+        "plimsoll-server listening on {} (catalog: {}, auth: {:?})",
         listener.local_addr()?,
-        catalog.as_ref().map_or("none", |c| c.uri.as_str())
+        catalog.as_ref().map_or("none", |c| c.uri.as_str()),
+        cfg.auth
     );
+    if cfg.auth == Auth::Disabled {
+        eprintln!("WARNING: PLIMSOLL_AUTH=disabled: `user` is trusted as sent (development only)");
+    }
     state.ready.store(true, Ordering::Relaxed);
 
     axum::serve(listener, app::router(state.clone()))

@@ -80,7 +80,8 @@ table-tested. Metrics never disagree with their owners.
 - No HTTP/2 and no in-process TLS: expected behind an ingress/proxy.
 - No drain delay between "not ready" and closing the listener (`ponytail:`
   in `shutdown_signal`); load balancers may see refused connections.
-- `user` in the request body is trusted as sent (`ponytail:`): no authN.
+- `user` in the request body was trusted as sent (`ponytail:`): no authN.
+  Resolved by ADR 0021 (bearer tokens; `user` = principal).
 - Results are JSON rows built from Arrow's JSON writer; no Arrow IPC.
 - No latency histograms; logs are `eprintln!`, no tracing subscriber.
 

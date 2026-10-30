@@ -18,6 +18,9 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true
+# ADR 0021: SHA-256 for token digests. Already in the build as the rustls
+# provider (ADR 0015), so no new crate.
+ring = "0.17"
 
 [dev-dependencies]
 tower = { version = "0.5", default-features = false, features = ["util"] }

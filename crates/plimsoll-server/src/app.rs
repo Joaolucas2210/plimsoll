@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -16,6 +16,7 @@ use plimsoll_control::governance::{Admission, AdmissionError, GovernedError, Que
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::auth::Auth;
 use crate::engine::{EngineError, QueryEngine, QueryOutput};
 use crate::metrics::{self, Latency, PoolStatsProvider};
 use futures::StreamExt;
@@ -31,6 +32,7 @@ pub struct AppState {
     /// `/v1/sql` errors by `code`, for `plimsoll_query_errors_total`.
     pub errors: ErrorCounts,
     pub latency: Latency,
+    pub auth: Auth,
 }
 
 #[derive(Default)]
@@ -130,7 +132,10 @@ fn json_body(query_id: Option<u64>, out: QueryOutput) -> Response {
 #[derive(Debug, Deserialize)]
 pub struct SqlRequest {
     pub sql: String,
-    pub user: String,
+    /// With auth on, the token's principal; a different value is refused.
+    /// With auth disabled, required and trusted as sent.
+    #[serde(default)]
+    pub user: Option<String>,
     #[serde(default)]
     pub resource_group: Option<String>,
 }
@@ -203,8 +208,23 @@ impl ApiError {
 
 async fn sql(
     State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: Result<Json<SqlRequest>, JsonRejection>,
 ) -> Response {
+    // Authenticate first: an anonymous caller learns nothing else (ADR 0021).
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let principal = match st.auth.principal(authorization) {
+        Ok(p) => p,
+        Err(e) => {
+            let mut r = ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", false)
+                .respond(&st, e, None);
+            r.headers_mut()
+                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+            return r;
+        }
+    };
     if !st.ready.load(Ordering::Relaxed) {
         return ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "not_ready", true).respond(
             &st,
@@ -222,17 +242,27 @@ async fn sql(
             );
         }
     };
-    if req.sql.trim().is_empty() || req.user.trim().is_empty() {
+    let user = match (principal, req.user) {
+        (Some(p), Some(u)) if u != p => {
+            return ApiError::new(StatusCode::FORBIDDEN, "forbidden", false).respond(
+                &st,
+                format!("authenticated as {p:?}, cannot run as {u:?}"),
+                None,
+            );
+        }
+        (Some(p), _) => p.to_owned(),
+        (None, Some(u)) => u,
+        (None, None) => String::new(),
+    };
+    if req.sql.trim().is_empty() || user.trim().is_empty() {
         return ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", false).respond(
             &st,
             "`sql` and `user` must be non-empty",
             None,
         );
     }
-    // ponytail: `user` is trusted as sent. Upgrade path: derive it from an
-    // authenticated principal (bearer token / mTLS) before multi-tenant use.
     let request = QueryRequest {
-        user: req.user,
+        user,
         resource_group: req.resource_group.unwrap_or_else(|| "default".to_owned()),
         sql: req.sql,
     };
@@ -317,6 +347,7 @@ mod tests {
             started: Instant::now(),
             errors: ErrorCounts::default(),
             latency: Latency::default(),
+            auth: Auth::Disabled,
         })
     }
 
@@ -471,6 +502,70 @@ mod tests {
             let (got, text) = call(router(default_state()), sql_req(body)).await;
             assert_eq!((got, error_code(&text).as_str()), (status, code), "{text}");
         }
+    }
+
+    #[tokio::test]
+    async fn sql_requires_a_bearer_token_and_runs_as_its_principal() {
+        let mut st = Arc::into_inner(default_state()).unwrap();
+        st.auth = Auth::from_lookup(&|k| {
+            (k == "PLIMSOLL_AUTH_TOKENS").then(|| {
+                let hex: String = crate::auth::token_digest("t1")
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                format!("ana:sha256:{hex}")
+            })
+        })
+        .unwrap();
+        let st = Arc::new(st);
+        let req = |token: Option<&str>, body: serde_json::Value| {
+            let mut r = Request::post("/v1/sql").header("content-type", "application/json");
+            if let Some(t) = token {
+                r = r.header("authorization", format!("Bearer {t}"));
+            }
+            r.body(Body::from(body.to_string())).unwrap()
+        };
+        // Missing or unknown token: 401 with a challenge, nothing executed.
+        for token in [None, Some("nope")] {
+            let res = router(st.clone())
+                .oneshot(req(token, json!({"sql": "select 1"})))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(res.headers()[header::WWW_AUTHENTICATE], "Bearer");
+        }
+        // Impersonation is refused.
+        let (status, body) = call(
+            router(st.clone()),
+            req(Some("t1"), json!({"sql": "select 1", "user": "bob"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        // The principal is the user; `user` may be omitted or match.
+        for body in [
+            json!({"sql": "select 1"}),
+            json!({"sql": "select 1", "user": "ana"}),
+        ] {
+            let (status, out) = call(router(st.clone()), req(Some("t1"), body)).await;
+            assert_eq!(status, StatusCode::OK, "{out}");
+        }
+        let users: Vec<String> = st
+            .admission
+            .registry()
+            .snapshot()
+            .into_iter()
+            .map(|q| q.user)
+            .collect();
+        assert_eq!(users, ["ana", "ana"]);
+        let (_, m) = call(router(st), get_req("/metrics")).await;
+        assert!(
+            m.contains("plimsoll_query_errors_total{code=\"unauthorized\"} 2"),
+            "{m}"
+        );
+        assert!(
+            m.contains("plimsoll_query_errors_total{code=\"forbidden\"} 1"),
+            "{m}"
+        );
     }
 
     #[tokio::test]
