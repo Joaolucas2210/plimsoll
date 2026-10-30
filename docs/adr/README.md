@@ -30,6 +30,7 @@ are allowed in place.
 | [0020](0020-concurrent-planning-fetches.md) | Concurrent metadata fetches during Iceberg planning | Accepted | 2026-10-30 | Manifests, delete files and DV blobs fetched `meta_fetch_concurrency` at a time, each reserved; decoded and merged in manifest order | 0007, 0010, 0012, 0014, 0016, 0017, 0018, 0019 |
 | [0021](0021-bearer-token-authentication.md) | Bearer-token authentication for the SQL endpoint | Accepted | 2026-10-30 | `Authorization: Bearer` mapped to a principal via SHA-256 digests in `PLIMSOLL_AUTH_TOKENS`; `user` = principal, impersonation 403; boot fails without tokens unless `PLIMSOLL_AUTH=disabled` | 0004, 0013, 0015 |
 | [0022](0022-principal-scoped-system-tables.md) | Principal-scoped system tables | Accepted | 2026-10-30 | The caller's `Viewer` rides in a per-query session config extension; `system.runtime.queries` shows own rows, all for `PLIMSOLL_AUTH_OPERATORS`, and fails closed without a viewer | 0002, 0021 |
+| [0023](0023-resource-groups.md) | Configurable resource groups bound to principals | Accepted | 2026-10-30 | Closed set of groups (`default` + `PLIMSOLL_RESOURCE_GROUPS`) with own running/queued limits; `PLIMSOLL_AUTH_GROUPS` binds principals, first = default; unknown 400, unbound 403 | 0004, 0013, 0021, 0022 |
 
 ## Reading order
 

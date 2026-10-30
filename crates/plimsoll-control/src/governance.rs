@@ -203,17 +203,34 @@ pub struct Limits {
     pub max_queued: usize,
 }
 
+/// The resource group every deployment has (ADR 0023).
+pub const DEFAULT_GROUP: &str = "default";
+
 /// Admission limits. A query runs only when the global, its resource group's
 /// and its user's running counts are all below their limits.
 ///
-/// ponytail: every resource group shares `per_group` and every user shares
-/// `per_user`. Upgrade path: `HashMap<String, Limits>` overrides keyed by
-/// group, loaded from config, falling back to these defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Groups are a closed set: [`DEFAULT_GROUP`] with `per_group` limits, plus
+/// the configured `groups` (ADR 0023). Callers check [`Self::has_group`]
+/// before admitting; an unknown name never creates a group.
+/// ponytail: every user shares `per_user`; per-user overrides when needed.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionConfig {
     pub global: Limits,
+    /// Limits of [`DEFAULT_GROUP`] (unless `groups` overrides it).
     pub per_group: Limits,
     pub per_user: Limits,
+    /// Configured resource groups and their limits.
+    pub groups: HashMap<String, Limits>,
+}
+
+impl AdmissionConfig {
+    pub fn has_group(&self, group: &str) -> bool {
+        group == DEFAULT_GROUP || self.groups.contains_key(group)
+    }
+
+    fn group_limits(&self, group: &str) -> Limits {
+        self.groups.get(group).copied().unwrap_or(self.per_group)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,7 +302,7 @@ impl State {
 
     fn can_run(&self, cfg: &AdmissionConfig, user: &str, group: &str) -> bool {
         self.global.running < cfg.global.max_running
-            && self.group(group).running < cfg.per_group.max_running
+            && self.group(group).running < cfg.group_limits(group).max_running
             && self.user(user).running < cfg.per_user.max_running
     }
 
@@ -305,7 +322,7 @@ impl State {
         full(self.global.queued, cfg.global.max_queued, Scope::Global)?;
         full(
             self.group(group).queued,
-            cfg.per_group.max_queued,
+            cfg.group_limits(group).max_queued,
             Scope::Group(group.to_owned()),
         )?;
         full(
@@ -438,6 +455,10 @@ impl Admission {
         &self.registry
     }
 
+    pub fn config(&self) -> &AdmissionConfig {
+        &self.inner.cfg
+    }
+
     /// Global `(running, queued)`, exported as gauges.
     pub fn load(&self) -> (usize, usize) {
         let st = lock(&self.inner.state);
@@ -535,6 +556,7 @@ mod tests {
             global,
             per_group,
             per_user,
+            groups: HashMap::new(),
         };
         Admission::new(cfg, Arc::new(QueryRegistry::new(100)))
     }
@@ -545,6 +567,31 @@ mod tests {
             resource_group: "default".into(),
             sql: "select 1".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn configured_groups_have_their_own_limits() {
+        let cfg = AdmissionConfig {
+            global: lim(10, 10),
+            per_group: lim(10, 10),
+            per_user: lim(10, 10),
+            groups: HashMap::from([("batch".to_owned(), lim(1, 0))]),
+        };
+        let adm = Admission::new(cfg, Arc::new(QueryRegistry::new(100)));
+        assert!(adm.config().has_group("batch") && adm.config().has_group(DEFAULT_GROUP));
+        assert!(!adm.config().has_group("made-up"));
+        let _batch = adm.acquire("a", "batch").await.unwrap();
+        // batch is full (1 running, no queue); default is unaffected.
+        let err = adm.acquire("b", "batch").await.err().unwrap();
+        assert_eq!(
+            err,
+            AdmissionError::QueueFull {
+                scope: Scope::Group("batch".into()),
+                limit: 0
+            }
+        );
+        let _interactive = adm.acquire("b", DEFAULT_GROUP).await.unwrap();
+        assert_eq!(adm.load(), (2, 0));
     }
 
     #[tokio::test]

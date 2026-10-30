@@ -12,7 +12,9 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use plimsoll_control::governance::{Admission, AdmissionError, GovernedError, QueryRequest};
+use plimsoll_control::governance::{
+    Admission, AdmissionError, DEFAULT_GROUP, GovernedError, QueryRequest,
+};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -261,9 +263,32 @@ async fn sql(
             None,
         );
     }
+    // Resource group: requested, else the principal's default (ADR 0023).
+    let allowed = st.auth.groups_for(&user);
+    let group = req.resource_group.unwrap_or_else(|| {
+        allowed
+            .as_ref()
+            .and_then(|a| a.first())
+            .unwrap_or(&DEFAULT_GROUP)
+            .to_string()
+    });
+    if !st.admission.config().has_group(&group) {
+        return ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", false).respond(
+            &st,
+            format!("unknown resource group {group:?}"),
+            None,
+        );
+    }
+    if allowed.is_some_and(|a| !a.contains(&group.as_str())) {
+        return ApiError::new(StatusCode::FORBIDDEN, "forbidden", false).respond(
+            &st,
+            format!("{user:?} may not use resource group {group:?}"),
+            None,
+        );
+    }
     let request = QueryRequest {
         user,
-        resource_group: req.resource_group.unwrap_or_else(|| "default".to_owned()),
+        resource_group: group,
         sql: req.sql,
     };
     let sql_text = request.sql.clone();
@@ -334,6 +359,13 @@ mod tests {
             global: limits,
             per_group: limits,
             per_user: limits,
+            groups: std::collections::HashMap::from([(
+                "batch".to_owned(),
+                Limits {
+                    max_running: 1,
+                    max_queued: 0,
+                },
+            )]),
         };
         Arc::new(AppState {
             engine: Arc::new(FakeEngine),
@@ -498,11 +530,14 @@ mod tests {
             hex("tb"),
             hex("to")
         );
-        st.auth = Auth::from_lookup(&|k| match k {
-            "PLIMSOLL_AUTH_TOKENS" => Some(tokens.clone()),
-            "PLIMSOLL_AUTH_OPERATORS" => Some("ops".into()),
-            _ => None,
-        })
+        st.auth = Auth::from_lookup(
+            &|k| match k {
+                "PLIMSOLL_AUTH_TOKENS" => Some(tokens.clone()),
+                "PLIMSOLL_AUTH_OPERATORS" => Some("ops".into()),
+                _ => None,
+            },
+            &|g| g == DEFAULT_GROUP,
+        )
         .unwrap();
         let st = Arc::new(st);
         let run = async |token: &str, sql: &str| {
@@ -560,15 +595,18 @@ mod tests {
     #[tokio::test]
     async fn sql_requires_a_bearer_token_and_runs_as_its_principal() {
         let mut st = Arc::into_inner(default_state()).unwrap();
-        st.auth = Auth::from_lookup(&|k| {
-            (k == "PLIMSOLL_AUTH_TOKENS").then(|| {
-                let hex: String = crate::auth::token_digest("t1")
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect();
-                format!("ana:sha256:{hex}")
-            })
-        })
+        let hex: String = crate::auth::token_digest("t1")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        st.auth = Auth::from_lookup(
+            &|k| match k {
+                "PLIMSOLL_AUTH_TOKENS" => Some(format!("ana:sha256:{hex}")),
+                "PLIMSOLL_AUTH_GROUPS" => Some("ana=default".into()),
+                _ => None,
+            },
+            &|g| ["default", "batch"].contains(&g),
+        )
         .unwrap();
         let st = Arc::new(st);
         let req = |token: Option<&str>, body: serde_json::Value| {
@@ -602,21 +640,32 @@ mod tests {
             let (status, out) = call(router(st.clone()), req(Some("t1"), body)).await;
             assert_eq!(status, StatusCode::OK, "{out}");
         }
-        let users: Vec<String> = st
+        // Resource groups: bound groups pass, others 403, unknown 400.
+        for (group, status) in [
+            ("default", StatusCode::OK),
+            ("batch", StatusCode::FORBIDDEN),
+            ("nightly", StatusCode::BAD_REQUEST),
+        ] {
+            let body = json!({"sql": "select 1", "resource_group": group});
+            let (got, out) = call(router(st.clone()), req(Some("t1"), body)).await;
+            assert_eq!(got, status, "{group}: {out}");
+        }
+        let users: Vec<(String, String)> = st
             .admission
             .registry()
             .snapshot()
             .into_iter()
-            .map(|q| q.user)
+            .map(|q| (q.user, q.resource_group))
             .collect();
-        assert_eq!(users, ["ana", "ana"]);
+        let ana = |g: &str| ("ana".to_owned(), g.to_owned());
+        assert_eq!(users, [ana("default"), ana("default"), ana("default")]);
         let (_, m) = call(router(st), get_req("/metrics")).await;
         assert!(
             m.contains("plimsoll_query_errors_total{code=\"unauthorized\"} 2"),
             "{m}"
         );
         assert!(
-            m.contains("plimsoll_query_errors_total{code=\"forbidden\"} 1"),
+            m.contains("plimsoll_query_errors_total{code=\"forbidden\"} 2"),
             "{m}"
         );
     }

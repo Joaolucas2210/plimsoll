@@ -1,6 +1,7 @@
 //! Server configuration. Env only, fail fast: an invalid value aborts startup
 //! instead of silently falling back to a default.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -55,23 +56,66 @@ impl Config {
             max_running,
             max_queued,
         };
+        let admission = AdmissionConfig {
+            global,
+            // `default` gets the global limits unless configured.
+            per_group: global,
+            per_user: Limits {
+                max_running: user_running,
+                max_queued,
+            },
+            groups: resource_groups(&lookup)?,
+        };
+        let auth = Auth::from_lookup(&lookup, &|g| admission.has_group(g))?;
         Ok(Self {
             bind,
             memory_limit_bytes,
-            admission: AdmissionConfig {
-                global,
-                // ponytail: one resource group ("default") and no group
-                // limits beyond the global ones until groups are configurable.
-                per_group: global,
-                per_user: Limits {
-                    max_running: user_running,
-                    max_queued,
-                },
-            },
+            admission,
             query_timeout: Duration::from_millis(timeout_ms),
-            auth: Auth::from_lookup(&lookup)?,
+            auth,
         })
     }
+}
+
+/// `PLIMSOLL_RESOURCE_GROUPS=interactive=4/16,batch=2/64`: per group, max
+/// running / max queued (ADR 0023).
+fn resource_groups(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<HashMap<String, Limits>, ConfigError> {
+    const VAR: &str = "PLIMSOLL_RESOURCE_GROUPS";
+    let mut groups = HashMap::new();
+    for entry in lookup(VAR).unwrap_or_default().split(',').map(str::trim) {
+        if entry.is_empty() {
+            continue;
+        }
+        let err = |reason| ConfigError {
+            var: VAR,
+            value: entry.to_owned(),
+            reason,
+        };
+        let shape = "expected `name=<running>/<queued>` entries";
+        let (name, limits) = entry.split_once('=').ok_or_else(|| err(shape))?;
+        let (running, queued) = limits.split_once('/').ok_or_else(|| err(shape))?;
+        let name = name.trim();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(err("group names are [A-Za-z0-9_-]+"));
+        }
+        let limits = Limits {
+            max_running: running.trim().parse().map_err(|_| err(shape))?,
+            max_queued: queued.trim().parse().map_err(|_| err(shape))?,
+        };
+        if limits.max_running == 0 {
+            return Err(err("max running must be greater than zero"));
+        }
+        if groups.insert(name.to_owned(), limits).is_some() {
+            return Err(err("group defined twice"));
+        }
+    }
+    Ok(groups)
 }
 
 fn parse<T: std::str::FromStr>(
@@ -120,6 +164,26 @@ mod tests {
                 .find(|(n, _)| *n == k)
                 .map(|(_, v)| (*v).to_owned())
         })
+    }
+
+    #[test]
+    fn resource_groups_are_parsed_and_validated() {
+        let c = cfg(&[("PLIMSOLL_RESOURCE_GROUPS", " batch=2/64 , interactive=4/0")]).unwrap();
+        let g = &c.admission.groups;
+        assert_eq!((g["batch"].max_running, g["batch"].max_queued), (2, 64));
+        assert_eq!(g["interactive"].max_queued, 0);
+        assert!(c.admission.has_group("default"));
+        for bad in [
+            "batch",
+            "batch=2",
+            "batch=0/1",
+            "b@d=1/1",
+            "a=1/1,a=2/2",
+            "x=one/1",
+        ] {
+            let e = cfg(&[("PLIMSOLL_RESOURCE_GROUPS", bad)]).unwrap_err();
+            assert_eq!(e.var, "PLIMSOLL_RESOURCE_GROUPS", "{bad}");
+        }
     }
 
     #[test]

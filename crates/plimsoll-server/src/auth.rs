@@ -10,12 +10,16 @@
 //!
 //! Authorization (ADR 0022): `PLIMSOLL_AUTH_OPERATORS=ana,ops` names the
 //! principals that see every query in `system.runtime.queries`; everyone
-//! else sees only their own.
+//! else sees only their own. `PLIMSOLL_AUTH_GROUPS=etl=batch,ana=interactive|batch`
+//! binds principals to the resource groups they may use, the first being
+//! their default; unlisted principals get `default` only (ADR 0023).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use ring::digest::{SHA256, digest};
+
+use plimsoll_control::governance::DEFAULT_GROUP;
 
 use crate::config::ConfigError;
 
@@ -27,6 +31,8 @@ pub enum Auth {
     Tokens {
         tokens: HashMap<[u8; 32], String>,
         operators: HashSet<String>,
+        /// Principal -> resource groups it may use (first = its default).
+        groups: HashMap<String, Vec<String>>,
     },
 }
 
@@ -34,7 +40,9 @@ impl fmt::Debug for Auth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Disabled => f.write_str("Disabled"),
-            Self::Tokens { tokens, operators } => {
+            Self::Tokens {
+                tokens, operators, ..
+            } => {
                 let mut users: Vec<&String> = tokens.values().collect();
                 users.sort();
                 users.dedup();
@@ -61,9 +69,15 @@ pub enum AuthError {
 const MODE: &str = "PLIMSOLL_AUTH";
 const TOKENS: &str = "PLIMSOLL_AUTH_TOKENS";
 const OPERATORS: &str = "PLIMSOLL_AUTH_OPERATORS";
+const GROUPS: &str = "PLIMSOLL_AUTH_GROUPS";
 
 impl Auth {
-    pub fn from_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+    /// `has_group`: whether a resource group exists (bindings are checked
+    /// against it at boot).
+    pub fn from_lookup(
+        lookup: &impl Fn(&str) -> Option<String>,
+        has_group: &dyn Fn(&str) -> bool,
+    ) -> Result<Self, ConfigError> {
         let err = |var, value: &str, reason| ConfigError {
             var,
             value: value.to_owned(),
@@ -72,8 +86,10 @@ impl Auth {
         match lookup(MODE).as_deref().map(str::trim) {
             None | Some("required") => {}
             Some("disabled") => {
-                if lookup(OPERATORS).is_some_and(|o| !o.trim().is_empty()) {
-                    return Err(err(OPERATORS, "", "operators need PLIMSOLL_AUTH=required"));
+                for var in [OPERATORS, GROUPS] {
+                    if lookup(var).is_some_and(|o| !o.trim().is_empty()) {
+                        return Err(err(var, "", "needs PLIMSOLL_AUTH=required"));
+                    }
                 }
                 return Ok(Self::Disabled);
             }
@@ -117,7 +133,48 @@ impl Auth {
             }
             operators.insert(op.to_owned());
         }
-        Ok(Self::Tokens { tokens, operators })
+        let mut groups = HashMap::new();
+        for entry in lookup(GROUPS).unwrap_or_default().split(',').map(str::trim) {
+            if entry.is_empty() {
+                continue;
+            }
+            let shape = "expected `user=group|group` entries";
+            let (user, list) = entry
+                .split_once('=')
+                .ok_or_else(|| err(GROUPS, entry, shape))?;
+            let user = user.trim();
+            if !tokens.values().any(|u| u == user) {
+                return Err(err(GROUPS, user, "not a user in PLIMSOLL_AUTH_TOKENS"));
+            }
+            let list: Vec<String> = list.split('|').map(|g| g.trim().to_owned()).collect();
+            if let Some(g) = list.iter().find(|g| !has_group(g)) {
+                return Err(err(
+                    GROUPS,
+                    g,
+                    "not a resource group (PLIMSOLL_RESOURCE_GROUPS)",
+                ));
+            }
+            if groups.insert(user.to_owned(), list).is_some() {
+                return Err(err(GROUPS, user, "user bound twice"));
+            }
+        }
+        Ok(Self::Tokens {
+            tokens,
+            operators,
+            groups,
+        })
+    }
+
+    /// Resource groups `principal` may use, its default first; `None` when
+    /// auth is disabled (any existing group).
+    pub fn groups_for(&self, principal: &str) -> Option<Vec<&str>> {
+        let Self::Tokens { groups, .. } = self else {
+            return None;
+        };
+        Some(match groups.get(principal) {
+            Some(list) => list.iter().map(String::as_str).collect(),
+            None => vec![DEFAULT_GROUP],
+        })
     }
 
     /// Whose queries `principal` may see in `system.runtime.queries`.
@@ -190,7 +247,10 @@ mod tests {
     }
 
     fn auth(vars: &[(&str, String)]) -> Result<Auth, ConfigError> {
-        Auth::from_lookup(&|k| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone()))
+        Auth::from_lookup(
+            &|k| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone()),
+            &|g| ["default", "batch", "interactive"].contains(&g),
+        )
     }
 
     #[test]
@@ -237,6 +297,24 @@ mod tests {
         assert_eq!(e.var, OPERATORS);
         let e = auth(&[(MODE, "disabled".into()), (OPERATORS, "ops".into())]).unwrap_err();
         assert_eq!(e.var, OPERATORS);
+    }
+
+    #[test]
+    fn principals_are_bound_to_resource_groups() {
+        let tokens = format!("ana:sha256:{},etl:sha256:{}", hex("t1"), hex("t2"));
+        let a = auth(&[
+            (TOKENS, tokens.clone()),
+            (GROUPS, "etl=batch, ana=interactive|batch".into()),
+        ])
+        .unwrap();
+        assert_eq!(a.groups_for("etl"), Some(vec!["batch"]));
+        assert_eq!(a.groups_for("ana"), Some(vec!["interactive", "batch"]));
+        assert_eq!(a.groups_for("bob"), Some(vec!["default"]));
+        assert_eq!(Auth::Disabled.groups_for("x"), None);
+        for bad in ["etl=nightly", "zed=batch", "etl", "etl=batch,etl=default"] {
+            let e = auth(&[(TOKENS, tokens.clone()), (GROUPS, bad.into())]).unwrap_err();
+            assert_eq!(e.var, GROUPS, "{bad}");
+        }
     }
 
     #[test]
