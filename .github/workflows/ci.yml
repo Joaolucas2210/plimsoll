@@ -1,9 +1,13 @@
 name: ci
 
+# ADR 0011: one job, one build, one cache. Docs-only changes don't run CI.
 on:
   push:
     branches: [main]
+    paths-ignore: ["**/*.md", "docs/**", "LICENSE"]
   pull_request:
+    paths-ignore: ["**/*.md", "docs/**", "LICENSE"]
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -12,22 +16,15 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # No debug info in CI: smaller artifacts, faster links, smaller cache.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
-  gates:
-    name: gates (fmt, clippy, test, arch)
+  ci:
+    name: gates + live integration
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: scripts/gates.sh
-
-  postgres-live:
-    name: postgres federation (live)
-    runs-on: ubuntu-latest
+    timeout-minutes: 25
     services:
       postgres:
         image: postgres:16
@@ -38,30 +35,11 @@ jobs:
         options: >-
           --health-cmd pg_isready --health-interval 5s
           --health-timeout 5s --health-retries 10
-    env:
-      PLIMSOLL_PG_URL: postgres://postgres:plimsoll@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p plimsoll-connectors -- --ignored
 
-  iceberg-interop:
-    name: iceberg interop (pyiceberg, REST catalog, S3)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v6
-      - run: uv run scripts/iceberg_fixture.py "$RUNNER_TEMP/wh" | grep ^PLIMSOLL_ >> "$GITHUB_ENV"
-      # The ignored tests return early without their env: make that impossible here.
-      - run: |
-          test -n "$PLIMSOLL_ICEBERG_FIXTURE" && test -n "$PLIMSOLL_ICEBERG_EVENTS"
-          cargo test -p plimsoll-connectors --test iceberg -- --ignored
-      # Reference REST catalog with an S3 warehouse (SeaweedFS): no shared
-      # filesystem, and Plimsoll reads metadata and data through s3://.
-      - name: start SeaweedFS (S3) and apache/iceberg-rest-fixture
+      # Started first so the JVM and S3 warm up while Rust compiles.
+      - name: start S3 (SeaweedFS) and Iceberg REST catalog
         run: |
           docker network create lake
           # admin writes (catalog, fixture); reader is what a vending catalog hands out.
@@ -75,25 +53,50 @@ jobs:
           docker run -d --name s3 --network lake -p 8333:8333 -v "$RUNNER_TEMP/s3:/etc/plimsoll:ro" \
             chrislusf/seaweedfs@sha256:c2658820e763294a9e9de7b36c81e59b879e3459148351aee4e31a126ca64860 \
             server -s3 -s3.config=/etc/plimsoll/s3.json -dir=/data
-          for i in $(seq 1 60); do
-            echo "s3.bucket.create -name warehouse" | docker exec -i s3 weed shell 2>&1 | grep -q "created bucket" && break
-            sleep 2
-          done
           docker run -d --name rest --network lake -p 8181:8181 \
             -e AWS_ACCESS_KEY_ID=admin -e AWS_SECRET_ACCESS_KEY=password -e AWS_REGION=us-east-1 \
             -e CATALOG_WAREHOUSE=s3://warehouse/ -e CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO \
             -e CATALOG_S3_ENDPOINT=http://s3:8333 -e CATALOG_S3_PATH__STYLE__ACCESS=true \
             apache/iceberg-rest-fixture
-          for i in $(seq 1 60); do curl -sf localhost:8181/v1/config && exit 0; sleep 2; done
-          docker logs rest; exit 1
-      - run: >-
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: plimsoll
+          # PRs restore main's cache but never write their own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # Builds every test binary once; the live tests below reuse them
+      # (always `--workspace`, so feature resolution and artifacts match).
+      - run: scripts/gates.sh
+
+      - name: wait for S3 bucket and REST catalog
+        run: |
+          for i in $(seq 1 60); do
+            echo "s3.bucket.create -name warehouse" | docker exec -i s3 weed shell 2>&1 | grep -q "created bucket" && break
+            sleep 2
+          done
+          for i in $(seq 1 60); do curl -sf -o /dev/null localhost:8181/v1/config && exit 0; sleep 2; done
+          exit 1
+      - name: write fixtures with pyiceberg through the REST catalog
+        run: >-
           uv run scripts/iceberg_fixture.py http://localhost:8181
           s3.endpoint=http://localhost:8333 s3.access-key-id=admin
           s3.secret-access-key=password s3.region=us-east-1 | grep ^PLIMSOLL_ >> "$GITHUB_ENV"
-      - run: |
-          cargo test -p plimsoll-control live_rest_catalog -- --ignored
-          cargo test -p plimsoll-connectors --test iceberg -- --ignored
+
+      # Ignored tests return early without their env: fail here instead.
+      - name: live tests (Postgres, REST catalog, Iceberg on S3, pruning)
+        run: |
+          test -n "$PLIMSOLL_ICEBERG_FIXTURE" && test -n "$PLIMSOLL_ICEBERG_EVENTS"
+          cargo test --workspace -- --ignored \
+            pg_live_roundtrip live_rest_catalog reads_a_pyiceberg_table prunes_a_partitioned_pyiceberg_table
         env:
+          PLIMSOLL_PG_URL: postgres://postgres:plimsoll@localhost:5432/postgres
           PLIMSOLL_CATALOG_URI: http://localhost:8181
           AWS_ENDPOINT: http://localhost:8333
           AWS_ALLOW_HTTP: "true"
@@ -101,7 +104,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: password
           AWS_REGION: us-east-1
       - name: catalog-vended credentials (env keys are wrong on purpose)
-        run: cargo test -p plimsoll-server reads_with_catalog_vended -- --ignored
+        run: cargo test --workspace -- --ignored reads_with_catalog_vended_credentials
         env:
           PLIMSOLL_CATALOG_URI: http://localhost:8181
           PLIMSOLL_TEST_VENDED: reader:readersecret
@@ -110,3 +113,7 @@ jobs:
           AWS_ACCESS_KEY_ID: wrong
           AWS_SECRET_ACCESS_KEY: wrong
           AWS_REGION: us-east-1
+
+      - name: container logs
+        if: failure()
+        run: docker logs rest 2>&1 | tail -100; docker logs s3 2>&1 | tail -50
