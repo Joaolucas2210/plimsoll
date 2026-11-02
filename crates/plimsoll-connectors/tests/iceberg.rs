@@ -330,6 +330,56 @@ async fn iceberg_scans_are_pinned_to_their_snapshot() {
     assert!(key.ends_with("t@1"), "{key:?}");
 }
 
+/// `count(*)` from manifest record counts (ADR 0054): no data file is
+/// read when no delete applies; with deletes or filters the scan stays.
+#[tokio::test]
+async fn count_star_is_answered_from_metadata_only_when_exact() {
+    let plan_of = async |ctx: &SessionContext, sql: &str| {
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string()
+    };
+    let dir = tmp("count-meta");
+    table(&dir, Deletes::None, false);
+    let ctx = SessionContext::new();
+    register(&ctx, &dir).await.unwrap();
+    let plan = plan_of(&ctx, "SELECT count(*) FROM t").await;
+    assert!(
+        !plan.contains("IcebergScan"),
+        "answered from metadata:\n{plan}"
+    );
+    assert_eq!(ids(&ctx, "SELECT count(*) FROM t").await.unwrap(), [3]);
+    // A filter (pushed into Parquet) keeps the scan.
+    let plan = plan_of(&ctx, "SELECT count(*) FROM t WHERE id > 1").await;
+    assert!(plan.contains("IcebergScan"), "{plan}");
+    assert_eq!(
+        ids(&ctx, "SELECT count(*) FROM t WHERE id > 1")
+            .await
+            .unwrap(),
+        [2]
+    );
+
+    for (deletes, rows) in [(Deletes::Position { seq: 3 }, 2), (Deletes::Equality, 5)] {
+        let dir = tmp("count-deletes");
+        table(&dir, deletes, false);
+        let ctx = SessionContext::new();
+        register(&ctx, &dir).await.unwrap();
+        let plan = plan_of(&ctx, "SELECT count(*) FROM t").await;
+        assert!(
+            plan.contains("IcebergScan"),
+            "deletes need the scan:\n{plan}"
+        );
+        assert_eq!(ids(&ctx, "SELECT count(*) FROM t").await.unwrap(), [rows]);
+    }
+}
+
 #[tokio::test]
 async fn position_deletes_are_applied_as_row_selections() {
     let dir = tmp("pos-deletes");
@@ -1174,6 +1224,19 @@ async fn reads_nested_spark_types() {
         .unwrap()
         .to_string();
     assert!(text.contains("{a: 1, b: x, c: }"), "{text}");
+    // No deletes in this table: count(*) comes from manifests (ADR 0054).
+    let plan = ctx
+        .sql("SELECT count(*) FROM n")
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let text = datafusion::physical_plan::displayable(plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(!text.contains("IcebergScan"), "{text}");
+    assert_eq!(ids(&ctx, "SELECT count(*) FROM n").await.unwrap(), [3]);
     assert_eq!(pool.used(), 0);
 }
 

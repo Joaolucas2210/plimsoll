@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] `count(*)` from manifest record counts when exact (no deletes, filters or limit) (ADR 0054)
 - [x] Decimal pruning: unscaled `i128` bounds, exact literal rescaling, decimal bucket/truncate partitions (ADR 0053)
 - [x] `LIKE 'prefix%'` / `starts_with` prune as string ranges (ADR 0052)
 - [x] Bucket and truncate partition pruning, per file on partition tuples (Iceberg Murmur3, spec vectors) (ADR 0051)
@@ -86,11 +87,11 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Statistics-only answers**: `count(*)`, `min(col)` and `max(col)` over an
-Iceberg table without deletes can be answered from manifest metadata
-(record counts, column bounds) without reading data files, when no filter
-or only partition filters apply. Dashboards' "total rows" tiles become
-metadata reads.
+**Exact partition filters**: identity-partition predicates (`region =
+'eu'` on `PARTITIONED BY (region)`) are fully decided by manifest pruning,
+yet DataFusion re-applies them as a `FilterExec`. Report them as `Exact`
+pushdown so the filter is dropped, and `count(*) WHERE region = 'eu'`
+also answers from metadata.
 
 ## Later
 

@@ -8,10 +8,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{Result, internal_err};
+use datafusion::common::{Result, Statistics, internal_err};
 use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::statistics::StatisticsArgs;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
@@ -21,6 +22,7 @@ pub struct AccountedExec {
     label: String,
     input: Arc<dyn ExecutionPlan>,
     pinned: Option<String>,
+    statistics: Option<Arc<Statistics>>,
 }
 
 impl AccountedExec {
@@ -30,7 +32,15 @@ impl AccountedExec {
             label: label.into(),
             input,
             pinned: None,
+            statistics: None,
         }
+    }
+
+    /// Statistics the source knows from metadata (e.g. an exact row count
+    /// from Iceberg manifests, ADR 0054); reported for the whole plan.
+    pub fn with_statistics(mut self, statistics: Statistics) -> Self {
+        self.statistics = Some(Arc::new(statistics));
+        self
     }
 
     /// Declares that this source reads immutable data identified by `id`
@@ -85,8 +95,25 @@ impl ExecutionPlan for AccountedExec {
                 label: self.label.clone(),
                 input,
                 pinned: self.pinned.clone(),
+                statistics: self.statistics.clone(),
             })),
             _ => internal_err!("AccountedExec takes exactly one child"),
+        }
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        // Accounting never changes rows: the child's statistics pass
+        // through, unless the source stated better ones for the whole plan.
+        match (&self.statistics, args.partition()) {
+            (Some(s), None) => Ok(s.clone()),
+            _ => Ok(input_stats
+                .first()
+                .cloned()
+                .unwrap_or_else(|| Arc::new(Statistics::new_unknown(&self.schema())))),
         }
     }
 

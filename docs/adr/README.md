@@ -61,6 +61,7 @@ are allowed in place.
 | [0051](0051-bucket-truncate-pruning.md) | Bucket and truncate partition pruning | Accepted | 2026-11-02 | `bucket[N]` maps `=`/`IN` through Iceberg's Murmur3 (spec vectors); `truncate[W]` maps `=` and widened ranges; checked per file on its partition tuple (manifests span all buckets) as well as on manifest summaries | 0010, 0050 |
 | [0052](0052-like-prefix-pruning.md) | `LIKE` prefix pruning | Accepted | 2026-11-02 | `LIKE 'p%'` (case-sensitive, not negated) and `starts_with(col, 'p')` become `col >= p AND col < next(p)` with bytewise `next`; the prefix stops at the first wildcard or escape | 0050, 0051 |
 | [0053](0053-decimal-pruning.md) | Decimal pruning | Accepted | 2026-11-02 | `decimal(p, s)` bounds decode as unscaled `i128` (big-endian two's complement); literals rescale to the column scale only when exact; bucket hashes the minimal unscaled bytes (spec vector), truncate works on the unscaled value | 0010, 0051 |
+| [0054](0054-count-from-metadata.md) | `count(*)` from metadata | Accepted | 2026-11-02 | The Iceberg scan reports an exact row count (sum of `record_count`) when no delete applies and no filter or limit is pushed into it, so DataFusion's aggregate-statistics rule answers `count(*)` without reading data files; `min`/`max` are not (spec bounds may be loose) | 0003, 0007, 0014, 0016, 0017 |
 
 ## Reading order
 

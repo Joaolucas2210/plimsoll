@@ -19,8 +19,9 @@ use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::DFSchema;
 use datafusion::common::config::TableParquetOptions;
+use datafusion::common::stats::Precision;
+use datafusion::common::{DFSchema, Statistics};
 use datafusion::common::{JoinType, NullEquality};
 use datafusion::datasource::listing::{ListingTableUrl, PartitionedFile};
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -816,7 +817,20 @@ impl TableProvider for IcebergTable {
             }
             plans.push(plan);
         }
-        Ok(Arc::new(AccountedExec::new(
+        // Exact row count from the manifests (ADR 0054), when it is exact:
+        // no deletes apply, every file states its record_count, and nothing
+        // (filter pushed into Parquet, limit) can drop rows inside the scan.
+        // DataFusion then answers `count(*)` without reading data files.
+        let exact_rows = (filters.is_empty() && limit.is_none() && sets.is_empty())
+            .then(|| {
+                files
+                    .iter()
+                    .map(|f| f.rows.filter(|_| f.selection.is_none()))
+                    .sum::<Option<u64>>()
+            })
+            .flatten()
+            .and_then(|n| usize::try_from(n).ok());
+        let scan = AccountedExec::new(
             format!(
                 "IcebergScan[{}] snapshot={} manifests={}/{} files={}/{} deletes={} deleted_rows={} equality_deletes={} delete_cache_hits={} manifest_cache_hits={}",
                 self.name,
@@ -834,13 +848,23 @@ impl TableProvider for IcebergTable {
             ),
             UnionExec::try_new(plans)?,
         )
-        // A snapshot never changes: same table + snapshot, same rows. The
-        // result cache keys on this (ADR 0038).
-        .with_pinned(format!(
+.with_pinned(format!(
             "{}@{}",
             self.name,
             self.snapshot_id.map_or("none".to_owned(), |id| id.to_string())
-        ))))
+        ));
+        Ok(Arc::new(match exact_rows {
+            Some(rows) => {
+                let schema = match projection {
+                    Some(p) => Arc::new(self.schema.project(p)?),
+                    None => self.schema.clone(),
+                };
+                let mut statistics = Statistics::new_unknown(&schema);
+                statistics.num_rows = Precision::Exact(rows);
+                scan.with_statistics(statistics)
+            }
+            None => scan,
+        }))
     }
 }
 
