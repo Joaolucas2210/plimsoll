@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] `LIKE 'prefix%'` / `starts_with` prune as string ranges (ADR 0052)
 - [x] Bucket and truncate partition pruning, per file on partition tuples (Iceberg Murmur3, spec vectors) (ADR 0051)
 - [x] Pruner as a predicate tree: OR, IN lists, exact NOT, at file and manifest level (ADR 0050)
 - [x] Null-count pruning: all-NULL columns match no comparison; `IS NULL` / `IS NOT NULL` prune on counts (ADR 0049)
@@ -84,9 +85,10 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**`LIKE 'prefix%'` pruning**: a string prefix is a range
-(`>= 'prefix'` and `< 'prefiy'`), so `code LIKE 'b%'` can prune on column
-bounds and identity/truncate partitions like the range it is.
+**Decimal pruning**: `decimal(p, s)` columns (money, quantities) are not
+prunable today. Iceberg stores their bounds as big-endian two's-complement
+unscaled values; compare them as `i128` at the column's scale, with
+literals rescaled exactly (or not at all).
 
 ## Later
 

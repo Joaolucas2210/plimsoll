@@ -1290,6 +1290,15 @@ async fn prunes_spark_bucket_and_truncate_partitions() {
         .unwrap(),
         [13]
     );
+    // LIKE 'b%' is that same range (ADR 0052): same files, same answer.
+    let (like_files, _) = scanned("SELECT id FROM b WHERE code LIKE 'b%'").await;
+    assert_eq!(like_files, b_files);
+    let n = ids(
+        &ctx,
+        "SELECT CAST(count(*) AS BIGINT) FROM b WHERE code LIKE 'b%'",
+    )
+    .await;
+    assert_eq!(n.unwrap(), [13]);
 }
 
 /// Format v3 table written by Spark with merge-on-read deletes, i.e. deletion

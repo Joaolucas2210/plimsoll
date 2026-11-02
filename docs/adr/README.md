@@ -59,6 +59,7 @@ are allowed in place.
 | [0049](0049-null-count-pruning.md) | Null-count pruning | Accepted | 2026-11-02 | Files whose `null_value_counts` equal `value_counts` for a column match no comparison and no `IS NOT NULL`; `null_value_counts` = 0 prunes `IS NULL`; unknown counts never prune | 0010, 0048 |
 | [0050](0050-pruning-predicate-tree.md) | Pruner as a predicate tree | Accepted | 2026-11-02 | Filters become And/Or/Cmp/Null nodes; unknown sub-expressions are `True` (may match), which makes an OR unknown; `IN` = OR of equalities; `NOT` pushed only into `<, <=, >, >=` and null checks; same tree at file and manifest level | 0010, 0048, 0049 |
 | [0051](0051-bucket-truncate-pruning.md) | Bucket and truncate partition pruning | Accepted | 2026-11-02 | `bucket[N]` maps `=`/`IN` through Iceberg's Murmur3 (spec vectors); `truncate[W]` maps `=` and widened ranges; checked per file on its partition tuple (manifests span all buckets) as well as on manifest summaries | 0010, 0050 |
+| [0052](0052-like-prefix-pruning.md) | `LIKE` prefix pruning | Accepted | 2026-11-02 | `LIKE 'p%'` (case-sensitive, not negated) and `starts_with(col, 'p')` become `col >= p AND col < next(p)` with bytewise `next`; the prefix stops at the first wildcard or escape | 0050, 0051 |
 
 ## Reading order
 

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Datelike};
 use datafusion::common::ScalarValue;
-use datafusion::logical_expr::expr::InList;
+use datafusion::logical_expr::expr::{InList, Like};
 use datafusion::logical_expr::{Between, BinaryExpr, Expr, Operator};
 
 /// Iceberg primitive types we can compare bounds for.
@@ -525,6 +525,33 @@ fn node(e: &Expr, columns: &HashMap<String, (i64, Prim)>) -> Node {
                 })
                 .collect(),
         ),
+        // `col LIKE 'abc%'` (ADR 0052): every match starts with the literal
+        // prefix, so it lies in ['abc', 'abd').
+        Expr::Like(Like {
+            negated: false,
+            expr,
+            pattern,
+            case_insensitive: false,
+            ..
+        }) => match pattern.as_ref() {
+            Expr::Literal(ScalarValue::Utf8(Some(p)) | ScalarValue::Utf8View(Some(p)), _) => {
+                // Stop at the first wildcard or escape: a shorter prefix is
+                // still a sound range.
+                let prefix: String = p
+                    .chars()
+                    .take_while(|c| !matches!(c, '%' | '_' | '\\'))
+                    .collect();
+                prefix_range(expr, &prefix, columns)
+            }
+            _ => Node::True,
+        },
+        Expr::ScalarFunction(f) if f.func.name() == "starts_with" => match f.args.as_slice() {
+            [
+                expr,
+                Expr::Literal(ScalarValue::Utf8(Some(p)) | ScalarValue::Utf8View(Some(p)), _),
+            ] => prefix_range(expr, p, columns),
+            _ => Node::True,
+        },
         Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
             match path(inner).and_then(|p| columns.get(&p)) {
                 Some(&(id, _)) => Node::Null(id, matches!(e, Expr::IsNull(_))),
@@ -554,6 +581,38 @@ fn node(e: &Expr, columns: &HashMap<String, (i64, Prim)>) -> Node {
         },
         _ => Node::True,
     }
+}
+
+/// `e` starts with `prefix`: `e >= prefix AND e < next(prefix)`, where
+/// `next` increments the last byte that can be (bytewise order, as Iceberg
+/// and Arrow compare strings). An empty prefix says nothing.
+fn prefix_range(e: &Expr, prefix: &str, columns: &HashMap<String, (i64, Prim)>) -> Node {
+    let Some(&(field_id, Prim::String)) = path(e).and_then(|p| columns.get(&p)) else {
+        return Node::True;
+    };
+    if prefix.is_empty() {
+        return Node::True;
+    }
+    let pred = |op, bytes: Vec<u8>| {
+        Node::Cmp(Pred {
+            field_id,
+            prim: Prim::String,
+            op,
+            value: Datum::Bytes(bytes),
+        })
+    };
+    let mut upper = prefix.as_bytes().to_vec();
+    while let Some(last) = upper.pop() {
+        if last < 0xff {
+            upper.push(last + 1);
+            break;
+        }
+    }
+    let lower = pred(Op::GtEq, prefix.as_bytes().to_vec());
+    if upper.is_empty() {
+        return lower;
+    }
+    Node::and(vec![lower, pred(Op::Lt, upper)])
 }
 
 fn cmp_op(op: Operator) -> Option<Op> {
@@ -843,5 +902,26 @@ mod tests {
         assert!(!keep(col("score").gt_eq(lit(30i64)), &f));
         assert!(keep(col("score").lt(lit(21i64)), &f));
         assert!(!keep(col("score").lt(lit(20i64)), &f)); // 20 starts the bucket
+    }
+
+    #[test]
+    fn like_prefixes_prune_as_ranges() {
+        // File holds city in ["b", "d"].
+        let lo = bounds(&[(2, b"b".to_vec())]);
+        let hi = bounds(&[(2, b"d".to_vec())]);
+        let keep =
+            |e: Expr| Pruner::new(&[e], &columns()).may_match_file(&lo, &hi, &Counts::default());
+        assert!(!keep(col("city").like(lit("e%"))));
+        assert!(!keep(col("city").like(lit("a%"))));
+        assert!(keep(col("city").like(lit("c%"))));
+        assert!(keep(col("city").like(lit("d%")))); // "d" itself matches
+        assert!(!keep(col("city").like(lit("da_%")))); // "da..." > "d"
+        assert!(keep(col("city").like(lit("%x")))); // no prefix: unknown
+        assert!(keep(col("city").not_like(lit("e%"))));
+        assert!(keep(col("city").ilike(lit("E%")))); // case-insensitive: unknown
+        assert!(!keep(datafusion::functions::string::expr_fn::starts_with(
+            col("city"),
+            lit("x")
+        )));
     }
 }
