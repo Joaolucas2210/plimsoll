@@ -504,6 +504,66 @@ async fn columns_resolve_by_field_id_across_renames() {
     assert!(text.contains("| 1  | lisbon |      |"), "{text}");
 }
 
+/// Nested Iceberg types map to Arrow nested types (ADR 0041); a history
+/// that renamed a nested child is refused (children resolve by name).
+#[tokio::test]
+async fn nested_types_map_and_nested_renames_are_refused() {
+    let nested = |b: &str| {
+        json!([
+            {"id": 1, "name": "id", "required": true, "type": "long"},
+            {"id": 2, "name": "s", "required": false, "type": {"type": "struct", "fields": [
+                {"id": 3, "name": "a", "required": false, "type": "int"},
+                {"id": 4, "name": b, "required": false, "type": "string"}]}},
+            {"id": 5, "name": "tags", "required": false, "type":
+                {"type": "list", "element-id": 6, "element-required": true, "element": "long"}},
+            {"id": 7, "name": "attrs", "required": false, "type":
+                {"type": "map", "key-id": 8, "key": "string", "value-id": 9,
+                 "value-required": false, "value": "int"}}])
+    };
+    let meta = |schemas: serde_json::Value| {
+        json!({"format-version": 2, "current-schema-id": 0, "current-snapshot-id": -1,
+               "schemas": schemas})
+    };
+    let ok = IcebergConnector::from_metadata(
+        "n",
+        "mem://n",
+        &meta(json!([{"schema-id": 0, "type": "struct", "fields": nested("b")}])),
+    )
+    .unwrap();
+    let schema = ok.source().schema();
+    assert_eq!(
+        schema.field_with_name("s").unwrap().data_type(),
+        &DataType::Struct(
+            vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new("b", DataType::Utf8, true),
+            ]
+            .into()
+        )
+    );
+    assert!(matches!(
+        schema.field_with_name("tags").unwrap().data_type(),
+        DataType::List(f) if !f.is_nullable() && f.data_type() == &DataType::Int64
+    ));
+    assert!(matches!(
+        schema.field_with_name("attrs").unwrap().data_type(),
+        DataType::Map(..)
+    ));
+
+    let err = IcebergConnector::from_metadata(
+        "n",
+        "mem://n",
+        &meta(json!([
+            {"schema-id": 0, "type": "struct", "fields": nested("bb")},
+            {"schema-id": 1, "type": "struct", "fields": nested("b")}])),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("nested field \"b\" was renamed"),
+        "{err}"
+    );
+}
+
 #[tokio::test]
 async fn empty_table_has_no_rows() {
     let dir = tmp("empty");
@@ -880,6 +940,70 @@ async fn reads_an_evolved_spark_table() {
             .unwrap(),
         [1, 4]
     );
+    assert_eq!(pool.used(), 0);
+}
+
+/// Nested types written by Spark (ADR 0041): struct, list and map, with a
+/// struct field `s.c` added after the first insert. Spark reads
+/// (1, 1, NULL, 2, 1), (2, NULL, NULL, 0, NULL), (3, 3, new, 1, 3).
+#[tokio::test]
+#[ignore = "needs PLIMSOLL_ICEBERG_NESTED from scripts/spark_mor_fixture.sh"]
+async fn reads_nested_spark_types() {
+    let Ok(location) = std::env::var("PLIMSOLL_ICEBERG_NESTED") else {
+        return;
+    };
+    let pool = Arc::new(CeilingPool::new(256 << 20, 0).unwrap());
+    let ctx = session_context_with_ceiling(pool.clone(), None, SessionConfig::new()).unwrap();
+    IcebergConnector::try_new("n", &location, &ctx.state())
+        .await
+        .unwrap()
+        .register(&ctx)
+        .unwrap();
+    let out = ctx
+        .sql(
+            "SELECT id, s['a'] AS a, s['c'] AS c, cardinality(tags) AS n, attrs['k'] AS k \
+             FROM n ORDER BY id",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let text = datafusion::arrow::util::pretty::pretty_format_batches(&out)
+        .unwrap()
+        .to_string();
+    let rows: Vec<Vec<&str>> = text
+        .lines()
+        .filter(|l| l.starts_with("| ") && !l.contains(" id "))
+        .map(|l| l.split('|').map(str::trim).skip(1).take(5).collect())
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ["1", "1", "", "2", "1"],
+            ["2", "", "", "0", ""],
+            ["3", "3", "new", "1", "3"],
+        ],
+        "{text}"
+    );
+    // Filters on nested fields, and the whole struct with its new field.
+    assert_eq!(
+        ids(&ctx, "SELECT id FROM n WHERE s['b'] = 'z'")
+            .await
+            .unwrap(),
+        [3]
+    );
+    let all = ctx
+        .sql("SELECT s FROM n ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let text = datafusion::arrow::util::pretty::pretty_format_batches(&all)
+        .unwrap()
+        .to_string();
+    assert!(text.contains("{a: 1, b: x, c: }"), "{text}");
     assert_eq!(pool.used(), 0);
 }
 

@@ -26,7 +26,7 @@ use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_expr::expressions::{Column, Literal, cast};
+use datafusion::physical_expr::expressions::{CastExpr, Column, Literal};
 use datafusion::physical_expr_adapter::{
     DefaultPhysicalExprAdapterFactory, PhysicalExprAdapter, PhysicalExprAdapterFactory,
 };
@@ -153,11 +153,17 @@ impl PhysicalExprAdapter for ById {
             let file_field = self.physical.field(i);
             let read: Arc<dyn PhysicalExpr> = Arc::new(Column::new(file_field.name(), i));
             Ok(Transformed::yes(
-                if file_field.data_type() == field.data_type() {
+                if file_field.data_type().equals_datatype(field.data_type()) {
                     read
                 } else {
-                    // Type promotion (int -> long, float -> double, ...).
-                    cast(read, &self.physical, field.data_type().clone())?
+                    // Type promotion (int -> long, float -> double), or a
+                    // struct that gained fields since the file was written
+                    // (filled with NULLs): DataFusion's struct-aware cast.
+                    Arc::new(CastExpr::new_with_target_field(
+                        read,
+                        Arc::new(field.clone()),
+                        None,
+                    ))
                 },
             ))
         })

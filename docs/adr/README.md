@@ -48,12 +48,13 @@ are allowed in place.
 | [0038](0038-result-cache.md) | Result cache over pinned snapshots | Accepted | 2026-11-02 | Opt-in (`PLIMSOLL_RESULT_CACHE_BYTES`); cacheable only when every physical source is pinned (`AccountedExec::with_pinned`, Iceberg `table@snapshot`) or constant and the logical plan has no non-immutable function or scalar subquery; key = SQL + pinned ids; looked up after grants; entries reserved in the pool, LRU, ¼ cap per entry | 0003, 0018, 0025, 0028, 0035 |
 | [0039](0039-manifest-cache.md) | Manifest cache | Accepted | 2026-11-02 | Manifest lists and manifests are immutable: their bytes are cached by path in DataFusion's file metadata cache (the cache reserve, ADR 0018), like delete files; `manifest_cache_hits=` in EXPLAIN | 0018, 0020, 0038 |
 | [0040](0040-schema-evolution-by-field-id.md) | Schema evolution by field id | Accepted | 2026-11-02 | The Parquet scan's expression adapter resolves columns by Iceberg field id (`PARQUET:field_id`): renamed columns read, promoted types cast, re-added columns are NULL in older files; equality-delete keys by id; files without ids in renamed tables are refused | 0005, 0007, 0016 |
+| [0041](0041-nested-types.md) | Nested types | Accepted | 2026-11-02 | Iceberg `struct` / `list` / `map` map recursively to Arrow; the scan adapter compares nested types ignoring names and uses DataFusion's struct-aware cast (fields added later are NULL); histories that renamed, moved or re-added a nested child are refused | 0005, 0007, 0040 |
 
 ## Reading order
 
 - Invariant first: 0003 (memory, with 0012, 0018 and 0036), 0005 (correctness).
 - Shape of the system: 0001, 0002, 0004.
-- Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040.
+- Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041.
 - Federation: 0005 → 0006.
 - Observability: 0013 → 0019 → 0027 → 0031.
 

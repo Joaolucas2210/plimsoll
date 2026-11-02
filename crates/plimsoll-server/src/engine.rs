@@ -628,4 +628,20 @@ mod tests {
         assert_eq!(reader.schema().fields().len(), 1);
         assert_eq!(reader.count(), 0);
     }
+
+    /// Nested values (ADR 0041) come out as JSON objects and arrays, in
+    /// both the document and the streamed formats.
+    #[tokio::test]
+    async fn nested_values_serialize_as_json() {
+        let pool = Arc::new(CeilingPool::new(16 << 20, 1 << 20).unwrap());
+        let e = CoreEngine(Arc::new(Engine::new(pool, None).unwrap()));
+        let sql = "SELECT named_struct('a', 1, 'b', 'x') AS s, make_array(1, 2) AS l, \
+                   map(['k'], [7]) AS m";
+        let out = e.execute(sql, Viewer::default()).await.unwrap();
+        let rows: Value = serde_json::from_slice(&out.rows_json).unwrap();
+        assert_eq!(
+            rows,
+            serde_json::json!([[{"a": 1, "b": "x"}, [1, 2], {"k": 7}]])
+        );
+    }
 }

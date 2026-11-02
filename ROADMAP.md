@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Nested types: struct, list, map; struct fields added later read as NULL; nested renames refused; validated on Spark (ADR 0041)
 - [x] Schema evolution by field id: renames, type promotion and re-added columns, equality-delete keys by id, validated on a Spark-evolved table (ADR 0040)
 - [x] Manifest cache: manifest lists and manifests cached by path in the cache reserve; replanning a snapshot reads nothing (ADR 0039)
 - [x] Result cache: SQL + pinned Iceberg snapshots as key, deterministic plans only, reserved in the pool, opt-in (ADR 0038)
@@ -73,9 +74,10 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Nested types**: Iceberg `struct`, `list` and `map` columns are refused
-today (`arrow_schema`). Map them to Arrow nested types with field ids on
-every child, so tables with nested columns read instead of failing.
+**Iceberg name mapping** (`schema.name-mapping.default`): files imported
+without Parquet field ids (`add_files`, migrations from Hive tables) are
+refused in renamed tables today (ADR 0040). Resolve them through the
+table's name mapping so imported data reads correctly.
 
 ## Later
 

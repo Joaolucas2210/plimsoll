@@ -48,5 +48,5 @@ jobs:
           cat "$RUNNER_TEMP/mor.err" >&2 || true
           cat "$RUNNER_TEMP/mor.env" >> "$GITHUB_ENV"
       - run: |
-          test -n "$PLIMSOLL_ICEBERG_MOR" && test -n "$PLIMSOLL_ICEBERG_EQ" && test -n "$PLIMSOLL_ICEBERG_DV" && test -n "$PLIMSOLL_ICEBERG_EVOLVED"
-          cargo test --workspace -- --ignored reads_a_spark_merge_on_read_table reads_reference_equality_deletes reads_reference_deletion_vectors time_travels_a_spark_table reads_an_evolved_spark_table
+          test -n "$PLIMSOLL_ICEBERG_MOR" && test -n "$PLIMSOLL_ICEBERG_EQ" && test -n "$PLIMSOLL_ICEBERG_DV" && test -n "$PLIMSOLL_ICEBERG_EVOLVED" && test -n "$PLIMSOLL_ICEBERG_NESTED"
+          cargo test --workspace -- --ignored reads_a_spark_merge_on_read_table reads_reference_equality_deletes reads_reference_deletion_vectors time_travels_a_spark_table reads_an_evolved_spark_table reads_nested_spark_types

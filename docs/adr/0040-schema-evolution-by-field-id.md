@@ -105,8 +105,8 @@ then be unusable on any table with ordinary maintenance. Rejected.
   query output schemas carry `PARQUET:field_id` metadata on table
   columns. JSON responses do not show it; Arrow IPC results (ADR 0037)
   carry it as field metadata, which is harmless.
-- **Nested types are still refused** (`arrow_schema`), so ids on nested
-  children are a later concern (next ROADMAP item).
+- **Nested children resolve by name.** ADR 0041 adds nested types but
+  refuses histories that renamed a nested child.
 
 ## Risks and mitigations
 

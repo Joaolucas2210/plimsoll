@@ -3,11 +3,11 @@
 # writers (the reference implementation) for tests/iceberg.rs:
 # position deletes (reads_a_spark_merge_on_read_table) and equality deletes
 # (reads_reference_equality_deletes), v3 deletion vectors
-# (reads_reference_deletion_vectors), and schema evolution
-# (reads_an_evolved_spark_table).
+# (reads_reference_deletion_vectors), schema evolution
+# (reads_an_evolved_spark_table) and nested types (reads_nested_spark_types).
 #
 #   scripts/spark_mor_fixture.sh <warehouse-dir>
-#   # prints PLIMSOLL_ICEBERG_{MOR,EQ,EVOLVED,DV}=...
+#   # prints PLIMSOLL_ICEBERG_{MOR,EQ,EVOLVED,NESTED,DV}=...
 #
 # The warehouse is mounted at the same absolute path inside the container, so
 # the paths Spark records in the metadata are valid on the host.
@@ -123,6 +123,24 @@ try {
   require(evolved == "[1,lisbon,10,null];[3,braga,3000000000,new];[4,faro,40,null]",
     s"Spark reads $evolved")
 
+  // Nested types (ADR 0041): struct, list and map, and a struct field added
+  // after the first files were written (NULL in them).
+  Seq(
+    """CREATE TABLE local.db.nested (id BIGINT, s STRUCT<a: INT, b: STRING>,
+       tags ARRAY<BIGINT>, attrs MAP<STRING, INT>) USING iceberg
+       TBLPROPERTIES ('format-version'='2')""",
+    """INSERT INTO local.db.nested VALUES
+       (1, named_struct('a', 1, 'b', 'x'), array(10, 20), map('k', 1)),
+       (2, NULL, array(), map())""",
+    "ALTER TABLE local.db.nested ADD COLUMN s.c STRING",
+    """INSERT INTO local.db.nested VALUES
+       (3, named_struct('a', 3, 'b', 'z', 'c', 'new'), array(30), map('k', 3, 'j', 4))"""
+  ).foreach(spark.sql)
+  val nested = spark.sql(
+    "SELECT id, s.a, s.c, size(tags), attrs['k'] FROM local.db.nested ORDER BY id")
+    .collect().map(_.toString).mkString(";")
+  require(nested == "[1,1,null,2,1];[2,null,null,0,null];[3,3,new,1,3]", s"Spark reads $nested")
+
   // The fixture is only useful if the reference engine agrees with it.
   val ids = spark.sql("SELECT id FROM local.db.eq ORDER BY id").collect().map(_.getLong(0)).toSeq
   require(ids == Seq(2L, 4L, 5L, 6L), s"Spark reads $ids")
@@ -143,4 +161,5 @@ rm -f "$scala"
 echo "PLIMSOLL_ICEBERG_MOR=$wh/db/mor"
 echo "PLIMSOLL_ICEBERG_EQ=$wh/db/eq"
 echo "PLIMSOLL_ICEBERG_EVOLVED=$wh/db/evolved"
+echo "PLIMSOLL_ICEBERG_NESTED=$wh/db/nested"
 echo "PLIMSOLL_ICEBERG_DV=$wh/db/dv"

@@ -293,6 +293,38 @@ impl IcebergTable {
             None => schemas.first().copied().ok_or_else(|| err("no schema"))?,
         };
         let renamed = renamed_columns(path, &schemas)?;
+        // Nested children resolve by name inside their parent (only
+        // top-level columns resolve by id, ADR 0040): refuse histories
+        // where that would read the wrong child (ADR 0041).
+        let mut nested = Vec::new();
+        for s in &schemas {
+            for f in s["fields"].as_array().into_iter().flatten() {
+                nested_fields(&f["type"], f["id"].as_i64().unwrap_or(-1), &mut nested);
+            }
+        }
+        let mut by_id: HashMap<i64, (i64, &str)> = HashMap::new();
+        let mut by_name: HashMap<(i64, &str), i64> = HashMap::new();
+        for (parent, f) in &nested {
+            let (Some(id), Some(name)) = (f["id"].as_i64(), f["name"].as_str()) else {
+                return Err(err("nested field without id/name"));
+            };
+            let moved = by_id
+                .insert(id, (*parent, name))
+                .is_some_and(|p| p != (*parent, name));
+            let reused = by_name.insert((*parent, name), id).is_some_and(|i| i != id);
+            if moved || reused {
+                return Err(unsupported(
+                    path,
+                    format!("nested field {name:?} was renamed, moved or re-added"),
+                ));
+            }
+            if !f["initial-default"].is_null() {
+                return Err(unsupported(
+                    path,
+                    format!("nested field default values ({name:?})"),
+                ));
+            }
+        }
         // v3 defaults: files written before a column was added must read its
         // `initial-default`; the Parquet scan would return NULL instead.
         if let Some(f) = current["fields"]
@@ -1013,16 +1045,83 @@ fn arrow_schema(path: &str, schema: &Json) -> Result<Schema, ConnectorError> {
         .ok_or_else(|| invalid(path, "schema without fields"))?;
     fields
         .iter()
-        .map(|f| {
-            let name = f["name"].as_str().unwrap_or_default();
-            let ty = f["type"]
-                .as_str()
-                .ok_or_else(|| unsupported(path, format!("nested type for column {name:?}")))?;
-            let required = f["required"].as_bool().unwrap_or(false);
-            Ok(Field::new(name, arrow_type(path, ty)?, !required))
-        })
+        .map(|f| arrow_field(path, f))
         .collect::<Result<Vec<_>, _>>()
         .map(Schema::new)
+}
+
+/// A struct field (`{"id", "name", "required", "type"}`) as an Arrow field.
+fn arrow_field(path: &str, f: &Json) -> Result<Field, ConnectorError> {
+    let name = f["name"].as_str().unwrap_or_default();
+    let required = f["required"].as_bool().unwrap_or(false);
+    Ok(Field::new(name, iceberg_type(path, &f["type"])?, !required))
+}
+
+/// An Iceberg type: a primitive name, or a `struct` / `list` / `map` object
+/// (ADR 0041). Child names follow the Parquet layout Iceberg writers use
+/// (`element`, `key_value` / `key` / `value`); the scan compares nested
+/// types ignoring names, so they only matter for display.
+fn iceberg_type(path: &str, ty: &Json) -> Result<DataType, ConnectorError> {
+    if let Some(primitive) = ty.as_str() {
+        return arrow_type(path, primitive);
+    }
+    match ty["type"].as_str() {
+        Some("struct") => {
+            let fields = ty["fields"]
+                .as_array()
+                .ok_or_else(|| invalid(path, "struct without fields"))?;
+            Ok(DataType::Struct(
+                fields
+                    .iter()
+                    .map(|f| arrow_field(path, f))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into(),
+            ))
+        }
+        Some("list") => {
+            let nullable = !ty["element-required"].as_bool().unwrap_or(false);
+            let element = iceberg_type(path, &ty["element"])?;
+            Ok(DataType::List(Arc::new(Field::new(
+                "element", element, nullable,
+            ))))
+        }
+        Some("map") => {
+            let key = Field::new("key", iceberg_type(path, &ty["key"])?, false);
+            let value = Field::new(
+                "value",
+                iceberg_type(path, &ty["value"])?,
+                !ty["value-required"].as_bool().unwrap_or(false),
+            );
+            Ok(DataType::Map(
+                Arc::new(Field::new(
+                    "key_value",
+                    DataType::Struct(vec![key, value].into()),
+                    false,
+                )),
+                false,
+            ))
+        }
+        _ => Err(unsupported(path, format!("type {ty}"))),
+    }
+}
+
+/// Every struct field nested under a top-level column, with the id of its
+/// parent (struct field, list element or map key/value id).
+fn nested_fields<'a>(ty: &'a Json, parent: i64, out: &mut Vec<(i64, &'a Json)>) {
+    match ty["type"].as_str() {
+        Some("struct") => {
+            for f in ty["fields"].as_array().into_iter().flatten() {
+                out.push((parent, f));
+                nested_fields(&f["type"], f["id"].as_i64().unwrap_or(-1), out);
+            }
+        }
+        Some("list") => nested_fields(&ty["element"], ty["element-id"].as_i64().unwrap_or(-1), out),
+        Some("map") => {
+            nested_fields(&ty["key"], ty["key-id"].as_i64().unwrap_or(-1), out);
+            nested_fields(&ty["value"], ty["value-id"].as_i64().unwrap_or(-1), out);
+        }
+        _ => {}
+    }
 }
 
 fn arrow_type(path: &str, ty: &str) -> Result<DataType, ConnectorError> {
