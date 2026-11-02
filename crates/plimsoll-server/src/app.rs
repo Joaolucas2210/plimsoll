@@ -15,6 +15,7 @@ use axum::{Json, Router};
 use plimsoll_control::governance::{
     Admission, AdmissionError, CancelOutcome, DEFAULT_GROUP, GovernedError, QueryRequest,
 };
+use plimsoll_core::datafusion::common::ScalarValue;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
@@ -162,6 +163,28 @@ pub struct SqlRequest {
     /// `json` (default): one document. `ndjson`: streamed lines (ADR 0035).
     #[serde(default)]
     pub format: Option<String>,
+    /// Values for `$1`, `$2`, ... (ADR 0043): JSON scalars, never spliced
+    /// into the SQL text.
+    #[serde(default)]
+    pub params: Vec<serde_json::Value>,
+}
+
+/// A JSON scalar as a SQL value; the engine casts it to the type its
+/// placeholder needs. Arrays and objects are not parameters.
+fn param(v: &serde_json::Value) -> Option<ScalarValue> {
+    use serde_json::Value as J;
+    Some(match v {
+        J::Null => ScalarValue::Null,
+        J::Bool(b) => ScalarValue::Boolean(Some(*b)),
+        J::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
+            (Some(i), _, _) => ScalarValue::Int64(Some(i)),
+            (None, Some(u), _) => ScalarValue::UInt64(Some(u)),
+            (None, None, Some(f)) => ScalarValue::Float64(Some(f)),
+            _ => return None,
+        },
+        J::String(s) => ScalarValue::Utf8(Some(s.clone())),
+        J::Array(_) | J::Object(_) => return None,
+    })
 }
 
 /// Error contract (ADR 0013): `code` is stable and machine-readable;
@@ -455,6 +478,7 @@ fn ndjson_line(v: &serde_json::Value) -> Vec<u8> {
 async fn stream_sql(
     shared: Arc<AppState>,
     request: QueryRequest,
+    params: Vec<ScalarValue>,
     viewer: crate::auth::Viewer,
     format: Format,
     arrived: Instant,
@@ -479,7 +503,12 @@ async fn stream_sql(
                         u64::try_from(queued.as_micros()).unwrap_or(u64::MAX),
                         Ordering::Relaxed,
                     );
-                    async move { engine.engine.stream(&sql, viewer, format, tx).await }
+                    async move {
+                        engine
+                            .engine
+                            .stream(&sql, &params, viewer, format, tx)
+                            .await
+                    }
                 })
                 .await;
             let _ = done_tx.send(result);
@@ -692,6 +721,13 @@ async fn run_sql(
             None,
         );
     }
+    let Some(params) = req.params.iter().map(param).collect::<Option<Vec<_>>>() else {
+        return ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", false).respond(
+            st,
+            "`params` must be JSON scalars (number, string, boolean, null)",
+            None,
+        );
+    };
     let request = QueryRequest {
         user,
         resource_group: group,
@@ -702,10 +738,28 @@ async fn run_sql(
     match req.format.as_deref() {
         None | Some("json") => {}
         Some("ndjson") => {
-            return stream_sql(shared, request, viewer, Format::Ndjson, Instant::now(), log).await;
+            return stream_sql(
+                shared,
+                request,
+                params,
+                viewer,
+                Format::Ndjson,
+                Instant::now(),
+                log,
+            )
+            .await;
         }
         Some("arrow") => {
-            return stream_sql(shared, request, viewer, Format::Arrow, Instant::now(), log).await;
+            return stream_sql(
+                shared,
+                request,
+                params,
+                viewer,
+                Format::Arrow,
+                Instant::now(),
+                log,
+            )
+            .await;
         }
         Some(other) => {
             return ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", false).respond(
@@ -730,7 +784,7 @@ async fn run_sql(
                 u64::try_from(queued.as_micros()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
-            st.engine.execute(&sql_text, viewer)
+            st.engine.execute(&sql_text, &params, viewer)
         })
         .await;
     let query_id = Some(assigned.load(Ordering::Relaxed)).filter(|id| *id != 0);
@@ -770,7 +824,12 @@ mod tests {
 
     #[async_trait]
     impl QueryEngine for FakeEngine {
-        async fn execute(&self, sql: &str, _viewer: Viewer) -> Result<QueryOutput, EngineError> {
+        async fn execute(
+            &self,
+            sql: &str,
+            _params: &[ScalarValue],
+            _viewer: Viewer,
+        ) -> Result<QueryOutput, EngineError> {
             match sql {
                 "select 1" => Ok(QueryOutput::from_rows(vec!["x".into()], &[vec![json!(1)]])),
                 "oom" => Err(EngineError::MemoryLimitExceeded("needed 2GiB".into())),
@@ -1160,6 +1219,56 @@ mod tests {
         )
         .await;
         assert_eq!(got, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    /// `params` (ADR 0043): bound as values in every format; non-scalar
+    /// params are a 400; the SQL text in the registry has no values.
+    #[tokio::test]
+    async fn params_bind_values_not_sql() {
+        use plimsoll_core::engine::Engine;
+        use plimsoll_core::memory::CeilingPool;
+        let pool = Arc::new(CeilingPool::new(64 << 20, 1 << 20).unwrap());
+        let mut st = Arc::into_inner(default_state()).unwrap();
+        st.engine = Arc::new(crate::engine::CoreEngine(Arc::new(
+            Engine::new(pool, None).unwrap(),
+        )));
+        let st = Arc::new(st);
+        let q = "SELECT count(*) AS n FROM range(10) WHERE value >= $1 AND 'x' <> $2";
+        for (format, params, n) in [
+            ("json", json!([7, "y"]), "3"),
+            ("ndjson", json!([7, "y"]), "3"),
+            // An injection attempt is just a string that is not 'x'.
+            ("json", json!([0, "x' OR '1'='1"]), "10"),
+        ] {
+            let (status, body) = call(
+                router(st.clone()),
+                sql_req(json!({"sql": q, "user": "ana", "format": format, "params": params})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(body.contains(&format!("[{n}]")), "{format}: {body}");
+        }
+        let (status, body) = call(
+            router(st.clone()),
+            sql_req(json!({"sql": q, "user": "ana", "params": [[1], "y"]})),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (StatusCode::BAD_REQUEST, "invalid_request")
+        );
+        let (status, body) = call(
+            router(st.clone()),
+            sql_req(json!({"sql": q, "user": "ana", "params": [1]})),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (StatusCode::BAD_REQUEST, "invalid_query")
+        );
+        // The registry keeps the statement, never the values.
+        let reg = st.admission.registry();
+        assert!(reg.snapshot().iter().all(|q| !q.sql.contains("OR '1'")));
     }
 
     /// `format: arrow` (ADR 0037): a decodable IPC stream with the query id

@@ -14,13 +14,14 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::MemorySchemaProvider;
 use datafusion::common::ResolvedTableReference;
 use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::{ScalarValue, plan_err};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::SQLOptions;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use futures::StreamExt;
 
 use crate::federation::preevaluate_scalar_subqueries;
@@ -135,7 +136,7 @@ impl Engine {
     /// Runs one statement. Dropping the returned future cancels execution
     /// (the stream and its reservations are dropped with it).
     pub async fn sql(&self, sql: &str) -> Result<QueryResult> {
-        self.run(&self.ctx, sql, None).await
+        self.run(&self.ctx, sql, &[], None).await
     }
 
     /// [`Engine::sql`] on behalf of `access`: every table the plan scans,
@@ -143,9 +144,17 @@ impl Engine {
     /// executes (ADR 0025). `access` is also put in this query's session
     /// config for providers that depend on who is asking (ADR 0022). Same
     /// catalogs, runtime and pool; only the config is per query.
-    pub async fn sql_with<T: TableAccess>(&self, sql: &str, access: Arc<T>) -> Result<QueryResult> {
+    ///
+    /// `params` bind `$1`, `$2`, ... (ADR 0043): each value is cast to the
+    /// type the planner inferred for its placeholder.
+    pub async fn sql_with<T: TableAccess>(
+        &self,
+        sql: &str,
+        params: &[ScalarValue],
+        access: Arc<T>,
+    ) -> Result<QueryResult> {
         let ctx = self.context_for(access.clone());
-        self.run(&ctx, sql, Some(access.as_ref())).await
+        self.run(&ctx, sql, params, Some(access.as_ref())).await
     }
 
     /// [`Engine::sql_with`] without collecting: the planned query as a
@@ -155,10 +164,12 @@ impl Engine {
     pub async fn sql_stream_with<T: TableAccess>(
         &self,
         sql: &str,
+        params: &[ScalarValue],
         access: Arc<T>,
     ) -> Result<QueryStream> {
         let ctx = self.context_for(access.clone());
-        self.plan_stream(&ctx, sql, Some(access.as_ref())).await
+        self.plan_stream(&ctx, sql, params, Some(access.as_ref()))
+            .await
     }
 
     fn context_for<T: TableAccess>(&self, access: Arc<T>) -> SessionContext {
@@ -186,10 +197,11 @@ impl Engine {
         &self,
         ctx: &SessionContext,
         sql: &str,
+        params: &[ScalarValue],
         access: Option<&dyn TableAccess>,
     ) -> Result<QueryResult> {
         let started = Instant::now();
-        let mut query = self.plan_stream(ctx, sql, access).await?;
+        let mut query = self.plan_stream(ctx, sql, params, access).await?;
         let group = access.and_then(|a| self.capped_group(a));
         let mut output =
             self.pool
@@ -214,6 +226,7 @@ impl Engine {
         &self,
         ctx: &SessionContext,
         sql: &str,
+        params: &[ScalarValue],
         access: Option<&dyn TableAccess>,
     ) -> Result<QueryStream> {
         let started = Instant::now();
@@ -226,7 +239,7 @@ impl Engine {
             .with_allow_ddl(false)
             .with_allow_dml(false)
             .with_allow_statements(false);
-        let df = ctx.sql_with_options(sql, read_only).await?;
+        let df = bind(ctx.sql_with_options(sql, read_only).await?, params)?;
         let (state, plan) = df.into_parts();
         // Before subquery pre-evaluation, which already executes.
         if let Some(access) = access {
@@ -251,7 +264,14 @@ impl Engine {
         let physical = state.create_physical_plan(&plan).await?;
         // Grants were checked above: a hit is only served to a principal
         // allowed to read every input.
-        let key = cache.and_then(|_| result_cache::key(sql, &physical));
+        // Parameters are part of the statement: same SQL, other values,
+        // other result.
+        let statement = if params.is_empty() {
+            sql.to_owned()
+        } else {
+            format!("{sql}\u{0}{params:?}")
+        };
+        let key = cache.and_then(|_| result_cache::key(&statement, &physical));
         let stream = match (cache, key) {
             (Some(cache), Some(key)) => match cache.get(&key) {
                 Some(hit) => hit,
@@ -266,6 +286,43 @@ impl Engine {
             spilled_total: self.spilled_total.clone(),
         })
     }
+}
+
+/// Binds `params` to the plan's `$n` placeholders (ADR 0043). Every
+/// placeholder needs a value and every value a placeholder; a value is
+/// cast to the type inferred for its placeholder (a JSON integer compared
+/// with an `INT` column, a string compared with a `DATE`), so clients need
+/// not know Arrow types. Values are never spliced into SQL text.
+fn bind(df: DataFrame, params: &[ScalarValue]) -> Result<DataFrame> {
+    let types = df.logical_plan().get_parameter_types()?;
+    if types.is_empty() && params.is_empty() {
+        return Ok(df);
+    }
+    if types.len() != params.len() {
+        return plan_err!(
+            "the query has {} parameter(s), {} value(s) were given",
+            types.len(),
+            params.len()
+        );
+    }
+    let values = params
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let name = format!("${}", i + 1);
+            let Some(ty) = types.get(&name) else {
+                return plan_err!("parameter {name} is not used (use $1..${})", params.len());
+            };
+            match ty {
+                Some(ty) if !v.is_null() && &v.data_type() != ty => v
+                    .cast_to(ty)
+                    .map_err(|e| DataFusionError::Plan(format!("parameter {name}: {e}"))),
+                Some(ty) if v.is_null() => ScalarValue::try_from(ty),
+                _ => Ok(v.clone()),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    df.with_param_values(values)
 }
 
 /// A planned query's result stream. Dropping it stops the query; spill is
@@ -408,7 +465,7 @@ mod tests {
             .unwrap();
         let access = Arc::new(NoGold);
         let ok = e
-            .sql_with("SELECT x FROM silver.s", access.clone())
+            .sql_with("SELECT x FROM silver.s", &[], access.clone())
             .await
             .unwrap();
         assert_eq!(ok.batches[0].num_rows(), 1);
@@ -421,7 +478,7 @@ mod tests {
             "SELECT s.x FROM silver.s s JOIN gold.g g ON s.x = g.x",
             "SELECT x FROM silver.s WHERE x > (SELECT max(x) FROM gold.g)",
         ] {
-            let err = e.sql_with(sql, access.clone()).await.unwrap_err();
+            let err = e.sql_with(sql, &[], access.clone()).await.unwrap_err();
             let denied = matches!(err.find_root(), DataFusionError::External(inner)
                 if inner.downcast_ref::<AccessDenied>().is_some());
             assert!(denied, "{sql}: {err}");
@@ -454,7 +511,7 @@ mod tests {
         let e = Engine::new(pool.clone(), None).unwrap();
         let sql = "SELECT a.value FROM range(300000) a JOIN range(300000) b ON a.value = b.value";
         let err = e
-            .sql_with(sql, Arc::new(In(Some("batch"))))
+            .sql_with(sql, &[], Arc::new(In(Some("batch"))))
             .await
             .unwrap_err();
         // Some operators (the spill pool) replace the pool's message with
@@ -476,7 +533,7 @@ mod tests {
         assert_eq!(pool.group_used("batch"), 0);
         // Ungrouped and other groups: only the ceiling applies.
         for group in [None, Some("adhoc")] {
-            let ok = e.sql_with(sql, Arc::new(In(group))).await.unwrap();
+            let ok = e.sql_with(sql, &[], Arc::new(In(group))).await.unwrap();
             assert_eq!(
                 ok.batches.iter().map(|b| b.num_rows()).sum::<usize>(),
                 300_000
@@ -486,11 +543,71 @@ mod tests {
         let ok = e
             .sql_with(
                 "SELECT count(*) FROM range(1000)",
+                &[],
                 Arc::new(In(Some("batch"))),
             )
             .await
             .unwrap();
         drop(ok);
         assert_eq!(pool.used(), 0);
+    }
+
+    /// `$n` parameters (ADR 0043): bound as values, cast to the inferred
+    /// type, counted exactly, never spliced into SQL.
+    #[tokio::test]
+    async fn binds_parameters_as_values() {
+        struct Any;
+        impl TableAccess for Any {
+            fn check(&self, _: &ResolvedTableReference) -> Result<()> {
+                Ok(())
+            }
+        }
+        let e = engine(64 << 20);
+        e.context()
+            .sql(
+                "CREATE TABLE gold.p AS SELECT * FROM (VALUES \
+                 (CAST(1 AS INT), 'ana', DATE '2024-05-01'), \
+                 (CAST(2 AS INT), 'bob', DATE '2024-05-02')) AS t(id, name, day)",
+            )
+            .await
+            .unwrap();
+        let count = async |sql: &str, params: &[ScalarValue]| {
+            let r = e.sql_with(sql, params, Arc::new(Any)).await?;
+            Ok::<_, DataFusionError>(r.batches.iter().map(|b| b.num_rows()).sum::<usize>())
+        };
+        // An Int64 value for an INT column, a string for a DATE.
+        let q = "SELECT * FROM gold.p WHERE id = $1 AND day = $2";
+        let p = [ScalarValue::Int64(Some(2)), ScalarValue::from("2024-05-02")];
+        assert_eq!(count(q, &p).await.unwrap(), 1);
+        // A value is a value: an injection attempt matches nothing.
+        let q = "SELECT * FROM gold.p WHERE name = $1";
+        assert_eq!(
+            count(q, &[ScalarValue::from("x' OR '1'='1")])
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(count(q, &[ScalarValue::from("ana")]).await.unwrap(), 1);
+        // NULL compares as SQL NULL.
+        assert_eq!(count(q, &[ScalarValue::Null]).await.unwrap(), 0);
+        // Exact arity, both ways; and values that do not fit their type.
+        for (sql, params) in [
+            ("SELECT * FROM gold.p WHERE id = $1", vec![]),
+            ("SELECT 1", vec![ScalarValue::Int64(Some(1))]),
+            (
+                "SELECT * FROM gold.p WHERE id = $1",
+                vec![ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(2))],
+            ),
+            (
+                "SELECT * FROM gold.p WHERE day = $1",
+                vec![ScalarValue::from("not a date")],
+            ),
+        ] {
+            let err = count(sql, &params).await.unwrap_err();
+            assert!(
+                matches!(err.find_root(), DataFusionError::Plan(_)),
+                "{sql} {params:?}: {err}"
+            );
+        }
     }
 }

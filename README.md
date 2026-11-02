@@ -138,7 +138,12 @@ Configuration is environment-only; invalid values abort startup.
 
 ### SQL API
 
-`POST /v1/sql` with `{"sql": "...", "user": "...", "resource_group": "..."?, "format": "json"|"ndjson"|"arrow"?}`.
+`POST /v1/sql` with `{"sql": "...", "user": "...", "resource_group": "..."?, "format": "json"|"ndjson"|"arrow"?, "params": [...]?}`.
+
+- `"params"` binds `$1`, `$2`, ... as values (ADR 0043): JSON scalars,
+  cast to the type each placeholder needs (`"2024-05-01"` for a `DATE`),
+  never spliced into the SQL, so client values cannot inject SQL and do
+  not appear in logs or `system.runtime.queries`. Counts must match.
 
 - `200` → `{"query_id": 1, "columns": [...], "rows": [[...]]}`
 - `"format": "ndjson"` streams `application/x-ndjson` (ADR 0035): a header

@@ -50,6 +50,7 @@ are allowed in place.
 | [0040](0040-schema-evolution-by-field-id.md) | Schema evolution by field id | Accepted | 2026-11-02 | The Parquet scan's expression adapter resolves columns by Iceberg field id (`PARQUET:field_id`): renamed columns read, promoted types cast, re-added columns are NULL in older files; equality-delete keys by id; files without ids in renamed tables are refused | 0005, 0007, 0016 |
 | [0041](0041-nested-types.md) | Nested types | Accepted | 2026-11-02 | Iceberg `struct` / `list` / `map` map recursively to Arrow; the scan adapter compares nested types ignoring names and uses DataFusion's struct-aware cast (fields added later are NULL); histories that renamed, moved or re-added a nested child are refused | 0005, 0007, 0040 |
 | [0042](0042-name-mapping.md) | Iceberg name mapping | Accepted | 2026-11-02 | Files without Parquet field ids get ids from `schema.name-mapping.default` (top level, aliases included); tables with a mapping always adapt by id; equality-delete keys use it too; ambiguous mappings are invalid metadata | 0040, 0041, 0016 |
+| [0043](0043-query-parameters.md) | Query parameters | Accepted | 2026-11-02 | `"params"` JSON scalars bind `$n` via DataFusion placeholders, each cast to its inferred type; exact arity; non-scalars 400; values stay out of the SQL text, logs and registry; included in the result-cache key | 0024, 0027, 0038 |
 
 ## Reading order
 

@@ -348,6 +348,16 @@ mod tests {
         }
     }
 
+    struct All;
+    impl crate::engine::TableAccess for All {
+        fn check(
+            &self,
+            _: &datafusion::common::ResolvedTableReference,
+        ) -> datafusion::error::Result<()> {
+            Ok(())
+        }
+    }
+
     fn engine(cache: usize) -> (Engine, Arc<Snapshots>, Arc<CeilingPool>) {
         let pool = Arc::new(CeilingPool::new(64 << 20, 1 << 20).unwrap());
         let e = Engine::new(pool.clone(), None)
@@ -391,9 +401,44 @@ mod tests {
         *t.0.lock().unwrap() = ("t@2".into(), vec![10, 20]);
         assert_eq!(sum(&e, q).await, 30);
         assert_eq!((stats().hits, stats().misses, stats().entries), (1, 2, 2));
+        // Same SQL, other parameters: another entry, another answer (ADR 0043).
+        let r = e
+            .sql_with(
+                "SELECT sum(v) FROM t WHERE v > $1",
+                &[datafusion::common::ScalarValue::Int64(Some(10))],
+                Arc::new(All),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r.batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            20
+        );
+        let r = e
+            .sql_with(
+                "SELECT sum(v) FROM t WHERE v > $1",
+                &[datafusion::common::ScalarValue::Int64(Some(0))],
+                Arc::new(All),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r.batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            30
+        );
         // Different SQL, same snapshot: its own entry.
         assert_eq!(sum(&e, "SELECT sum(v) FROM t").await, 30);
-        assert_eq!(stats().entries, 3);
+        assert_eq!(stats().entries, 5);
     }
 
     #[tokio::test]

@@ -14,6 +14,7 @@ use plimsoll_control::catalog::CatalogError;
 use plimsoll_core::datafusion::arrow::ipc::writer::StreamWriter;
 use plimsoll_core::datafusion::arrow::json::ArrayWriter;
 use plimsoll_core::datafusion::arrow::record_batch::RecordBatch;
+use plimsoll_core::datafusion::common::ScalarValue;
 use plimsoll_core::datafusion::error::DataFusionError;
 use plimsoll_core::datafusion::object_store::Error as ObjectStoreError;
 use plimsoll_core::datafusion::parquet::errors::ParquetError;
@@ -118,7 +119,12 @@ fn receiver_gone() -> EngineError {
 #[async_trait]
 pub trait QueryEngine: Send + Sync {
     /// Runs `sql` on behalf of `viewer` (scopes system tables, ADR 0022).
-    async fn execute(&self, sql: &str, viewer: Viewer) -> Result<QueryOutput, EngineError>;
+    async fn execute(
+        &self,
+        sql: &str,
+        params: &[ScalarValue],
+        viewer: Viewer,
+    ) -> Result<QueryOutput, EngineError>;
 
     /// Runs `sql`, sending the result to `tx` as it is produced. `tx` is
     /// bounded: a slow reader slows the query instead of buffering it.
@@ -126,6 +132,7 @@ pub trait QueryEngine: Send + Sync {
     async fn stream(
         &self,
         sql: &str,
+        params: &[ScalarValue],
         viewer: Viewer,
         format: Format,
         tx: tokio::sync::mpsc::Sender<Chunk>,
@@ -133,7 +140,7 @@ pub trait QueryEngine: Send + Sync {
         if format != Format::Ndjson {
             return Err(EngineError::Unsupported(format!("{format:?} results")));
         }
-        let out = self.execute(sql, viewer).await?;
+        let out = self.execute(sql, params, viewer).await?;
         let rows: Vec<Value> = serde_json::from_slice(&out.rows_json)
             .map_err(|e| EngineError::Internal(e.to_string()))?;
         let mut lines = Vec::new();
@@ -183,7 +190,12 @@ pub struct CoreEngine(pub Arc<Engine>);
 
 #[async_trait]
 impl QueryEngine for CoreEngine {
-    async fn execute(&self, sql: &str, viewer: Viewer) -> Result<QueryOutput, EngineError> {
+    async fn execute(
+        &self,
+        sql: &str,
+        params: &[ScalarValue],
+        viewer: Viewer,
+    ) -> Result<QueryOutput, EngineError> {
         let QueryResult {
             batches,
             mut memory,
@@ -191,7 +203,7 @@ impl QueryEngine for CoreEngine {
             execution,
         } = self
             .0
-            .sql_with(sql, Arc::new(viewer))
+            .sql_with(sql, params, Arc::new(viewer))
             .await
             .map_err(|e| classify(&e))?;
         let serializing = Instant::now();
@@ -241,6 +253,7 @@ impl QueryEngine for CoreEngine {
     async fn stream(
         &self,
         sql: &str,
+        params: &[ScalarValue],
         viewer: Viewer,
         format: Format,
         tx: tokio::sync::mpsc::Sender<Chunk>,
@@ -250,7 +263,7 @@ impl QueryEngine for CoreEngine {
         let group = self.0.capped_group(viewer.as_ref());
         let mut query = self
             .0
-            .sql_stream_with(sql, viewer)
+            .sql_stream_with(sql, params, viewer)
             .await
             .map_err(|e| classify(&e))?;
         let columns: Vec<String> = query
@@ -420,19 +433,20 @@ mod tests {
         let pool = Arc::new(CeilingPool::new(1 << 20, 1 << 17).unwrap());
         let e = CoreEngine(Arc::new(Engine::new(pool, None).unwrap()));
         let out = e
-            .execute("SELECT 1 AS a, NULL AS b", Viewer::default())
+            .execute("SELECT 1 AS a, NULL AS b", &[], Viewer::default())
             .await
             .unwrap();
         assert_eq!(out.columns, ["a", "b"]);
         let rows: Value = serde_json::from_slice(&out.rows_json).unwrap();
         assert_eq!(rows, serde_json::json!([[1, null]]));
         assert!(matches!(
-            e.execute("SELEC", Viewer::default()).await,
+            e.execute("SELEC", &[], Viewer::default()).await,
             Err(EngineError::InvalidQuery(_))
         ));
         assert!(matches!(
             e.execute(
                 "SELECT value, repeat('x', 100) FROM range(200000)",
+                &[],
                 Viewer::default()
             )
             .await,
@@ -518,7 +532,7 @@ mod tests {
         let pool = Arc::new(CeilingPool::new(4 << 20, 2 << 20).unwrap());
         let e = CoreEngine(Arc::new(Engine::new(pool.clone(), None).unwrap()));
         let small = e
-            .execute("SELECT value FROM range(1000)", Viewer::default())
+            .execute("SELECT value FROM range(1000)", &[], Viewer::default())
             .await
             .unwrap();
         let held = small.memory.as_ref().map(Reservation::size).unwrap();
@@ -536,6 +550,7 @@ mod tests {
         let err = e
             .execute(
                 "SELECT NULL AS a, NULL AS b, NULL AS c, NULL AS d FROM range(200000)",
+                &[],
                 Viewer::default(),
             )
             .await;
@@ -551,7 +566,7 @@ mod tests {
         let e = CoreEngine(Arc::new(Engine::new(pool.clone(), None).unwrap()));
         let sql = "SELECT value, repeat('x', 100) FROM range(200000)";
         assert!(matches!(
-            e.execute(sql, Viewer::default()).await,
+            e.execute(sql, &[], Viewer::default()).await,
             Err(EngineError::MemoryLimitExceeded(_))
         ));
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
@@ -569,7 +584,7 @@ mod tests {
             (header, lines, peak)
         });
         let done = e
-            .stream(sql, Viewer::default(), Format::Ndjson, tx)
+            .stream(sql, &[], Viewer::default(), Format::Ndjson, tx)
             .await
             .unwrap();
         let (header, lines, peak) = reader.await.unwrap();
@@ -581,7 +596,7 @@ mod tests {
         // Planning errors surface before any chunk.
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         assert!(matches!(
-            e.stream("SELEC", Viewer::default(), Format::Ndjson, tx)
+            e.stream("SELEC", &[], Viewer::default(), Format::Ndjson, tx)
                 .await,
             Err(EngineError::InvalidQuery(_))
         ));
@@ -600,10 +615,10 @@ mod tests {
         let collect = async |sql: &'static str| {
             let (tx, mut rx) = tokio::sync::mpsc::channel(2);
             let e = e.clone();
-            let run =
-                tokio::spawn(
-                    async move { e.stream(sql, Viewer::default(), Format::Arrow, tx).await },
-                );
+            let run = tokio::spawn(async move {
+                e.stream(sql, &[], Viewer::default(), Format::Arrow, tx)
+                    .await
+            });
             let mut bytes = Vec::new();
             while let Some(chunk) = rx.recv().await {
                 if let Chunk::Rows(b, _) = chunk {
@@ -637,7 +652,7 @@ mod tests {
         let e = CoreEngine(Arc::new(Engine::new(pool, None).unwrap()));
         let sql = "SELECT named_struct('a', 1, 'b', 'x') AS s, make_array(1, 2) AS l, \
                    map(['k'], [7]) AS m";
-        let out = e.execute(sql, Viewer::default()).await.unwrap();
+        let out = e.execute(sql, &[], Viewer::default()).await.unwrap();
         let rows: Value = serde_json::from_slice(&out.rows_json).unwrap();
         assert_eq!(
             rows,
