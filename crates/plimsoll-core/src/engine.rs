@@ -44,6 +44,18 @@ pub struct QueryResult {
     pub planning: Duration,
     /// Physical plan -> all batches collected.
     pub execution: Duration,
+    /// Every scan of the optimized plan (ADR 0046).
+    pub reads: Vec<TableRead>,
+}
+
+/// One scan of a query, for the audit trail (ADR 0046): the table as
+/// resolved, the columns it read (filters included) and whether a row
+/// filter (ADR 0045) confined it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRead {
+    pub table: String,
+    pub columns: Vec<String>,
+    pub row_filter: bool,
 }
 
 impl std::fmt::Debug for QueryResult {
@@ -226,12 +238,14 @@ impl Engine {
             batches.push(batch);
         }
         let planning = query.planning;
+        let reads = std::mem::take(&mut query.reads);
         drop(query);
         Ok(QueryResult {
             batches,
             memory: output,
             planning,
             execution: started.elapsed() - planning,
+            reads,
         })
     }
 
@@ -315,7 +329,10 @@ impl Engine {
         // Optimized once, here, so column grants see what each scan really
         // reads (projection pushdown) before anything executes (ADR 0044).
         let plan = state.optimize(&plan)?;
-        if let Some(access) = access {
+        // What every scan reads, for column grants (ADR 0044) and the audit
+        // trail (ADR 0046).
+        let mut reads: Vec<TableRead> = Vec::new();
+        {
             let options = state.config_options();
             let (catalog, schema) = (
                 &options.catalog.default_catalog,
@@ -337,7 +354,18 @@ impl Engine {
                         }
                     }
                     let table = scan.table_name.clone().resolve(catalog, schema);
-                    access.check_columns(&table, &columns)?;
+                    if let Some(access) = access {
+                        access.check_columns(&table, &columns)?;
+                    }
+                    columns.sort_unstable();
+                    columns.dedup();
+                    let name = table.to_string();
+                    let row_filter = applied.iter().any(|a| a.starts_with(&format!("{name}:")));
+                    reads.push(TableRead {
+                        table: name,
+                        columns: columns.into_iter().map(str::to_owned).collect(),
+                        row_filter,
+                    });
                 }
                 Ok(TreeNodeRecursion::Continue)
             })?;
@@ -368,6 +396,7 @@ impl Engine {
         Ok(QueryStream {
             stream,
             planning: started.elapsed(),
+            reads,
             physical,
             spilled_total: self.spilled_total.clone(),
         })
@@ -417,6 +446,8 @@ pub struct QueryStream {
     pub stream: SendableRecordBatchStream,
     /// SQL text -> physical plan.
     pub planning: Duration,
+    /// Every scan of the optimized plan (ADR 0046).
+    pub reads: Vec<TableRead>,
     physical: Arc<dyn ExecutionPlan>,
     spilled_total: Arc<AtomicU64>,
 }
@@ -695,5 +726,61 @@ mod tests {
                 "{sql} {params:?}: {err}"
             );
         }
+    }
+
+    /// The audit trail (ADR 0046): every scan of the optimized plan, with
+    /// the columns it read (filters included) and its row filter.
+    #[tokio::test]
+    async fn records_what_each_scan_read() {
+        struct Eu;
+        impl TableAccess for Eu {
+            fn check(&self, _: &ResolvedTableReference) -> Result<()> {
+                Ok(())
+            }
+            fn row_filter(&self, t: &ResolvedTableReference) -> Option<String> {
+                (t.table.as_ref() == "orders").then(|| "region = 'eu'".to_owned())
+            }
+        }
+        let e = engine(64 << 20);
+        e.context()
+            .sql("CREATE TABLE gold.orders AS SELECT * FROM (VALUES (1, 'eu', 10, 'a@x')) AS t(id, region, amount, email)")
+            .await
+            .unwrap();
+        e.context()
+            .sql("CREATE TABLE gold.users AS SELECT * FROM (VALUES (1, 'ana')) AS t(id, name)")
+            .await
+            .unwrap();
+        let r = e
+            .sql_with(
+                "SELECT u.name, sum(o.amount) FROM gold.orders o JOIN gold.users u ON o.id = u.id \
+                 WHERE o.email LIKE '%@x' GROUP BY u.name",
+                &[],
+                Arc::new(Eu),
+            )
+            .await
+            .unwrap();
+        let mut reads = r.reads.clone();
+        reads.sort_by(|a, b| a.table.cmp(&b.table));
+        assert_eq!(
+            reads,
+            [
+                TableRead {
+                    table: "datafusion.gold.orders".into(),
+                    // The filter's columns (email, region) count as read.
+                    columns: vec![
+                        "amount".into(),
+                        "email".into(),
+                        "id".into(),
+                        "region".into()
+                    ],
+                    row_filter: true,
+                },
+                TableRead {
+                    table: "datafusion.gold.users".into(),
+                    columns: vec!["id".into(), "name".into()],
+                    row_filter: false,
+                },
+            ]
+        );
     }
 }

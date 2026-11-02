@@ -53,6 +53,7 @@ are allowed in place.
 | [0043](0043-query-parameters.md) | Query parameters | Accepted | 2026-11-02 | `"params"` JSON scalars bind `$n` via DataFusion placeholders, each cast to its inferred type; exact arity; non-scalars 400; values stay out of the SQL text, logs and registry; included in the result-cache key | 0024, 0027, 0038 |
 | [0044](0044-column-deny.md) | Column-level deny | Accepted | 2026-11-02 | `PLIMSOLL_AUTH_COLUMN_DENY=user=schema.table.column\|...`; checked on the optimized plan's scans (projected + pushed-filter columns) before execution and before the result cache; `@` time-travel names map to the base table; `$files` partition values withheld | 0024, 0025, 0028, 0032, 0038 |
 | [0045](0045-row-filters.md) | Row filters per principal | Accepted | 2026-11-02 | `PLIMSOLL_AUTH_ROW_FILTERS` JSON; the engine wraps every scan of a filtered table in a `Filter` before optimization (joins, subqueries, time travel); result-cache key includes applied filters; `$` metadata tables of filtered tables denied; bad predicates are 500s that do not echo the filter | 0025, 0038, 0044 |
+| [0046](0046-audit-trail.md) | Audit trail of data reads | Accepted | 2026-11-02 | Every scan of the optimized plan is recorded (table, columns read incl. pushed-filter columns, row filter applied) and emitted as `reads` on the `query` log line; values never logged | 0027, 0043, 0044, 0045 |
 
 ## Reading order
 
@@ -60,7 +61,8 @@ are allowed in place.
 - Shape of the system: 0001, 0002, 0004.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
 - Federation: 0005 → 0006.
-- Observability: 0013 → 0019 → 0027 → 0031.
+- Observability: 0013 → 0019 → 0027 → 0031 → 0046.
+- Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046.
 
 ## Conventions
 

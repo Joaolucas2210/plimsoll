@@ -362,6 +362,7 @@ async fn sql(
                 .await
                 .unwrap_or_else(|_| Outcome::failed("internal", "stream task ended"));
             if let Some(s) = outcome.streamed {
+                log.reads = s.reads;
                 log.planning = Some(s.phases.planning);
                 log.execution = Some(s.phases.execution);
                 log.serialization = Some(s.phases.serialization);
@@ -796,6 +797,7 @@ async fn run_sql(
 
     match result {
         Ok(out) => {
+            log.reads = out.reads.clone();
             log.planning = Some(out.phases.planning);
             log.execution = Some(out.phases.execution);
             log.serialization = Some(out.phases.serialization);

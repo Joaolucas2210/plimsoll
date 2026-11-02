@@ -18,7 +18,7 @@ use plimsoll_core::datafusion::common::ScalarValue;
 use plimsoll_core::datafusion::error::DataFusionError;
 use plimsoll_core::datafusion::object_store::Error as ObjectStoreError;
 use plimsoll_core::datafusion::parquet::errors::ParquetError;
-use plimsoll_core::engine::{AccessDenied, Engine, QueryResult};
+use plimsoll_core::engine::{AccessDenied, Engine, QueryResult, TableRead};
 
 use crate::auth::Viewer;
 use plimsoll_core::memory::{ConsumerKind, Reservation};
@@ -32,6 +32,8 @@ pub struct QueryOutput {
     pub rows_json: Vec<u8>,
     pub memory: Option<Reservation>,
     pub phases: Phases,
+    /// What each scan read, for the audit trail (ADR 0046).
+    pub reads: Vec<TableRead>,
 }
 
 /// Where a successful query spent its time (the admission queue is timed by
@@ -51,6 +53,7 @@ impl QueryOutput {
             rows_json: serde_json::to_vec(rows).unwrap_or_else(|_| b"[]".to_vec()),
             memory: None,
             phases: Phases::default(),
+            reads: Vec::new(),
         }
     }
 }
@@ -104,10 +107,12 @@ pub enum Format {
 const CHUNK_ROWS: usize = 1024;
 
 /// What a streamed query did, once its last chunk was sent.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct Streamed {
     pub rows: u64,
     pub phases: Phases,
+    /// What each scan read, for the audit trail (ADR 0046).
+    pub reads: Vec<TableRead>,
 }
 
 /// The receiver is gone (client disconnected). The caller cancels the query
@@ -158,6 +163,7 @@ pub trait QueryEngine: Send + Sync {
         Ok(Streamed {
             rows: rows.len() as u64,
             phases: out.phases,
+            reads: out.reads,
         })
     }
 }
@@ -201,6 +207,7 @@ impl QueryEngine for CoreEngine {
             mut memory,
             planning,
             execution,
+            reads,
         } = self
             .0
             .sql_with(sql, params, Arc::new(viewer))
@@ -247,6 +254,7 @@ impl QueryEngine for CoreEngine {
                 execution,
                 serialization: serializing.elapsed(),
             },
+            reads,
         })
     }
 
@@ -340,6 +348,7 @@ impl QueryEngine for CoreEngine {
         let planning = query.planning;
         Ok(Streamed {
             rows,
+            reads: std::mem::take(&mut query.reads),
             phases: Phases {
                 planning,
                 // Includes time spent waiting for the reader.

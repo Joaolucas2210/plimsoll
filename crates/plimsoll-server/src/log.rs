@@ -62,6 +62,9 @@ pub struct QueryLog {
     pub sql_bytes: usize,
     /// W3C trace id, to jump from a log line to its trace (ADR 0031).
     pub trace_id: Option<String>,
+    /// Tables and columns the query read (ADR 0046); empty when it never
+    /// planned (rejected, invalid, denied).
+    pub reads: Vec<plimsoll_core::engine::TableRead>,
     pub queue: Option<Duration>,
     pub planning: Option<Duration>,
     pub execution: Option<Duration>,
@@ -99,6 +102,11 @@ impl QueryLog {
             "sql_sha256": self.sql_sha256,
             "sql_bytes": self.sql_bytes,
             "trace_id": self.trace_id,
+            "reads": self.reads.iter().map(|r| json!({
+                "table": r.table,
+                "columns": r.columns,
+                "row_filter": r.row_filter,
+            })).collect::<Vec<_>>(),
             "queue_ms": ms(self.queue),
             "planning_ms": ms(self.planning),
             "execution_ms": ms(self.execution),
@@ -144,6 +152,11 @@ mod tests {
             ..Default::default()
         };
         log.set_sql("SELECT * FROM t WHERE email = 'ana@example.com'");
+        log.reads = vec![plimsoll_core::engine::TableRead {
+            table: "datafusion.gold.t".into(),
+            columns: vec!["email".into(), "id".into()],
+            row_filter: true,
+        }];
         let v = line(Level::Info, "query", log.fields(200, None));
         assert_eq!(v["event"], "query");
         assert_eq!(v["code"], "ok");
@@ -151,6 +164,10 @@ mod tests {
         assert_eq!(v["planning_ms"], 2.5);
         assert_eq!(v["execution_ms"], Value::Null);
         assert_eq!(v["sql_sha256"].as_str().unwrap().len(), 16);
+        assert_eq!(
+            v["reads"],
+            json!([{"table": "datafusion.gold.t", "columns": ["email", "id"], "row_filter": true}])
+        );
         assert!(
             !v.to_string().contains("example.com"),
             "no SQL text in logs"
