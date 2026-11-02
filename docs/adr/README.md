@@ -56,6 +56,7 @@ are allowed in place.
 | [0046](0046-audit-trail.md) | Audit trail of data reads | Accepted | 2026-11-02 | Every scan of the optimized plan is recorded (table, columns read incl. pushed-filter columns, row filter applied) and emitted as `reads` on the `query` log line; values never logged | 0027, 0043, 0044, 0045 |
 | [0047](0047-iceberg-partitions-table.md) | Iceberg `$partitions` | Accepted | 2026-11-02 | Folds the `$files` stream per (spec, partition) into Spark's columns; O(partitions) reserved; column deny withholds `partition`, row filters deny it like any `$` table | 0032, 0044, 0045 |
 | [0048](0048-nested-field-pruning.md) | Pruning on nested struct fields | Accepted | 2026-11-02 | Prunable columns include primitives reached through structs (`s.a`, by field id); `get_field` paths in filters map to them; list/map elements excluded; key clashes with dotted top-level names disable pruning for that path | 0010, 0041 |
+| [0049](0049-null-count-pruning.md) | Null-count pruning | Accepted | 2026-11-02 | Files whose `null_value_counts` equal `value_counts` for a column match no comparison and no `IS NOT NULL`; `null_value_counts` = 0 prunes `IS NULL`; unknown counts never prune | 0010, 0048 |
 
 ## Reading order
 

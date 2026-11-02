@@ -611,6 +611,10 @@ impl IcebergTable {
                     && !pruner.may_match_file(
                         &bound_map(file, "lower_bounds"),
                         &bound_map(file, "upper_bounds"),
+                        &prune::Counts {
+                            values: count_map(file, "value_counts"),
+                            nulls: count_map(file, "null_value_counts"),
+                        },
                     )
                 {
                     continue;
@@ -1233,6 +1237,18 @@ fn bound_map(file: &Avro, name: &str) -> HashMap<i64, Vec<u8>> {
     items
         .iter()
         .filter_map(|kv| Some((long_field(kv, "key")?, bytes_field(kv, "value")?.to_vec())))
+        .collect()
+}
+
+/// Iceberg `map<int, long>`, e.g. `null_value_counts`. Missing or
+/// malformed -> empty (no pruning).
+fn count_map(file: &Avro, name: &str) -> HashMap<i64, i64> {
+    let Some(Avro::Array(items)) = field(file, name) else {
+        return HashMap::new();
+    };
+    items
+        .iter()
+        .filter_map(|kv| Some((long_field(kv, "key")?, long_field(kv, "value")?)))
         .collect()
 }
 

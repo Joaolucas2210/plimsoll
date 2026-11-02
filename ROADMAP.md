@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Null-count pruning: all-NULL columns match no comparison; `IS NULL` / `IS NOT NULL` prune on counts (ADR 0049)
 - [x] Pruning on nested struct fields (`s['a']` uses `s.a` bounds) (ADR 0048)
 - [x] Iceberg `$partitions`: per (spec, partition) data rows/files/bytes and delete rows/files, folded from `$files` under the ceiling (ADR 0047)
 - [x] Audit trail: `reads` (table, columns read, row filter) on every query log line, from the optimized plan (ADR 0046)
@@ -81,10 +82,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Null-count pruning**: files whose `null_value_counts` equal their
-`value_counts` for a column hold only NULLs there, so any comparison on it
-(`=`, `<`, `BETWEEN`) can skip them; and `IS NULL` / `IS NOT NULL` can
-prune on the same counts. Today such files have no bounds and are kept.
+**`IN` lists and `NOT` in the pruner**: `region IN ('eu', 'us')` and
+`NOT (x > 5)` are common dashboard filters the pruner ignores today; an
+`IN` list prunes like an OR of equalities against each file's bounds.
 
 ## Later
 

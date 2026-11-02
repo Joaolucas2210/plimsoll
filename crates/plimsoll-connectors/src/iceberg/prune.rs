@@ -150,33 +150,69 @@ pub(super) fn partition_spec(fields: &serde_json::Value) -> Vec<Option<Partition
 #[derive(Debug, Default)]
 pub(super) struct Pruner {
     preds: Vec<Pred>,
+    /// `col IS NULL` (true) / `col IS NOT NULL` (false), by field id
+    /// (ADR 0049).
+    null_checks: Vec<(i64, bool)>,
+}
+
+/// Per-column counts of a data file (`value_counts` includes nulls).
+#[derive(Debug, Default)]
+pub(super) struct Counts {
+    pub(super) values: HashMap<i64, i64>,
+    pub(super) nulls: HashMap<i64, i64>,
+}
+
+impl Counts {
+    /// Every value of `id` in the file is NULL (counts known and equal).
+    fn all_null(&self, id: i64) -> bool {
+        matches!((self.values.get(&id), self.nulls.get(&id)), (Some(v), Some(n)) if v == n)
+    }
+
+    fn no_null(&self, id: i64) -> bool {
+        self.nulls.get(&id) == Some(&0)
+    }
 }
 
 impl Pruner {
     /// `columns`: column name -> (field id, type) for the current schema.
     pub(super) fn new(filters: &[Expr], columns: &HashMap<String, (i64, Prim)>) -> Self {
-        let mut preds = Vec::new();
+        let mut pruner = Self::default();
         for f in filters {
-            collect(f, columns, &mut preds);
+            collect(f, columns, &mut pruner.preds, &mut pruner.null_checks);
         }
-        Self { preds }
+        pruner
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.preds.is_empty()
+        self.preds.is_empty() && self.null_checks.is_empty()
     }
 
-    /// File-level: `lower`/`upper` are the data file's column bounds.
+    /// File-level: `lower`/`upper` are the data file's column bounds,
+    /// `counts` its value and null counts.
     pub(super) fn may_match_file(
         &self,
         lower: &HashMap<i64, Vec<u8>>,
         upper: &HashMap<i64, Vec<u8>>,
+        counts: &Counts,
     ) -> bool {
-        self.preds.iter().all(|p| {
+        // A comparison is never true on NULL: an all-NULL column matches
+        // nothing (ADR 0049).
+        let compared = self.preds.iter().all(|p| {
+            if counts.all_null(p.field_id) {
+                return false;
+            }
             let lo = lower.get(&p.field_id).and_then(|b| p.prim.decode(b));
             let hi = upper.get(&p.field_id).and_then(|b| p.prim.decode(b));
             p.op.may_match(lo.as_ref(), hi.as_ref(), &p.value)
-        })
+        });
+        compared
+            && self.null_checks.iter().all(|&(id, is_null)| {
+                if is_null {
+                    !counts.no_null(id)
+                } else {
+                    !counts.all_null(id)
+                }
+            })
     }
 
     /// Manifest-level: `summaries[i]` = (lower, upper) bound of partition
@@ -249,15 +285,25 @@ fn transformed(p: &Pred, t: Transform) -> Option<(Op, Datum, Prim)> {
     Some((op, Datum::Int(tv), Prim::Int))
 }
 
-fn collect(e: &Expr, columns: &HashMap<String, (i64, Prim)>, out: &mut Vec<Pred>) {
+fn collect(
+    e: &Expr,
+    columns: &HashMap<String, (i64, Prim)>,
+    out: &mut Vec<Pred>,
+    nulls: &mut Vec<(i64, bool)>,
+) {
     match e {
         Expr::BinaryExpr(BinaryExpr {
             left,
             op: Operator::And,
             right,
         }) => {
-            collect(left, columns, out);
-            collect(right, columns, out);
+            collect(left, columns, out, nulls);
+            collect(right, columns, out, nulls);
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            if let Some(&(id, _)) = path(inner).and_then(|p| columns.get(&p)) {
+                nulls.push((id, matches!(e, Expr::IsNull(_))));
+            }
         }
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
             let op = match op {
@@ -403,7 +449,8 @@ mod tests {
         // File holds id in [10, 20], city in ["b", "d"].
         let lo = bounds(&[(1, long(10)), (2, b"b".to_vec())]);
         let hi = bounds(&[(1, long(20)), (2, b"d".to_vec())]);
-        let keep = |e: Expr| Pruner::new(&[e], &columns()).may_match_file(&lo, &hi);
+        let keep =
+            |e: Expr| Pruner::new(&[e], &columns()).may_match_file(&lo, &hi, &Counts::default());
 
         assert!(!keep(col("id").gt(lit(20i64))));
         assert!(keep(col("id").gt_eq(lit(20i64))));
@@ -429,7 +476,8 @@ mod tests {
         let lo = bounds(&[(3, long(us))]);
         let hi = bounds(&[(3, long(us))]);
         let ts = |ns: i64| lit(ScalarValue::TimestampNanosecond(Some(ns), None));
-        let keep = |e: Expr| Pruner::new(&[e], &columns()).may_match_file(&lo, &hi);
+        let keep =
+            |e: Expr| Pruner::new(&[e], &columns()).may_match_file(&lo, &hi, &Counts::default());
         assert!(!keep(col("ts").gt(ts(us * 1_000))));
         assert!(keep(col("ts").lt(ts(us * 1_000 + 1)))); // sub-µs: not pruned
     }
@@ -486,5 +534,28 @@ mod tests {
             Some("s.t.b")
         );
         assert_eq!(path(&(col("a") + col("b"))), None);
+    }
+
+    #[test]
+    fn null_counts_prune_comparisons_and_null_checks() {
+        let (lo, hi) = (HashMap::new(), HashMap::new());
+        // Field 1 is `id` (see `columns()`): 10 values.
+        let counts = |nulls: i64| Counts {
+            values: HashMap::from([(1, 10)]),
+            nulls: HashMap::from([(1, nulls)]),
+        };
+        let keep = |e: Expr, c: &Counts| Pruner::new(&[e], &columns()).may_match_file(&lo, &hi, c);
+        // All NULL: no comparison can be true; IS NOT NULL neither.
+        assert!(!keep(col("id").eq(lit(5i64)), &counts(10)));
+        assert!(!keep(col("id").is_not_null(), &counts(10)));
+        assert!(keep(col("id").is_null(), &counts(10)));
+        // No NULL: IS NULL cannot match.
+        assert!(!keep(col("id").is_null(), &counts(0)));
+        assert!(keep(col("id").is_not_null(), &counts(0)));
+        // Some NULLs, or unknown counts: keep.
+        assert!(keep(col("id").is_null(), &counts(3)));
+        assert!(keep(col("id").is_not_null(), &counts(3)));
+        assert!(keep(col("id").is_null(), &Counts::default()));
+        assert!(keep(col("id").eq(lit(5i64)), &Counts::default()));
     }
 }

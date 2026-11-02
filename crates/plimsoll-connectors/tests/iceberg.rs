@@ -1090,19 +1090,27 @@ async fn reads_nested_spark_types() {
             .unwrap(),
         [3]
     );
-    // Nested bounds prune (ADR 0048). Spark wrote three files: (1, s.a=1),
-    // (2, s NULL) and (3, s.a=3). The all-NULL file has no bounds for s.a
-    // and is kept (conservative); the others prune on s.a's bounds.
+    // Nested bounds prune (ADR 0048), and null counts (ADR 0049). Spark
+    // wrote three files: (1, s.a=1), (2, s NULL) and (3, s.a=3). The
+    // all-NULL file matches no comparison; IS NULL keeps only it.
     assert_eq!(
         ids(&ctx, "SELECT id FROM n WHERE s['a'] = 3")
             .await
             .unwrap(),
         [3]
     );
+    assert_eq!(
+        ids(&ctx, "SELECT id FROM n WHERE s['a'] IS NULL")
+            .await
+            .unwrap(),
+        [2]
+    );
     for (sql, files) in [
-        ("SELECT id FROM n WHERE s['a'] = 3", "files=2/3"),
-        ("SELECT id FROM n WHERE s['a'] > 100", "files=1/3"),
-        ("SELECT id FROM n WHERE s['a'] >= 1", "files=3/3"),
+        ("SELECT id FROM n WHERE s['a'] = 3", "files=1/3"),
+        ("SELECT id FROM n WHERE s['a'] > 100", "files=0/3"),
+        ("SELECT id FROM n WHERE s['a'] >= 1", "files=2/3"),
+        ("SELECT id FROM n WHERE s['a'] IS NULL", "files=1/3"),
+        ("SELECT id FROM n WHERE s['a'] IS NOT NULL", "files=2/3"),
     ] {
         let plan = ctx
             .sql(sql)

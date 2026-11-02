@@ -36,10 +36,8 @@ a common filter on event payloads, read every file.
 - Filters on struct fields skip files like any other filter.
 
 **Negative (accepted)**
-- **Files where the field is all NULL have no bounds and are kept.** This
-  happens when the struct is NULL or the field was added later. Pruning
-  them needs null counts: the next ROADMAP item, which applies to
-  top-level columns too.
+- **Files where the field is all NULL have no bounds.** They were kept
+  until ADR 0049 pruned them by null counts.
 - **No pruning through list or map elements.**
 
 ## Validation
