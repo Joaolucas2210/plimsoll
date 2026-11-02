@@ -940,6 +940,45 @@ async fn reads_a_spark_merge_on_read_table() {
         "| 0 |",
     )
     .await;
+    // IN / OR / NOT prune (ADR 0050) with unchanged answers. Main has
+    // three data files: day 1's insert, day 2's insert, and the file the
+    // UPDATE of id 1 wrote (day 1, bounds [1, 1]). DataFusion turns IN
+    // into OR.
+    for (sql, expected, files) in [
+        (
+            "SELECT count(*) AS n FROM mor WHERE id IN (1, 2)",
+            "| 2 |",
+            "files=2/3",
+        ),
+        (
+            "SELECT count(*) AS n FROM mor WHERE id IN (40, 41) OR id = 47",
+            "| 3 |",
+            "files=1/3",
+        ),
+        (
+            "SELECT count(*) AS n FROM mor WHERE NOT (id <= 23)",
+            "| 16 |",
+            "files=1/3",
+        ),
+        (
+            "SELECT count(*) AS n FROM mor WHERE id IN (2, 40)",
+            "| 2 |",
+            "files=2/3",
+        ),
+    ] {
+        check(sql, expected).await;
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let text = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(text.contains(files), "{sql}: {text}");
+    }
     assert_eq!(pool.used(), 0);
 }
 

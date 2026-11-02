@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Datelike};
 use datafusion::common::ScalarValue;
+use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{Between, BinaryExpr, Expr, Operator};
 
 /// Iceberg primitive types we can compare bounds for.
@@ -146,13 +147,125 @@ pub(super) fn partition_spec(fields: &serde_json::Value) -> Vec<Option<Partition
         .collect()
 }
 
-/// AND of the prunable predicates found in the scan filters.
+/// The scan filters as a tree of what can be checked against file and
+/// manifest statistics (ADR 0050). Anything else is `True` ("may match"),
+/// so the tree only ever prunes what is provably empty.
 #[derive(Debug, Default)]
 pub(super) struct Pruner {
-    preds: Vec<Pred>,
+    root: Node,
+}
+
+#[derive(Debug, Default)]
+enum Node {
+    /// Unknown: may match.
+    #[default]
+    True,
+    Cmp(Pred),
     /// `col IS NULL` (true) / `col IS NOT NULL` (false), by field id
     /// (ADR 0049).
-    null_checks: Vec<(i64, bool)>,
+    Null(i64, bool),
+    And(Vec<Node>),
+    Or(Vec<Node>),
+}
+
+impl Node {
+    fn and(nodes: Vec<Node>) -> Node {
+        let mut nodes: Vec<Node> = nodes
+            .into_iter()
+            .filter(|n| !matches!(n, Node::True))
+            .collect();
+        match nodes.len() {
+            0 => Node::True,
+            1 => nodes.remove(0),
+            _ => Node::And(nodes),
+        }
+    }
+
+    fn or(nodes: Vec<Node>) -> Node {
+        // One unknown branch makes the whole OR unknown.
+        if nodes.is_empty() || nodes.iter().any(|n| matches!(n, Node::True)) {
+            return Node::True;
+        }
+        Node::Or(nodes)
+    }
+
+    fn file(
+        &self,
+        lower: &HashMap<i64, Vec<u8>>,
+        upper: &HashMap<i64, Vec<u8>>,
+        counts: &Counts,
+    ) -> bool {
+        match self {
+            Node::True => true,
+            // A comparison is never true on NULL: an all-NULL column
+            // matches nothing (ADR 0049).
+            Node::Cmp(p) => {
+                if counts.all_null(p.field_id) {
+                    return false;
+                }
+                let lo = lower.get(&p.field_id).and_then(|b| p.prim.decode(b));
+                let hi = upper.get(&p.field_id).and_then(|b| p.prim.decode(b));
+                p.op.may_match(lo.as_ref(), hi.as_ref(), &p.value)
+            }
+            Node::Null(id, true) => !counts.no_null(*id),
+            Node::Null(id, false) => !counts.all_null(*id),
+            Node::And(n) => n.iter().all(|n| n.file(lower, upper, counts)),
+            Node::Or(n) => n.iter().any(|n| n.file(lower, upper, counts)),
+        }
+    }
+
+    fn manifest(&self, spec: &[Option<PartitionField>], summaries: &[Summary]) -> bool {
+        match self {
+            Node::True | Node::Null(..) => true,
+            Node::Cmp(p) => spec.iter().zip(summaries).all(|(field, (lo, hi))| {
+                let Some(field) = field.as_ref().filter(|f| f.source_id == p.field_id) else {
+                    return true;
+                };
+                let Some((op, v, prim)) = transformed(p, field.transform) else {
+                    return true;
+                };
+                let lo = lo.as_deref().and_then(|b| prim.decode(b));
+                let hi = hi.as_deref().and_then(|b| prim.decode(b));
+                op.may_match(lo.as_ref(), hi.as_ref(), &v)
+            }),
+            Node::And(n) => n.iter().all(|n| n.manifest(spec, summaries)),
+            Node::Or(n) => n.iter().any(|n| n.manifest(spec, summaries)),
+        }
+    }
+}
+
+impl Pruner {
+    /// `columns`: column path -> (field id, type) for the current schema.
+    pub(super) fn new(filters: &[Expr], columns: &HashMap<String, (i64, Prim)>) -> Self {
+        Self {
+            root: Node::and(filters.iter().map(|f| node(f, columns)).collect()),
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        matches!(self.root, Node::True)
+    }
+
+    /// File-level: `lower`/`upper` are the data file's column bounds,
+    /// `counts` its value and null counts.
+    pub(super) fn may_match_file(
+        &self,
+        lower: &HashMap<i64, Vec<u8>>,
+        upper: &HashMap<i64, Vec<u8>>,
+        counts: &Counts,
+    ) -> bool {
+        self.root.file(lower, upper, counts)
+    }
+
+    /// Manifest-level: `summaries[i]` = (lower, upper) bound of partition
+    /// field `spec[i]` across the manifest.
+    pub(super) fn may_match_manifest(
+        &self,
+        spec: &[Option<PartitionField>],
+        summaries: &[Summary],
+    ) -> bool {
+        self.root.manifest(spec, summaries)
+    }
 }
 
 /// Per-column counts of a data file (`value_counts` includes nulls).
@@ -170,71 +283,6 @@ impl Counts {
 
     fn no_null(&self, id: i64) -> bool {
         self.nulls.get(&id) == Some(&0)
-    }
-}
-
-impl Pruner {
-    /// `columns`: column name -> (field id, type) for the current schema.
-    pub(super) fn new(filters: &[Expr], columns: &HashMap<String, (i64, Prim)>) -> Self {
-        let mut pruner = Self::default();
-        for f in filters {
-            collect(f, columns, &mut pruner.preds, &mut pruner.null_checks);
-        }
-        pruner
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.preds.is_empty() && self.null_checks.is_empty()
-    }
-
-    /// File-level: `lower`/`upper` are the data file's column bounds,
-    /// `counts` its value and null counts.
-    pub(super) fn may_match_file(
-        &self,
-        lower: &HashMap<i64, Vec<u8>>,
-        upper: &HashMap<i64, Vec<u8>>,
-        counts: &Counts,
-    ) -> bool {
-        // A comparison is never true on NULL: an all-NULL column matches
-        // nothing (ADR 0049).
-        let compared = self.preds.iter().all(|p| {
-            if counts.all_null(p.field_id) {
-                return false;
-            }
-            let lo = lower.get(&p.field_id).and_then(|b| p.prim.decode(b));
-            let hi = upper.get(&p.field_id).and_then(|b| p.prim.decode(b));
-            p.op.may_match(lo.as_ref(), hi.as_ref(), &p.value)
-        });
-        compared
-            && self.null_checks.iter().all(|&(id, is_null)| {
-                if is_null {
-                    !counts.no_null(id)
-                } else {
-                    !counts.all_null(id)
-                }
-            })
-    }
-
-    /// Manifest-level: `summaries[i]` = (lower, upper) bound of partition
-    /// field `spec[i]` across the manifest.
-    pub(super) fn may_match_manifest(
-        &self,
-        spec: &[Option<PartitionField>],
-        summaries: &[Summary],
-    ) -> bool {
-        self.preds.iter().all(|p| {
-            spec.iter().zip(summaries).all(|(field, (lo, hi))| {
-                let Some(field) = field.as_ref().filter(|f| f.source_id == p.field_id) else {
-                    return true;
-                };
-                let Some((op, v, prim)) = transformed(p, field.transform) else {
-                    return true;
-                };
-                let lo = lo.as_deref().and_then(|b| prim.decode(b));
-                let hi = hi.as_deref().and_then(|b| prim.decode(b));
-                op.may_match(lo.as_ref(), hi.as_ref(), &v)
-            })
-        })
     }
 }
 
@@ -285,47 +333,26 @@ fn transformed(p: &Pred, t: Transform) -> Option<(Op, Datum, Prim)> {
     Some((op, Datum::Int(tv), Prim::Int))
 }
 
-fn collect(
-    e: &Expr,
-    columns: &HashMap<String, (i64, Prim)>,
-    out: &mut Vec<Pred>,
-    nulls: &mut Vec<(i64, bool)>,
-) {
+fn node(e: &Expr, columns: &HashMap<String, (i64, Prim)>) -> Node {
     match e {
         Expr::BinaryExpr(BinaryExpr {
             left,
             op: Operator::And,
             right,
-        }) => {
-            collect(left, columns, out, nulls);
-            collect(right, columns, out, nulls);
-        }
-        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
-            if let Some(&(id, _)) = path(inner).and_then(|p| columns.get(&p)) {
-                nulls.push((id, matches!(e, Expr::IsNull(_))));
-            }
-        }
+        }) => Node::and(vec![node(left, columns), node(right, columns)]),
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Or,
+            right,
+        }) => Node::or(vec![node(left, columns), node(right, columns)]),
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-            let op = match op {
-                Operator::Eq => Op::Eq,
-                Operator::Lt => Op::Lt,
-                Operator::LtEq => Op::LtEq,
-                Operator::Gt => Op::Gt,
-                Operator::GtEq => Op::GtEq,
-                _ => return,
+            let Some(op) = cmp_op(*op) else {
+                return Node::True;
             };
             match (left.as_ref(), right.as_ref()) {
-                (e, Expr::Literal(v, _)) => {
-                    if let Some(name) = path(e) {
-                        push(&name, op, v, columns, out);
-                    }
-                }
-                (Expr::Literal(v, _), e) => {
-                    if let Some(name) = path(e) {
-                        push(&name, op.flip(), v, columns, out);
-                    }
-                }
-                _ => {}
+                (e, Expr::Literal(v, _)) => cmp(e, op, v, columns),
+                (Expr::Literal(v, _), e) => cmp(e, op.flip(), v, columns),
+                _ => Node::True,
             }
         }
         Expr::Between(Between {
@@ -333,15 +360,81 @@ fn collect(
             negated: false,
             low,
             high,
-        }) => {
-            if let (Some(name), Expr::Literal(lo, _), Expr::Literal(hi, _)) =
-                (path(expr), low.as_ref(), high.as_ref())
-            {
-                push(&name, Op::GtEq, lo, columns, out);
-                push(&name, Op::LtEq, hi, columns, out);
+        }) => match (low.as_ref(), high.as_ref()) {
+            (Expr::Literal(lo, _), Expr::Literal(hi, _)) => Node::and(vec![
+                cmp(expr, Op::GtEq, lo, columns),
+                cmp(expr, Op::LtEq, hi, columns),
+            ]),
+            _ => Node::True,
+        },
+        // `col IN (a, b)`: an OR of equalities (ADR 0050).
+        Expr::InList(InList {
+            expr,
+            list,
+            negated: false,
+        }) => Node::or(
+            list.iter()
+                .map(|v| match v {
+                    Expr::Literal(v, _) => cmp(expr, Op::Eq, v, columns),
+                    _ => Node::True,
+                })
+                .collect(),
+        ),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            match path(inner).and_then(|p| columns.get(&p)) {
+                Some(&(id, _)) => Node::Null(id, matches!(e, Expr::IsNull(_))),
+                None => Node::True,
             }
         }
-        _ => {}
+        // `NOT` only where the negation is exact under SQL's three-valued
+        // logic: NOT (x > 5) is x <= 5 for non-NULL x, and NULL either way.
+        Expr::Not(inner) => match inner.as_ref() {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                let negated = match cmp_op(*op) {
+                    Some(Op::Gt) => Op::LtEq,
+                    Some(Op::GtEq) => Op::Lt,
+                    Some(Op::Lt) => Op::GtEq,
+                    Some(Op::LtEq) => Op::Gt,
+                    _ => return Node::True,
+                };
+                match (left.as_ref(), right.as_ref()) {
+                    (e, Expr::Literal(v, _)) => cmp(e, negated, v, columns),
+                    (Expr::Literal(v, _), e) => cmp(e, negated.flip(), v, columns),
+                    _ => Node::True,
+                }
+            }
+            Expr::IsNull(x) => node(&Expr::IsNotNull(x.clone()), columns),
+            Expr::IsNotNull(x) => node(&Expr::IsNull(x.clone()), columns),
+            _ => Node::True,
+        },
+        _ => Node::True,
+    }
+}
+
+fn cmp_op(op: Operator) -> Option<Op> {
+    Some(match op {
+        Operator::Eq => Op::Eq,
+        Operator::Lt => Op::Lt,
+        Operator::LtEq => Op::LtEq,
+        Operator::Gt => Op::Gt,
+        Operator::GtEq => Op::GtEq,
+        _ => return None,
+    })
+}
+
+/// `e <op> v` when `e` is a prunable column path and `v` converts exactly.
+fn cmp(e: &Expr, op: Op, v: &ScalarValue, columns: &HashMap<String, (i64, Prim)>) -> Node {
+    let Some(&(field_id, prim)) = path(e).and_then(|p| columns.get(&p)) else {
+        return Node::True;
+    };
+    match literal(prim, v) {
+        Some(value) => Node::Cmp(Pred {
+            field_id,
+            prim,
+            op,
+            value,
+        }),
+        None => Node::True,
     }
 }
 
@@ -365,26 +458,6 @@ fn path(e: &Expr) -> Option<String> {
             Some(out)
         }
         _ => None,
-    }
-}
-
-fn push(
-    name: &str,
-    op: Op,
-    v: &ScalarValue,
-    columns: &HashMap<String, (i64, Prim)>,
-    out: &mut Vec<Pred>,
-) {
-    let Some(&(field_id, prim)) = columns.get(name) else {
-        return;
-    };
-    if let Some(value) = literal(prim, v) {
-        out.push(Pred {
-            field_id,
-            prim,
-            op,
-            value,
-        });
     }
 }
 
@@ -426,6 +499,7 @@ fn literal(prim: Prim, v: &ScalarValue) -> Option<Datum> {
 mod tests {
     use super::*;
     use datafusion::prelude::{col, lit};
+    use std::ops::Not;
 
     fn columns() -> HashMap<String, (i64, Prim)> {
         HashMap::from([
@@ -463,8 +537,23 @@ mod tests {
         assert!(!keep(col("id").gt(lit(5i64)).and(col("city").eq(lit("z")))));
         assert!(keep(col("city").eq(lit("c"))));
 
+        // OR: pruned when every branch is (ADR 0050).
+        assert!(!keep(col("id").gt(lit(20i64)).or(col("id").lt(lit(0i64)))));
+        assert!(keep(col("id").gt(lit(20i64)).or(col("id").eq(lit(15i64)))));
+        // An unknown branch makes the OR unknown.
+        assert!(keep(col("id").gt(lit(20i64)).or(col("nope").eq(lit(0i64)))));
+        // IN lists: an OR of equalities.
+        assert!(!keep(col("id").in_list(vec![lit(1i64), lit(30i64)], false)));
+        assert!(keep(col("id").in_list(vec![lit(1i64), lit(15i64)], false)));
+        assert!(keep(col("id").in_list(vec![lit(1i64), lit(30i64)], true))); // NOT IN
+        assert!(!keep(col("city").in_list(vec![lit("a"), lit("z")], false)));
+        // NOT on comparisons, exact under three-valued logic.
+        assert!(!keep(col("id").lt_eq(lit(20i64)).not()));
+        assert!(keep(col("id").lt(lit(20i64)).not()));
+        assert!(keep(col("id").eq(lit(15i64)).not())); // NOT = is `<>`: not provable
+
         // Not provable -> keep.
-        assert!(keep(col("id").gt(lit(20i64)).or(col("id").lt(lit(0i64)))));
+
         assert!(keep(col("score").gt(lit(1_000i64)))); // no bounds for score
         assert!(keep(col("nope").gt(lit(1i64))));
         assert!(keep(col("id").not_eq(lit(15i64))));
