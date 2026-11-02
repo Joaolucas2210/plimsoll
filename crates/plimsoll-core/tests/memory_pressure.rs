@@ -133,3 +133,89 @@ async fn sort_spills_under_ceiling_when_disk_configured() -> Result<()> {
     assert_eq!(pool.used(), 0);
     Ok(())
 }
+
+/// Many queries race past the ceiling at once (the concurrent variant of
+/// `query_fails_naming_consumers_and_node_survives`). 32 MiB fits one
+/// self-join of `big`, not eight. Every query either
+/// returns the exact answer or fails alone with `ResourcesExhausted`: no
+/// panic, no other error. Small queries in the middle of the storm succeed,
+/// the pool drains to zero, and the node keeps serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_queries_fail_alone_under_the_ceiling() -> Result<()> {
+    let pool = Arc::new(CeilingPool::new(48 * MIB, 512 * 1024)?);
+    let ctx = session_context_with_ceiling(Arc::clone(&pool), None, config())?;
+    register_big(&ctx)?;
+    const ROWS: usize = 25 * 8192; // keys are unique: a self-join returns every row
+
+    let join = |ctx: SessionContext| async move {
+        let rows: Result<usize> = async {
+            let out = ctx
+                .table("big")
+                .await?
+                .join(
+                    ctx.table("big2").await?,
+                    JoinType::Inner,
+                    &["k"],
+                    &["k2"],
+                    None,
+                )?
+                .collect()
+                .await?;
+            Ok(out.iter().map(|b| b.num_rows()).sum())
+        }
+        .await;
+        rows
+    };
+    let small = |ctx: SessionContext| async move {
+        let out = ctx
+            .table("big")
+            .await?
+            .limit(0, Some(10))?
+            .collect()
+            .await?;
+        Ok::<_, DataFusionError>(out.iter().map(|b| b.num_rows()).sum::<usize>())
+    };
+
+    let joins: Vec<_> = (0..8).map(|_| tokio::spawn(join(ctx.clone()))).collect();
+    let smalls: Vec<_> = (0..8).map(|_| tokio::spawn(small(ctx.clone()))).collect();
+
+    let (mut ok, mut exhausted) = (0, 0);
+    for h in joins {
+        match h
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+        {
+            Ok(rows) => {
+                assert_eq!(rows, ROWS, "a join that finishes is exact");
+                ok += 1;
+            }
+            Err(e) => {
+                assert!(
+                    matches!(e.find_root(), DataFusionError::ResourcesExhausted(_)),
+                    "only the ceiling may fail a query: {e:?}"
+                );
+                exhausted += 1;
+            }
+        }
+    }
+    assert!(
+        exhausted > 0,
+        "8 joins of ~10 MiB each cannot all fit in 8 MiB"
+    );
+    for h in smalls {
+        let rows = h
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))??;
+        assert_eq!(rows, 10, "small queries are not starved by the storm");
+    }
+    eprintln!("joins: {ok} ok, {exhausted} exhausted");
+
+    // Everything released; the node serves the next query, and the ceiling
+    // fits one join on its own: the failures above were contention, not a
+    // query that could never run.
+    assert_eq!(pool.used(), 0);
+    assert_eq!(small(ctx.clone()).await?, 10);
+    assert_eq!(join(ctx.clone()).await?, ROWS);
+    assert_eq!(pool.used(), 0);
+    Ok(())
+}

@@ -17,7 +17,8 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Parquet scans from local/object storage under the ceiling, spill enabled (S3 via ADR 0009)
 - [x] Iceberg table reads (metadata → manifests → Parquet) under the ceiling (ADR 0007)
 - [x] Test: a query exceeding the ceiling fails with `memory_limit_exceeded`
-      and the next query on the same node succeeds (concurrent variant: TODO)
+      and the next query on the same node succeeds; concurrent variant: 8 joins
+      racing past a ceiling that fits one, each exact or failing alone
 
 ## Phase 2 — Postgres federation
 
@@ -65,9 +66,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Concurrent memory test** (Phase 1's open TODO): many queries racing past
-the ceiling at once, each failing alone with `memory_limit_exceeded` while
-the rest and the next query succeed, and the pool returning to zero.
+**Query cancellation**: `DELETE /v1/queries/{id}` (owner or operator)
+stops a running query, releases its memory and admission slot, and is
+recorded as `cancelled` in `system.runtime.queries`.
 
 ## Later
 
