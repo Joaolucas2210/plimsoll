@@ -34,6 +34,8 @@ pub struct Config {
     pub otlp: Option<OtlpConfig>,
     /// How often catalog listings are refreshed; zero = boot only (ADR 0033).
     pub catalog_refresh: Duration,
+    /// Percent of the memory ceiling each capped group may hold (ADR 0036).
+    pub group_memory: HashMap<String, u8>,
 }
 
 impl Config {
@@ -74,6 +76,7 @@ impl Config {
             "expected a non-negative integer",
         )?;
 
+        let (groups, group_memory) = resource_groups(&lookup)?;
         let global = Limits {
             max_running,
             max_queued,
@@ -86,7 +89,7 @@ impl Config {
                 max_running: user_running,
                 max_queued,
             },
-            groups: resource_groups(&lookup)?,
+            groups,
         };
         let auth = Auth::from_lookup(&lookup, &|g| admission.has_group(g))?;
         Ok(Self {
@@ -98,6 +101,7 @@ impl Config {
             auth,
             otlp: otlp(&lookup)?,
             catalog_refresh: Duration::from_millis(refresh_ms),
+            group_memory,
         })
     }
 }
@@ -159,13 +163,16 @@ fn otlp(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<OtlpConfig>, 
     }))
 }
 
+type GroupConfig = (HashMap<String, Limits>, HashMap<String, u8>);
+
 /// `PLIMSOLL_RESOURCE_GROUPS=interactive=4/16,batch=2/64`: per group, max
 /// running / max queued (ADR 0023).
-fn resource_groups(
-    lookup: &impl Fn(&str) -> Option<String>,
-) -> Result<HashMap<String, Limits>, ConfigError> {
+/// Optionally with a share of the memory ceiling: `batch=2/64/40%`
+/// (ADR 0036).
+fn resource_groups(lookup: &impl Fn(&str) -> Option<String>) -> Result<GroupConfig, ConfigError> {
     const VAR: &str = "PLIMSOLL_RESOURCE_GROUPS";
     let mut groups = HashMap::new();
+    let mut shares = HashMap::new();
     for entry in lookup(VAR).unwrap_or_default().split(',').map(str::trim) {
         if entry.is_empty() {
             continue;
@@ -175,9 +182,14 @@ fn resource_groups(
             value: entry.to_owned(),
             reason,
         };
-        let shape = "expected `name=<running>/<queued>` entries";
+        let shape = "expected `name=<running>/<queued>[/<memory>%]` entries";
         let (name, limits) = entry.split_once('=').ok_or_else(|| err(shape))?;
-        let (running, queued) = limits.split_once('/').ok_or_else(|| err(shape))?;
+        let mut parts = limits.split('/');
+        let (Some(running), Some(queued), share, None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(err(shape));
+        };
         let name = name.trim();
         if name.is_empty()
             || !name
@@ -196,8 +208,17 @@ fn resource_groups(
         if groups.insert(name.to_owned(), limits).is_some() {
             return Err(err("group defined twice"));
         }
+        if let Some(share) = share {
+            let percent: u8 = share
+                .trim()
+                .strip_suffix('%')
+                .and_then(|p| p.parse().ok())
+                .filter(|p| (1..=100).contains(p))
+                .ok_or_else(|| err("memory share is 1%..100%"))?;
+            shares.insert(name.to_owned(), percent);
+        }
     }
-    Ok(groups)
+    Ok((groups, shares))
 }
 
 fn parse<T: std::str::FromStr>(
@@ -255,7 +276,15 @@ mod tests {
         assert_eq!((g["batch"].max_running, g["batch"].max_queued), (2, 64));
         assert_eq!(g["interactive"].max_queued, 0);
         assert!(c.admission.has_group("default"));
+        assert!(c.group_memory.is_empty());
+        let c = cfg(&[("PLIMSOLL_RESOURCE_GROUPS", "batch=2/64/40%,adhoc=1/1")]).unwrap();
+        assert_eq!(c.group_memory, HashMap::from([("batch".to_owned(), 40)]));
+        assert_eq!(c.admission.groups["batch"].max_queued, 64);
         for bad in [
+            "batch=2/64/0%",
+            "batch=2/64/101%",
+            "batch=2/64/40",
+            "batch=2/64/40%/x",
             "batch",
             "batch=2",
             "batch=0/1",

@@ -35,7 +35,7 @@ impl MemoryPool for CeilingPool {
         } else {
             ConsumerKind::NonSpillable
         };
-        self.register_id(consumer.id(), consumer.name().to_owned(), kind);
+        self.register_id(consumer.id(), consumer.name().to_owned(), kind, None);
     }
 
     fn unregister(&self, consumer: &MemoryConsumer) {
@@ -62,6 +62,82 @@ impl MemoryPool for CeilingPool {
 
     fn memory_limit(&self) -> MemoryLimit {
         MemoryLimit::Finite(self.limit)
+    }
+}
+
+/// The process pool seen by one query of a resource group (ADR 0036): every
+/// consumer it registers counts against the group's share as well as the
+/// ceiling. Used as the memory pool of that query's runtime.
+#[derive(Debug)]
+pub struct GroupPool {
+    pool: Arc<CeilingPool>,
+    group: Arc<str>,
+}
+
+impl GroupPool {
+    pub fn new(pool: Arc<CeilingPool>, group: Arc<str>) -> Self {
+        Self { pool, group }
+    }
+
+    /// `runtime` with its memory pool replaced by this group's view; disk,
+    /// caches and object stores stay shared.
+    pub fn runtime(self, runtime: &RuntimeEnv) -> Arc<RuntimeEnv> {
+        Arc::new(RuntimeEnv {
+            memory_pool: Arc::new(self),
+            disk_manager: runtime.disk_manager.clone(),
+            cache_manager: runtime.cache_manager.clone(),
+            object_store_registry: runtime.object_store_registry.clone(),
+        })
+    }
+}
+
+impl std::fmt::Display for GroupPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} group {}", self.pool, self.group)
+    }
+}
+
+impl MemoryPool for GroupPool {
+    fn name(&self) -> &str {
+        "plimsoll-ceiling-group"
+    }
+
+    fn register(&self, consumer: &MemoryConsumer) {
+        let kind = if consumer.can_spill() {
+            ConsumerKind::Spillable
+        } else {
+            ConsumerKind::NonSpillable
+        };
+        self.pool.register_id(
+            consumer.id(),
+            consumer.name().to_owned(),
+            kind,
+            Some(self.group.clone()),
+        );
+    }
+
+    fn unregister(&self, consumer: &MemoryConsumer) {
+        self.pool.unregister(consumer);
+    }
+
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.pool.grow(reservation, additional);
+    }
+
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.pool.shrink(reservation, shrink);
+    }
+
+    fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
+        self.pool.try_grow(reservation, additional)
+    }
+
+    fn reserved(&self) -> usize {
+        self.pool.reserved()
+    }
+
+    fn memory_limit(&self) -> MemoryLimit {
+        self.pool.memory_limit()
     }
 }
 

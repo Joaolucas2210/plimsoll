@@ -43,10 +43,11 @@ are allowed in place.
 | [0033](0033-live-catalog-listings.md) | Live catalog listings | Accepted | 2026-11-01 | A periodic re-list (`PLIMSOLL_CATALOG_REFRESH_MS`, 60 s) updates table names and registers new namespaces; list-then-swap so a catalog error changes nothing; never shadows env tables | 0008, 0030 |
 | [0034](0034-query-cancellation.md) | Query cancellation | Accepted | 2026-11-01 | `DELETE /v1/queries/{id}`: a per-query `Notify` in the registry races the deadline; cancelling drops the governed future (queue wait or execution); owners and operators only, others get 404; the query answers `409 query_cancelled` | 0013, 0021, 0022, 0026 |
 | [0035](0035-streamed-results.md) | Streamed results (NDJSON) | Accepted | 2026-11-02 | `"format": "ndjson"`: the governed query runs in its own task and sends 1024-row chunks, each reserved until written, through a 2-slot channel; errors before the header keep HTTP statuses; a dropped body cancels the query | 0003, 0012, 0013, 0027, 0034 |
+| [0036](0036-group-memory-shares.md) | Memory shares per resource group | Accepted | 2026-11-02 | `PLIMSOLL_RESOURCE_GROUPS=batch=2/64/40%`: the `CeilingPool` caps a group's consumers together; queries of a capped group run on a `GroupPool` view of the pool in a per-query runtime; uncapped groups untouched | 0003, 0018, 0023, 0035 |
 
 ## Reading order
 
-- Invariant first: 0003 (memory, with 0012 and 0018), 0005 (correctness).
+- Invariant first: 0003 (memory, with 0012, 0018 and 0036), 0005 (correctness).
 - Shape of the system: 0001, 0002, 0004.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032.
 - Federation: 0005 → 0006.

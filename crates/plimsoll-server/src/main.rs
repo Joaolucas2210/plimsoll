@@ -57,9 +57,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // line too (ADR 0018). ponytail: fixed split; make it config when a
     // deployment needs a bigger footer/delete cache.
     let limit = usize::try_from(cfg.memory_limit_bytes)?;
-    let pool = Arc::new(
-        CeilingPool::new(limit, limit / 8)?.with_cache_reserve((limit / 16).min(64 << 20))?,
-    );
+    let mut pool =
+        CeilingPool::new(limit, limit / 8)?.with_cache_reserve((limit / 16).min(64 << 20))?;
+    // Resource groups with a memory share (ADR 0036): a percent of the line.
+    for (group, percent) in &cfg.group_memory {
+        pool = pool.with_group_share(group, limit / 100 * usize::from(*percent));
+    }
+    let pool = Arc::new(pool);
     // Unset = no spill: memory pressure fails the query (never the process).
     let spill_dir = std::env::var_os("PLIMSOLL_SPILL_DIR").map(std::path::PathBuf::from);
     if let Some(dir) = &spill_dir {
@@ -105,6 +109,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             limit_bytes: pool.limit() as u64,
             cache_reserve_bytes: pool.cache_reserve() as u64,
             spill_bytes_total: stats_engine.spilled_bytes_total(),
+            groups: pool
+                .group_usage()
+                .into_iter()
+                .map(|(g, share, used)| (g, share as u64, used as u64))
+                .collect(),
         }),
         query_timeout: cfg.query_timeout,
         ready: AtomicBool::new(false),

@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Memory shares per resource group: `batch=2/64/40%` caps the group's queries together, below the ceiling; per-group used/share gauges (ADR 0036)
 - [x] Streamed results: `"format": "ndjson"`, bounded by the chunks in flight, back-pressure to the scan, disconnect cancels (ADR 0035)
 - [x] Query cancellation: `DELETE /v1/queries/{id}` for owners and operators; queued or running; slot and memory released (ADR 0034)
 - [x] Live catalog listings: tables and namespaces created after boot appear in `SHOW TABLES` / `information_schema` (`PLIMSOLL_CATALOG_REFRESH_MS`) (ADR 0033)
@@ -68,10 +69,10 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Memory shares per resource group**: groups bound running/queued counts
-(ADR 0023) but not memory, so one group's big queries can take the whole
-ceiling. Give each group a share of the pool (`batch=2/64/40%`) enforced by
-the `CeilingPool`, so interactive queries keep their headroom.
+**Arrow IPC results**: `"format": "arrow"` streams
+`application/vnd.apache.arrow.stream` on the same chunk path as NDJSON
+(ADR 0035): typed, columnar and several times smaller, for notebooks and
+analytical clients (pyarrow, polars, DuckDB read it directly).
 
 ## Later
 

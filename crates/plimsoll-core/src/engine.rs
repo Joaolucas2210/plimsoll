@@ -17,6 +17,7 @@ use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::SQLOptions;
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -24,7 +25,7 @@ use futures::StreamExt;
 
 use crate::federation::preevaluate_scalar_subqueries;
 use crate::memory::{
-    CeilingPool, ConsumerKind, Reservation, session_context_with_ceiling, spilled_bytes,
+    CeilingPool, ConsumerKind, GroupPool, Reservation, session_context_with_ceiling, spilled_bytes,
 };
 
 /// Medallion convention: these schemas always exist in the default catalog.
@@ -56,6 +57,12 @@ impl std::fmt::Debug for QueryResult {
 /// server's caller identity); the engine only asks.
 pub trait TableAccess: Send + Sync + 'static {
     fn check(&self, table: &ResolvedTableReference) -> Result<()>;
+
+    /// The resource group the query runs in; its memory share, if any,
+    /// caps every reservation the query makes (ADR 0036).
+    fn resource_group(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// The caller may not read `table`. Returned (wrapped in
@@ -141,8 +148,23 @@ impl Engine {
 
     fn context_for<T: TableAccess>(&self, access: Arc<T>) -> SessionContext {
         let mut state = self.ctx.state();
+        // A capped group gets its own view of the pool (ADR 0036).
+        if let Some(group) = self.capped_group(access.as_ref()) {
+            let runtime = GroupPool::new(self.pool.clone(), group).runtime(state.runtime_env());
+            state = SessionStateBuilder::new_from_existing(state)
+                .with_runtime_env(runtime)
+                .build();
+        }
         state.config_mut().set_extension(access);
         SessionContext::new_with_state(state)
+    }
+
+    /// `access`'s resource group when it has a memory share.
+    pub fn capped_group(&self, access: &dyn TableAccess) -> Option<Arc<str>> {
+        access
+            .resource_group()
+            .filter(|g| self.pool.group_share(g).is_some())
+            .map(Arc::from)
     }
 
     async fn run(
@@ -153,7 +175,10 @@ impl Engine {
     ) -> Result<QueryResult> {
         let started = Instant::now();
         let mut query = self.plan_stream(ctx, sql, access).await?;
-        let mut output = self.pool.register("query-output", ConsumerKind::Output);
+        let group = access.and_then(|a| self.capped_group(a));
+        let mut output =
+            self.pool
+                .register_in(group.as_ref(), "query-output", ConsumerKind::Output);
         let mut batches = Vec::new();
         while let Some(batch) = query.stream.next().await {
             let batch = batch?;
@@ -377,5 +402,66 @@ mod tests {
             );
         }
         assert_eq!(e.pool().used(), 0);
+    }
+
+    /// A query in a capped group fails on its group's share while the
+    /// ceiling still has room; the same query outside the group runs.
+    #[tokio::test]
+    async fn group_share_caps_a_query_below_the_ceiling() {
+        struct In(Option<&'static str>);
+        impl TableAccess for In {
+            fn check(&self, _: &ResolvedTableReference) -> Result<()> {
+                Ok(())
+            }
+            fn resource_group(&self) -> Option<&str> {
+                self.0
+            }
+        }
+        let pool = Arc::new(
+            CeilingPool::new(64 << 20, 8 << 20)
+                .unwrap()
+                .with_group_share("batch", 1 << 20),
+        );
+        let e = Engine::new(pool.clone(), None).unwrap();
+        let sql = "SELECT a.value FROM range(300000) a JOIN range(300000) b ON a.value = b.value";
+        let err = e
+            .sql_with(sql, Arc::new(In(Some("batch"))))
+            .await
+            .unwrap_err();
+        // Some operators (the spill pool) replace the pool's message with
+        // their own; the class is what clients see (memory_limit_exceeded),
+        // and the same query outside the group runs (below).
+        assert!(
+            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{err}"
+        );
+        // Partition tasks spawned by DataFusion drop their reservations
+        // as they wind down, just after the error is returned.
+        for _ in 0..200 {
+            if pool.used() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(pool.used(), 0);
+        assert_eq!(pool.group_used("batch"), 0);
+        // Ungrouped and other groups: only the ceiling applies.
+        for group in [None, Some("adhoc")] {
+            let ok = e.sql_with(sql, Arc::new(In(group))).await.unwrap();
+            assert_eq!(
+                ok.batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                300_000
+            );
+        }
+        // A small query in the group fits its share.
+        let ok = e
+            .sql_with(
+                "SELECT count(*) FROM range(1000)",
+                Arc::new(In(Some("batch"))),
+            )
+            .await
+            .unwrap();
+        drop(ok);
+        assert_eq!(pool.used(), 0);
     }
 }

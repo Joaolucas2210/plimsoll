@@ -671,7 +671,8 @@ async fn run_sql(
         resource_group: group,
         sql: req.sql,
     };
-    let viewer = st.auth.viewer(&request.user);
+    let mut viewer = st.auth.viewer(&request.user);
+    viewer.group = Some(request.resource_group.clone());
     match req.format.as_deref() {
         None | Some("json") => {}
         Some("ndjson") => return stream_sql(shared, request, viewer, Instant::now(), log).await,
@@ -777,6 +778,7 @@ mod tests {
                 limit_bytes: 1024,
                 cache_reserve_bytes: 0,
                 spill_bytes_total: 0,
+                groups: vec![],
             }),
             query_timeout: timeout,
             ready: AtomicBool::new(true),

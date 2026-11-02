@@ -234,6 +234,7 @@ impl Auth {
             return Viewer {
                 only: None,
                 schemas: None,
+                group: None,
             };
         };
         Viewer {
@@ -241,6 +242,7 @@ impl Auth {
             schemas: grants
                 .as_ref()
                 .map(|g| g.get(principal).cloned().unwrap_or_default()),
+            group: None,
         }
     }
 
@@ -272,9 +274,15 @@ pub struct Viewer {
     pub only: Option<String>,
     /// Readable schemas (`*` = all). `None`: grants not configured.
     pub schemas: Option<HashSet<String>>,
+    /// The resource group the query runs in (memory share, ADR 0036).
+    pub group: Option<String>,
 }
 
 impl TableAccess for Viewer {
+    fn resource_group(&self) -> Option<&str> {
+        self.group.as_deref()
+    }
+
     fn check(&self, table: &ResolvedTableReference) -> DfResult<()> {
         let Some(schemas) = &self.schemas else {
             return Ok(());

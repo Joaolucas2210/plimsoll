@@ -14,13 +14,15 @@ use std::time::Duration;
 use plimsoll_control::governance::QueryTotals;
 
 /// Memory pool figures from the compute plane's CeilingPool.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PoolStats {
     pub used_bytes: u64,
     pub limit_bytes: u64,
     /// Part of the limit set aside for DataFusion's caches (ADR 0018).
     pub cache_reserve_bytes: u64,
     pub spill_bytes_total: u64,
+    /// `(group, share, used)` for resource groups with a share (ADR 0036).
+    pub groups: Vec<(String, u64, u64)>,
 }
 
 /// INTEGRATION POINT: a closure reading the live CeilingPool counters.
@@ -115,6 +117,31 @@ pub fn render(
         "Part of the ceiling reserved for file metadata/statistics/delete caches.",
         &[("", pool.cache_reserve_bytes)],
     );
+    let share: Vec<(String, u64)> = pool
+        .groups
+        .iter()
+        .map(|(g, share, _)| (format!("{{group=\"{g}\"}}"), *share))
+        .collect();
+    let used: Vec<(String, u64)> = pool
+        .groups
+        .iter()
+        .map(|(g, _, used)| (format!("{{group=\"{g}\"}}"), *used))
+        .collect();
+    fn refs(v: &[(String, u64)]) -> Vec<(&str, u64)> {
+        v.iter().map(|(l, n)| (l.as_str(), *n)).collect()
+    }
+    metric(
+        "plimsoll_pool_group_share_bytes",
+        "gauge",
+        "Memory a resource group's queries may hold together (ADR 0036).",
+        &refs(&share),
+    );
+    metric(
+        "plimsoll_pool_group_used_bytes",
+        "gauge",
+        "Bytes held by a resource group's queries.",
+        &refs(&used),
+    );
     metric(
         "plimsoll_spill_bytes_total",
         "counter",
@@ -184,6 +211,7 @@ mod tests {
             limit_bytes: 100,
             cache_reserve_bytes: 6,
             spill_bytes_total: 3,
+            groups: vec![("batch".into(), 40, 7)],
         };
         let totals = QueryTotals {
             finished: 4,
@@ -201,6 +229,8 @@ mod tests {
             "plimsoll_pool_limit_bytes 100",
             "plimsoll_pool_cache_reserve_bytes 6",
             "plimsoll_spill_bytes_total 3",
+            "plimsoll_pool_group_share_bytes{group=\"batch\"} 40",
+            "plimsoll_pool_group_used_bytes{group=\"batch\"} 7",
             "plimsoll_queries_running 2",
             "plimsoll_queries_queued 1",
             "plimsoll_queries_total{state=\"finished\"} 4",

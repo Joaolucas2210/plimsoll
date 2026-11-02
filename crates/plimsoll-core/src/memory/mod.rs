@@ -19,13 +19,18 @@
 //!
 //! Working operators can never eat the output slice, so a query that has
 //! produced results can always ship them out.
+//!
+//! Resource groups may hold a share of the line (ADR 0036): a consumer
+//! registered in a capped group fails once the group's bytes would cross
+//! its share, even with room under the ceiling, so one group's heavy queries
+//! cannot take memory the others were promised.
 //! See `docs/adr/0003-memory-ceiling.md`.
 
 mod accounted;
 mod df_adapter;
 
 pub use accounted::AccountedExec;
-pub use df_adapter::{runtime_env, session_context_with_ceiling, spilled_bytes};
+pub use df_adapter::{GroupPool, runtime_env, session_context_with_ceiling, spilled_bytes};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -84,6 +89,20 @@ pub enum CeilingError {
         cache_reserve: usize,
         top: Vec<ConsumerUsage>,
     },
+    /// The reservation would cross its resource group's share (ADR 0036).
+    #[error(
+        "memory ceiling: resource group '{group}' share exhausted: '{consumer}' requested \
+         {requested}B, {available}B of the group's {share}B available; top consumers: [{}]",
+        join(top)
+    )]
+    GroupExhausted {
+        group: String,
+        consumer: String,
+        requested: usize,
+        available: usize,
+        share: usize,
+        top: Vec<ConsumerUsage>,
+    },
     /// Output + cache reserves larger than `limit`.
     #[error(
         "output reserve {output_reserve}B + cache reserve {cache_reserve}B exceed limit {limit}B"
@@ -110,6 +129,8 @@ struct Entry {
     name: String,
     kind: ConsumerKind,
     bytes: usize,
+    /// Resource group, when the consumer was registered in one.
+    group: Option<Arc<str>>,
 }
 
 #[derive(Debug, Default)]
@@ -119,6 +140,8 @@ struct State {
     /// Bytes held by Output consumers.
     output: usize,
     consumers: HashMap<usize, Entry>,
+    /// Bytes held per resource group.
+    groups: HashMap<Arc<str>, usize>,
 }
 
 impl State {
@@ -136,6 +159,9 @@ pub struct CeilingPool {
     limit: usize,
     output_reserve: usize,
     cache_reserve: usize,
+    /// Byte caps per resource group (ADR 0036); groups not listed share the
+    /// ceiling freely.
+    group_shares: HashMap<String, usize>,
     // ponytail: one Mutex for all accounting; contention is per reservation
     // call (operators reserve in chunks), not per row. Shard if it shows up in profiles.
     state: Mutex<State>,
@@ -149,6 +175,7 @@ impl CeilingPool {
             limit,
             output_reserve,
             cache_reserve: 0,
+            group_shares: HashMap::new(),
             state: Mutex::default(),
         }
         .with_cache_reserve(0)
@@ -166,6 +193,36 @@ impl CeilingPool {
         }
         self.cache_reserve = bytes;
         Ok(self)
+    }
+
+    /// Caps consumers registered in `group` at `bytes` in total.
+    pub fn with_group_share(mut self, group: impl Into<String>, bytes: usize) -> Self {
+        self.group_shares.insert(group.into(), bytes);
+        self
+    }
+
+    pub fn group_share(&self, group: &str) -> Option<usize> {
+        self.group_shares.get(group).copied()
+    }
+
+    /// `(group, share, used)` for every capped group, by name.
+    pub fn group_usage(&self) -> Vec<(String, usize, usize)> {
+        let s = self.lock();
+        let mut v: Vec<_> = self
+            .group_shares
+            .iter()
+            .map(|(g, share)| {
+                let used = s.groups.get(g.as_str()).copied().unwrap_or(0);
+                (g.clone(), *share, used)
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Bytes currently held by consumers of `group`.
+    pub fn group_used(&self, group: &str) -> usize {
+        self.lock().groups.get(group).copied().unwrap_or(0)
     }
 
     pub fn limit(&self) -> usize {
@@ -204,8 +261,18 @@ impl CeilingPool {
 
     /// Register a native consumer. Dropping the returned reservation frees its bytes.
     pub fn register(self: &Arc<Self>, name: impl Into<String>, kind: ConsumerKind) -> Reservation {
+        self.register_in(None, name, kind)
+    }
+
+    /// [`Self::register`] counted against `group`'s share, if it has one.
+    pub fn register_in(
+        self: &Arc<Self>,
+        group: Option<&Arc<str>>,
+        name: impl Into<String>,
+        kind: ConsumerKind,
+    ) -> Reservation {
         let id = next_id();
-        self.register_id(id, name.into(), kind);
+        self.register_id(id, name.into(), kind, group.cloned());
         Reservation {
             pool: Arc::clone(self),
             id,
@@ -231,13 +298,16 @@ impl CeilingPool {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn register_id(&self, id: usize, name: String, kind: ConsumerKind) {
+    fn register_id(&self, id: usize, name: String, kind: ConsumerKind, group: Option<Arc<str>>) {
+        // Only capped groups are tracked: the others need no bookkeeping.
+        let group = group.filter(|g| self.group_shares.contains_key(g.as_ref()));
         self.lock().consumers.insert(
             id,
             Entry {
                 name,
                 kind,
                 bytes: 0,
+                group,
             },
         );
     }
@@ -247,16 +317,46 @@ impl CeilingPool {
         if let Some(e) = s.consumers.remove(&id) {
             let b = s.bucket(e.kind);
             *b = b.saturating_sub(e.bytes);
+            if let Some(g) = &e.group {
+                Self::group_sub(&mut s, g, e.bytes);
+            }
+        }
+    }
+
+    fn group_sub(s: &mut State, group: &Arc<str>, bytes: usize) {
+        if let Some(used) = s.groups.get_mut(group) {
+            *used = used.saturating_sub(bytes);
+            if *used == 0 {
+                s.groups.remove(group);
+            }
         }
     }
 
     fn try_grow_id(&self, id: usize, additional: usize) -> Result<(), CeilingError> {
         let mut s = self.lock();
-        let kind = s
+        let entry = s
             .consumers
             .get(&id)
-            .ok_or(CeilingError::UnknownConsumer(id))?
-            .kind;
+            .ok_or(CeilingError::UnknownConsumer(id))?;
+        let kind = entry.kind;
+        if let Some(group) = entry.group.clone() {
+            let share = self
+                .group_shares
+                .get(group.as_ref())
+                .copied()
+                .unwrap_or(usize::MAX);
+            let available = share.saturating_sub(s.groups.get(&group).copied().unwrap_or(0));
+            if additional > available {
+                return Err(CeilingError::GroupExhausted {
+                    group: group.to_string(),
+                    consumer: entry.name.clone(),
+                    requested: additional,
+                    available,
+                    share,
+                    top: top_of(&s, TOP_CONSUMERS),
+                });
+            }
+        }
         // Working consumers see the output slice as always taken.
         let taken = match kind {
             ConsumerKind::Output => s.work + s.output,
@@ -293,8 +393,11 @@ impl CeilingPool {
     fn add_id(&self, s: &mut State, id: usize, additional: usize) {
         if let Some(e) = s.consumers.get_mut(&id) {
             e.bytes += additional;
-            let kind = e.kind;
+            let (kind, group) = (e.kind, e.group.clone());
             *s.bucket(kind) += additional;
+            if let Some(g) = group {
+                *s.groups.entry(g).or_default() += additional;
+            }
         }
     }
 
@@ -303,8 +406,11 @@ impl CeilingPool {
         if let Some(e) = s.consumers.get_mut(&id) {
             let freed = bytes.min(e.bytes);
             e.bytes -= freed;
-            let kind = e.kind;
+            let (kind, group) = (e.kind, e.group.clone());
             *s.bucket(kind) -= freed;
+            if let Some(g) = group {
+                Self::group_sub(&mut s, &g, freed);
+            }
         }
     }
 }
@@ -557,6 +663,46 @@ mod tests {
         for h in threads {
             assert!(h.join().unwrap() <= LIMIT);
         }
+        assert_eq!(p.used(), 0);
+    }
+
+    #[test]
+    fn group_shares_cap_their_consumers_only() {
+        let p = Arc::new(
+            CeilingPool::new(1000, 100)
+                .unwrap()
+                .with_group_share("batch", 300),
+        );
+        let batch: Arc<str> = Arc::from("batch");
+        let adhoc: Arc<str> = Arc::from("adhoc"); // no share: not capped
+        let mut b1 = p.register_in(Some(&batch), "b1", Spillable);
+        let mut b2 = p.register_in(Some(&batch), "b2", Output);
+        b1.try_grow(200).unwrap();
+        b2.try_grow(100).unwrap();
+        assert_eq!(p.group_used("batch"), 300);
+        assert_eq!(p.group_usage(), [("batch".to_owned(), 300, 300)]);
+        // The group is full although the ceiling has room.
+        let err = b1.try_grow(1).unwrap_err();
+        assert!(
+            matches!(&err, CeilingError::GroupExhausted { group, available: 0, share: 300, .. } if group == "batch"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("resource group 'batch'"), "{err}");
+        // Other groups and ungrouped consumers still get the rest.
+        let mut a = p.register_in(Some(&adhoc), "a", NonSpillable);
+        a.try_grow(500).unwrap();
+        let mut plain = p.register("plain", NonSpillable);
+        // 700 working + the 100 output reserve held back: 200 left.
+        assert!(plain.try_grow(201).is_err(), "the ceiling still binds");
+        assert_eq!(p.group_used("adhoc"), 0, "uncapped groups are not tracked");
+        // Shrink and drop give the share back.
+        b1.shrink(150);
+        assert_eq!(p.group_used("batch"), 150);
+        b1.try_grow(150).unwrap();
+        drop(b1);
+        drop(b2);
+        assert_eq!(p.group_used("batch"), 0);
+        drop(a);
         assert_eq!(p.used(), 0);
     }
 }

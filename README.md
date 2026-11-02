@@ -108,7 +108,7 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_BIND` | `127.0.0.1:8080` | Listen address |
 | `PLIMSOLL_AUTH_TOKENS` | required | `ana:sha256:<hex>,etl:sha256:<hex>`: SHA-256 of each bearer token and its user (ADR 0021) |
 | `PLIMSOLL_AUTH_OPERATORS` | unset | Users (from the tokens) who see every query in `system.runtime.queries`; others see their own (ADR 0022) |
-| `PLIMSOLL_RESOURCE_GROUPS` | unset | `interactive=4/16,batch=2/64`: per group, max running / max queued; `default` always exists with the global limits (ADR 0023) |
+| `PLIMSOLL_RESOURCE_GROUPS` | unset | `interactive=4/16,batch=2/64/40%`: per group, max running / max queued (ADR 0023), and optionally a share of the memory ceiling that the group's queries together may hold (ADR 0036); `default` always exists with the global limits |
 | `PLIMSOLL_AUTH_GROUPS` | unset | `etl=batch,ana=interactive\|batch`: groups each user may use, first = their default; unlisted users get `default` (ADR 0023) |
 | `PLIMSOLL_AUTH_GRANTS` | unset | `ana=gold\|silver,etl=*`: schemas each user may read; once set, unlisted users read no data (system tables stay scoped per user) (ADR 0025) |
 | `PLIMSOLL_AUTH` | `required` | `disabled` = no authentication, `user` trusted from the body (development only) |

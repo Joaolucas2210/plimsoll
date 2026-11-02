@@ -231,9 +231,11 @@ impl QueryEngine for CoreEngine {
         tx: tokio::sync::mpsc::Sender<Chunk>,
     ) -> Result<Streamed, EngineError> {
         let started = Instant::now();
+        let viewer = Arc::new(viewer);
+        let group = self.0.capped_group(viewer.as_ref());
         let mut query = self
             .0
-            .sql_stream_with(sql, Arc::new(viewer))
+            .sql_stream_with(sql, viewer)
             .await
             .map_err(|e| classify(&e))?;
         let columns: Vec<String> = query
@@ -267,7 +269,10 @@ impl QueryEngine for CoreEngine {
                 serialization += serializing.elapsed();
                 // Reserved until the body takes it: the bytes in flight (the
                 // channel plus the chunk being written) stay under the ceiling.
-                let mut memory = self.0.pool().register("query-output", ConsumerKind::Output);
+                let mut memory =
+                    self.0
+                        .pool()
+                        .register_in(group.as_ref(), "query-output", ConsumerKind::Output);
                 memory
                     .try_grow(lines.len())
                     .map_err(|e| EngineError::MemoryLimitExceeded(e.to_string()))?;
