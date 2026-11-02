@@ -77,3 +77,6 @@ None of them pruned.
   | `id IN (2, 40)` | 2 rows | 2/3 (the `id = 1` file pruned) |
 
   Answers are unchanged with deletes applied.
+- `tests/iceberg.rs::prunes_a_partitioned_pyiceberg_table` (CI live
+  tests): `id = 3 OR id = 97` over 10 daily files used to read all 10.
+  It now reads 2/10 and still answers 2 rows.

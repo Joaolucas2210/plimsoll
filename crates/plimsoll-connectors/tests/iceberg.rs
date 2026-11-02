@@ -890,11 +890,11 @@ async fn prunes_a_partitioned_pyiceberg_table() {
         "manifests=10/10 files=1/10",
     )
     .await;
-    // OR is not provable: nothing pruned, result still right.
+    // OR prunes per branch (ADR 0050): only the files holding 3 and 97.
     check(
         "SELECT count(*) AS n FROM events WHERE id = 3 OR id = 97",
         "| 2 |",
-        "manifests=10/10 files=10/10",
+        "manifests=10/10 files=2/10",
     )
     .await;
 }
