@@ -17,10 +17,11 @@ use plimsoll_control::governance::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::auth::Auth;
-use crate::engine::{EngineError, QueryEngine, QueryOutput};
-use crate::log::{QueryLog, level_for};
+use crate::engine::{Chunk, EngineError, QueryEngine, QueryOutput, Streamed};
+use crate::log::{Level, QueryLog, level_for};
 use crate::metrics::{self, Latency, PoolStatsProvider};
 use crate::trace::{self, TraceContext, Tracer};
 use futures::StreamExt;
@@ -158,6 +159,9 @@ pub struct SqlRequest {
     pub user: Option<String>,
     #[serde(default)]
     pub resource_group: Option<String>,
+    /// `json` (default): one document. `ndjson`: streamed lines (ADR 0035).
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 /// Error contract (ADR 0013): `code` is stable and machine-readable;
@@ -320,8 +324,40 @@ async fn sql(
         ..Default::default()
     };
     let mut response = run_sql(&st, &headers, body, &mut log).await;
-    log.total = started.elapsed();
+    if let Ok(v) = HeaderValue::from_str(&ctx.traceparent()) {
+        response.headers_mut().insert("traceparent", v);
+    }
     let status = response.status().as_u16();
+    // A streamed result is logged when its last line is written (ADR 0035).
+    let deferred = response
+        .extensions_mut()
+        .remove::<Deferred>()
+        .and_then(|d| d.0.lock().unwrap_or_else(PoisonError::into_inner).take());
+    if let Some(outcome) = deferred {
+        tokio::spawn(async move {
+            let outcome = outcome
+                .await
+                .unwrap_or_else(|_| Outcome::failed("internal", "stream task ended"));
+            if let Some(s) = outcome.streamed {
+                log.planning = Some(s.phases.planning);
+                log.execution = Some(s.phases.execution);
+                log.serialization = Some(s.phases.serialization);
+            }
+            log.total = started.elapsed();
+            let error = outcome.error.as_ref().map(|(c, m)| (*c, m.as_str()));
+            let level = if error.is_some() {
+                Level::Warn
+            } else {
+                Level::Info
+            };
+            crate::log::emit(level, "query", log.fields(status, error));
+            if let (Some(tracer), true) = (&st.tracer, ctx.sampled) {
+                tracer.record(trace::spans(&ctx, wall, &log, status, error));
+            }
+        });
+        return response;
+    }
+    log.total = started.elapsed();
     let error = response
         .extensions()
         .get::<ErrorInfo>()
@@ -330,9 +366,217 @@ async fn sql(
     if let (Some(tracer), true) = (&st.tracer, ctx.sampled) {
         tracer.record(trace::spans(&ctx, wall, &log, status, error));
     }
-    if let Ok(v) = HeaderValue::from_str(&ctx.traceparent()) {
-        response.headers_mut().insert("traceparent", v);
+    response
+}
+
+/// How a streamed query ended, for its deferred log line and trace.
+struct Outcome {
+    error: Option<(&'static str, String)>,
+    streamed: Option<Streamed>,
+}
+
+impl Outcome {
+    fn failed(code: &'static str, message: impl ToString) -> Self {
+        Self {
+            error: Some((code, message.to_string())),
+            streamed: None,
+        }
     }
+}
+
+/// Marks a streamed response; `sql` logs once the outcome arrives.
+#[derive(Clone)]
+struct Deferred(Arc<Mutex<Option<oneshot::Receiver<Outcome>>>>);
+
+/// Lives in the response body: reports the outcome when the last line is
+/// written, or, if the body is dropped first (the client went away),
+/// cancels the query so its slot and memory are released at once.
+struct StreamGuard {
+    st: Arc<AppState>,
+    query_id: u64,
+    arrived: Instant,
+    outcome: Option<oneshot::Sender<Outcome>>,
+}
+
+impl StreamGuard {
+    fn finish(&mut self, outcome: Outcome) {
+        self.st.latency.total.observe(self.arrived.elapsed());
+        if let Some(code) = outcome.error.as_ref().map(|(c, _)| *c) {
+            self.st.errors.inc(code);
+        }
+        if let Some(tx) = self.outcome.take() {
+            let _ = tx.send(outcome);
+        }
+    }
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        if self.outcome.is_some() {
+            self.st.admission.registry().cancel(self.query_id);
+            self.finish(Outcome::failed(
+                "client_disconnected",
+                "the client closed the connection before the last row",
+            ));
+        }
+    }
+}
+
+/// The body's end of the channel. Dropped before the end (the client went
+/// away), it cancels the query *before* the receiver closes, so the query
+/// is recorded as cancelled rather than failing on its next send.
+struct Receiving {
+    rx: mpsc::Receiver<Chunk>,
+    st: Arc<AppState>,
+    query_id: u64,
+    drained: bool,
+}
+
+impl Drop for Receiving {
+    fn drop(&mut self) {
+        if !self.drained {
+            self.st.admission.registry().cancel(self.query_id);
+        }
+    }
+}
+
+fn ndjson_line(v: &serde_json::Value) -> Vec<u8> {
+    let mut line = v.to_string().into_bytes();
+    line.push(b'\n');
+    line
+}
+
+/// `format: "ndjson"` (ADR 0035): the governed query runs in its own task
+/// and sends NDJSON chunks through a bounded channel, so the response
+/// starts before the result is complete and memory holds only the chunks
+/// in flight. Admission, the deadline and cancellation cover the whole
+/// stream. Errors before the first line keep their HTTP status; later ones
+/// end the body with an `{"error": ..}` line.
+async fn stream_sql(
+    shared: Arc<AppState>,
+    request: QueryRequest,
+    viewer: crate::auth::Viewer,
+    arrived: Instant,
+    log: &mut QueryLog,
+) -> Response {
+    let (tx, mut rx) = mpsc::channel::<Chunk>(2);
+    let (done_tx, done_rx) = oneshot::channel();
+    let assigned = Arc::new(AtomicU64::new(0));
+    let queued_us = Arc::new(AtomicU64::new(0));
+    {
+        let (st, assigned, queued_us) = (shared.clone(), assigned.clone(), queued_us.clone());
+        tokio::spawn(async move {
+            let sql = request.sql.clone();
+            let engine = st.clone();
+            let result = st
+                .admission
+                .execute(request, st.query_timeout, move |id| {
+                    assigned.store(id, Ordering::Relaxed);
+                    let queued = arrived.elapsed();
+                    engine.latency.queue.observe(queued);
+                    queued_us.store(
+                        u64::try_from(queued.as_micros()).unwrap_or(u64::MAX),
+                        Ordering::Relaxed,
+                    );
+                    async move { engine.engine.stream(&sql, viewer, tx).await }
+                })
+                .await;
+            let _ = done_tx.send(result);
+        });
+    }
+    let first = rx.recv().await;
+    let query_id = Some(assigned.load(Ordering::Relaxed)).filter(|id| *id != 0);
+    log.query_id = query_id;
+    if query_id.is_some() {
+        log.queue = Some(Duration::from_micros(queued_us.load(Ordering::Relaxed)));
+    }
+    let st = shared.as_ref();
+    let (Some(Chunk::Header(columns)), Some(query_id)) = (first, query_id) else {
+        // No header: the query failed before producing a result (rejected,
+        // invalid, forbidden...). Answer with its status like `json` does.
+        if query_id.is_some() {
+            st.latency.total.observe(arrived.elapsed());
+        }
+        return match done_rx.await {
+            Ok(Err(e)) => ApiError::of(&e).respond(st, &e, query_id),
+            _ => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", false).respond(
+                st,
+                "stream ended without a header",
+                query_id,
+            ),
+        };
+    };
+    let (outcome_tx, outcome_rx) = oneshot::channel();
+    let mut guard = StreamGuard {
+        st: shared.clone(),
+        query_id,
+        arrived,
+        outcome: Some(outcome_tx),
+    };
+    let head = ndjson_line(&json!({ "query_id": query_id, "columns": columns }));
+    let receiving = Receiving {
+        rx,
+        st: shared.clone(),
+        query_id,
+        drained: false,
+    };
+    let rows = futures::stream::unfold(receiving, |mut r| async move {
+        let chunk = r.rx.recv().await;
+        r.drained = chunk.is_none();
+        chunk.map(|chunk| (chunk, r))
+    })
+    .map(|chunk| match chunk {
+        // The reservation ends as hyper takes the bytes.
+        Chunk::Rows(bytes, _memory) => bytes,
+        Chunk::Header(_) => Vec::new(),
+    });
+    let tail = futures::stream::once(async move {
+        let (line, outcome) = match done_rx.await {
+            Ok(Ok(s)) => {
+                guard.st.latency.planning.observe(s.phases.planning);
+                guard.st.latency.execution.observe(s.phases.execution);
+                guard
+                    .st
+                    .latency
+                    .serialization
+                    .observe(s.phases.serialization);
+                (
+                    json!({ "done": true, "rows": s.rows }),
+                    Outcome {
+                        error: None,
+                        streamed: Some(s),
+                    },
+                )
+            }
+            Ok(Err(e)) => {
+                let api = ApiError::of(&e);
+                let body = json!({ "error": {
+                    "code": api.code, "message": e.to_string(),
+                    "retryable": api.retryable, "query_id": query_id,
+                }});
+                (body, Outcome::failed(api.code, e))
+            }
+            Err(_) => (
+                json!({ "error": { "code": "internal", "message": "stream task ended",
+                                   "retryable": false, "query_id": query_id } }),
+                Outcome::failed("internal", "stream task ended"),
+            ),
+        };
+        guard.finish(outcome);
+        ndjson_line(&line)
+    });
+    let body = futures::stream::once(std::future::ready(head))
+        .chain(rows)
+        .chain(tail)
+        .map(Ok::<_, std::convert::Infallible>);
+    let mut response = (
+        [(header::CONTENT_TYPE, "application/x-ndjson")],
+        axum::body::Body::from_stream(body),
+    )
+        .into_response();
+    response
+        .extensions_mut()
+        .insert(Deferred(Arc::new(Mutex::new(Some(outcome_rx)))));
     response
 }
 
@@ -342,6 +586,7 @@ async fn run_sql(
     body: Result<Json<SqlRequest>, JsonRejection>,
     log: &mut QueryLog,
 ) -> Response {
+    let shared = Arc::clone(st);
     let st = st.as_ref();
     // Authenticate first: an anonymous caller learns nothing else (ADR 0021).
     let authorization = headers
@@ -426,8 +671,19 @@ async fn run_sql(
         resource_group: group,
         sql: req.sql,
     };
-    let sql_text = request.sql.clone();
     let viewer = st.auth.viewer(&request.user);
+    match req.format.as_deref() {
+        None | Some("json") => {}
+        Some("ndjson") => return stream_sql(shared, request, viewer, Instant::now(), log).await,
+        Some(other) => {
+            return ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", false).respond(
+                st,
+                format!("unknown format {other:?} (json, ndjson)"),
+                None,
+            );
+        }
+    }
+    let sql_text = request.sql.clone();
     let assigned = AtomicU64::new(0);
     let queued_us = AtomicU64::new(0);
     let arrived = Instant::now();
@@ -822,6 +1078,92 @@ mod tests {
             let (got, text) = call(router(default_state()), sql_req(body)).await;
             assert_eq!((got, error_code(&text).as_str()), (status, code), "{text}");
         }
+    }
+
+    #[tokio::test]
+    async fn ndjson_streams_rows_and_keeps_early_error_statuses() {
+        let res = router(default_state())
+            .oneshot(sql_req(
+                json!({"sql": "select 1", "user": "ana", "format": "ndjson"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()[header::CONTENT_TYPE], "application/x-ndjson");
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let lines: Vec<serde_json::Value> = std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                json!({"query_id": 1, "columns": ["x"]}),
+                json!([1]),
+                json!({"done": true, "rows": 1}),
+            ]
+        );
+        // Failures before the first line keep their status and error body.
+        for (sql, status, code) in [
+            (
+                "oom",
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "memory_limit_exceeded",
+            ),
+            ("bad", StatusCode::BAD_REQUEST, "invalid_query"),
+        ] {
+            let (got, body) = call(
+                router(default_state()),
+                sql_req(json!({"sql": sql, "user": "ana", "format": "ndjson"})),
+            )
+            .await;
+            assert_eq!((got, error_code(&body).as_str()), (status, code), "{body}");
+        }
+        let (got, body) = call(
+            router(default_state()),
+            sql_req(json!({"sql": "select 1", "user": "ana", "format": "csv"})),
+        )
+        .await;
+        assert_eq!(got, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    /// A reader that goes away mid-stream cancels the query: the slot and
+    /// every reserved chunk are released, and the registry says cancelled.
+    #[tokio::test]
+    async fn ndjson_client_disconnect_cancels_the_query() {
+        use plimsoll_core::engine::Engine;
+        use plimsoll_core::memory::CeilingPool;
+        let pool = Arc::new(CeilingPool::new(64 << 20, 1 << 20).unwrap());
+        let mut st = Arc::into_inner(default_state()).unwrap();
+        st.engine = Arc::new(crate::engine::CoreEngine(Arc::new(
+            Engine::new(pool.clone(), None).unwrap(),
+        )));
+        let st = Arc::new(st);
+        let res = router(st.clone())
+            .oneshot(sql_req(json!({
+                "sql": "SELECT value, repeat('x', 100) FROM range(100000000)",
+                "user": "ana", "format": "ndjson"})))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mut body = res.into_body().into_data_stream();
+        let first = body.next().await.unwrap().unwrap();
+        let header: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(header["query_id"], 1);
+        assert!(body.next().await.unwrap().is_ok(), "rows are flowing");
+        drop(body);
+        let reg = st.admission.registry();
+        for _ in 0..500 {
+            if reg.get(1).is_some_and(|q| q.state.is_terminal()) && st.admission.load() == (0, 0) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(reg.get(1).unwrap().state, QueryState::Cancelled);
+        assert_eq!(st.admission.load(), (0, 0));
+        assert_eq!(pool.used(), 0, "chunks in flight released");
+        assert_eq!(st.errors.snapshot().get("client_disconnected"), Some(&1));
     }
 
     #[tokio::test]

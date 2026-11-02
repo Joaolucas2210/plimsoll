@@ -8,16 +8,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use plimsoll_connectors::ConnectorError;
 use plimsoll_control::catalog::CatalogError;
 use plimsoll_core::datafusion::arrow::json::ArrayWriter;
+use plimsoll_core::datafusion::arrow::record_batch::RecordBatch;
 use plimsoll_core::datafusion::error::DataFusionError;
 use plimsoll_core::datafusion::object_store::Error as ObjectStoreError;
 use plimsoll_core::datafusion::parquet::errors::ParquetError;
 use plimsoll_core::engine::{AccessDenied, Engine, QueryResult};
 
 use crate::auth::Viewer;
-use plimsoll_core::memory::Reservation;
+use plimsoll_core::memory::{ConsumerKind, Reservation};
 use serde_json::Value;
 
 /// A result ready for the wire. `rows_json` is already serialized (a JSON
@@ -78,10 +80,89 @@ pub enum EngineError {
     Internal(String),
 }
 
+/// A piece of a streamed result (ADR 0035): the column names once, then
+/// NDJSON lines (one JSON array per row), each chunk reserved in the pool
+/// until the body has taken it.
+pub enum Chunk {
+    Header(Vec<String>),
+    Rows(Vec<u8>, Option<Reservation>),
+}
+
+/// Rows per streamed chunk. ponytail: fixed; very wide rows make big
+/// chunks (1024 × row size). Size by bytes if that ever matters.
+const CHUNK_ROWS: usize = 1024;
+
+/// What a streamed query did, once its last chunk was sent.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Streamed {
+    pub rows: u64,
+    pub phases: Phases,
+}
+
+/// The receiver is gone (client disconnected). The caller cancels the query
+/// in the registry before this surfaces (ADR 0035), so it is never reported.
+fn receiver_gone() -> EngineError {
+    EngineError::Internal("result receiver dropped".into())
+}
+
 #[async_trait]
 pub trait QueryEngine: Send + Sync {
     /// Runs `sql` on behalf of `viewer` (scopes system tables, ADR 0022).
     async fn execute(&self, sql: &str, viewer: Viewer) -> Result<QueryOutput, EngineError>;
+
+    /// Runs `sql`, sending the result to `tx` as it is produced. `tx` is
+    /// bounded: a slow reader slows the query instead of buffering it.
+    /// Default: [`Self::execute`], then the whole result as one chunk.
+    async fn stream(
+        &self,
+        sql: &str,
+        viewer: Viewer,
+        tx: tokio::sync::mpsc::Sender<Chunk>,
+    ) -> Result<Streamed, EngineError> {
+        let out = self.execute(sql, viewer).await?;
+        let rows: Vec<Value> = serde_json::from_slice(&out.rows_json)
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        let mut lines = Vec::new();
+        for row in &rows {
+            serde_json::to_writer(&mut lines, row)
+                .map_err(|e| EngineError::Internal(e.to_string()))?;
+            lines.push(b'\n');
+        }
+        tx.send(Chunk::Header(out.columns))
+            .await
+            .map_err(|_| receiver_gone())?;
+        tx.send(Chunk::Rows(lines, out.memory))
+            .await
+            .map_err(|_| receiver_gone())?;
+        Ok(Streamed {
+            rows: rows.len() as u64,
+            phases: out.phases,
+        })
+    }
+}
+
+/// `batch` as one JSON array per row, in `columns` order, handed to `row`.
+fn each_row(
+    batch: &RecordBatch,
+    columns: &[String],
+    mut row: impl FnMut(Vec<Value>) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    let internal = |e: &dyn std::fmt::Display| EngineError::Internal(e.to_string());
+    let mut writer = ArrayWriter::new(Vec::new());
+    writer
+        .write(batch)
+        .and_then(|()| writer.finish())
+        .map_err(|e| internal(&e))?;
+    let objects: Vec<serde_json::Map<String, Value>> =
+        serde_json::from_slice(&writer.into_inner()).map_err(|e| internal(&e))?;
+    for mut object in objects {
+        // Arrow's writer omits nulls: absent columns are `null`.
+        row(columns
+            .iter()
+            .map(|c| object.remove(c).unwrap_or(Value::Null))
+            .collect())?;
+    }
+    Ok(())
 }
 
 pub struct CoreEngine(pub Arc<Engine>);
@@ -119,25 +200,13 @@ impl QueryEngine for CoreEngine {
         // Batch by batch: each batch leaves the pool as its JSON enters it, so
         // only one batch's transient JSON objects are ever unaccounted.
         for batch in batches {
-            let mut writer = ArrayWriter::new(Vec::new());
-            writer
-                .write(&batch)
-                .and_then(|()| writer.finish())
-                .map_err(|e| internal(&e))?;
-            let objects: Vec<serde_json::Map<String, Value>> =
-                serde_json::from_slice(&writer.into_inner()).map_err(|e| internal(&e))?;
             let before = rows_json.len();
-            for mut object in objects {
+            each_row(&batch, &columns, |row| {
                 if rows_json.len() > 1 {
                     rows_json.push(b',');
                 }
-                // Arrow's writer omits nulls: absent columns are `null`.
-                let row: Vec<Value> = columns
-                    .iter()
-                    .map(|c| object.remove(c).unwrap_or(Value::Null))
-                    .collect();
-                serde_json::to_writer(&mut rows_json, &row).map_err(|e| internal(&e))?;
-            }
+                serde_json::to_writer(&mut rows_json, &row).map_err(|e| internal(&e))
+            })?;
             memory.shrink(batch.get_array_memory_size());
             drop(batch);
             memory.try_grow(rows_json.len() - before).map_err(mem_err)?;
@@ -151,6 +220,70 @@ impl QueryEngine for CoreEngine {
                 planning,
                 execution,
                 serialization: serializing.elapsed(),
+            },
+        })
+    }
+
+    async fn stream(
+        &self,
+        sql: &str,
+        viewer: Viewer,
+        tx: tokio::sync::mpsc::Sender<Chunk>,
+    ) -> Result<Streamed, EngineError> {
+        let started = Instant::now();
+        let mut query = self
+            .0
+            .sql_stream_with(sql, Arc::new(viewer))
+            .await
+            .map_err(|e| classify(&e))?;
+        let columns: Vec<String> = query
+            .stream
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        tx.send(Chunk::Header(columns.clone()))
+            .await
+            .map_err(|_| receiver_gone())?;
+        let (mut rows, mut serialization) = (0u64, Duration::ZERO);
+        while let Some(batch) = query.stream.next().await {
+            let batch = batch.map_err(|e| classify(&e))?;
+            // Zero-copy slices bound each chunk, so the window in flight is
+            // a few chunks whatever the batch size.
+            let mut offset = 0;
+            while offset < batch.num_rows() {
+                let slice = batch.slice(offset, CHUNK_ROWS.min(batch.num_rows() - offset));
+                offset += slice.num_rows();
+                let serializing = Instant::now();
+                let mut lines = Vec::new();
+                each_row(&slice, &columns, |row| {
+                    rows += 1;
+                    serde_json::to_writer(&mut lines, &row)
+                        .map_err(|e| EngineError::Internal(e.to_string()))?;
+                    lines.push(b'\n');
+                    Ok(())
+                })?;
+                serialization += serializing.elapsed();
+                // Reserved until the body takes it: the bytes in flight (the
+                // channel plus the chunk being written) stay under the ceiling.
+                let mut memory = self.0.pool().register("query-output", ConsumerKind::Output);
+                memory
+                    .try_grow(lines.len())
+                    .map_err(|e| EngineError::MemoryLimitExceeded(e.to_string()))?;
+                tx.send(Chunk::Rows(lines, Some(memory)))
+                    .await
+                    .map_err(|_| receiver_gone())?;
+            }
+        }
+        let planning = query.planning;
+        Ok(Streamed {
+            rows,
+            phases: Phases {
+                planning,
+                // Includes time spent waiting for the reader.
+                execution: started.elapsed().saturating_sub(planning + serialization),
+                serialization,
             },
         })
     }
@@ -360,5 +493,46 @@ mod tests {
             .await;
         assert!(matches!(err, Err(EngineError::MemoryLimitExceeded(_))));
         assert_eq!(pool.used(), 0);
+    }
+
+    /// A result too big for the ceiling as one document streams through it:
+    /// only the chunks in flight are held (ADR 0035).
+    #[tokio::test]
+    async fn streamed_results_are_bounded_by_the_window_not_the_result() {
+        let pool = Arc::new(CeilingPool::new(1 << 20, 1 << 17).unwrap());
+        let e = CoreEngine(Arc::new(Engine::new(pool.clone(), None).unwrap()));
+        let sql = "SELECT value, repeat('x', 100) FROM range(200000)";
+        assert!(matches!(
+            e.execute(sql, Viewer::default()).await,
+            Err(EngineError::MemoryLimitExceeded(_))
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let reader = tokio::spawn(async move {
+            let (mut header, mut lines, mut peak) = (None, 0usize, 0usize);
+            while let Some(chunk) = rx.recv().await {
+                match chunk {
+                    Chunk::Header(c) => header = Some(c),
+                    Chunk::Rows(bytes, memory) => {
+                        peak = peak.max(memory.as_ref().map_or(0, |m| m.size()));
+                        lines += bytes.iter().filter(|b| **b == b'\n').count();
+                    }
+                }
+            }
+            (header, lines, peak)
+        });
+        let done = e.stream(sql, Viewer::default(), tx).await.unwrap();
+        let (header, lines, peak) = reader.await.unwrap();
+        assert_eq!(header.unwrap().len(), 2);
+        assert_eq!((done.rows, lines), (200_000, 200_000));
+        assert!(peak > 0 && peak < 1 << 20, "chunks are reserved: {peak}");
+        assert_eq!(pool.used(), 0);
+
+        // Planning errors surface before any chunk.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        assert!(matches!(
+            e.stream("SELEC", Viewer::default(), tx).await,
+            Err(EngineError::InvalidQuery(_))
+        ));
+        assert!(rx.recv().await.is_none());
     }
 }

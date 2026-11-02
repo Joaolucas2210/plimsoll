@@ -111,7 +111,16 @@ pub struct QueryRegistry {
     failed: AtomicU64,
     cancelled: AtomicU64,
     /// Cancel signals of queries not yet terminal (ADR 0034).
-    cancels: Mutex<HashMap<QueryId, Arc<Notify>>>,
+    cancels: Mutex<HashMap<QueryId, Arc<CancelSignal>>>,
+}
+
+/// Wakes the governed query, and remembers the request: a run that fails
+/// *because* of the cancel (its reader is gone) may complete before the
+/// wake-up is seen, and must still be recorded as cancelled.
+#[derive(Default)]
+struct CancelSignal {
+    notify: Notify,
+    requested: std::sync::atomic::AtomicBool,
 }
 
 /// Result of [`QueryRegistry::cancel`].
@@ -148,8 +157,9 @@ impl QueryRegistry {
         }
         match lock(&self.cancels).get(&id) {
             Some(signal) => {
+                signal.requested.store(true, Ordering::SeqCst);
                 // Stored as a permit if the query is not awaiting it yet.
-                signal.notify_one();
+                signal.notify.notify_one();
                 CancelOutcome::Cancelling
             }
             // Registered but terminal by now (raced with `finish`).
@@ -159,7 +169,7 @@ impl QueryRegistry {
         }
     }
 
-    fn cancel_signal(&self, id: QueryId) -> Arc<Notify> {
+    fn cancel_signal(&self, id: QueryId) -> Arc<CancelSignal> {
         Arc::clone(lock(&self.cancels).entry(id).or_default())
     }
 
@@ -572,11 +582,19 @@ impl Admission {
         };
         // A cancel drops `governed` like the timeout does: queue wait or
         // execution stops, and the slot and memory are released.
+        // Biased, cancel first; and a run that failed after a cancel was
+        // requested (a disconnected stream's reader) is recorded as
+        // cancelled even if it finished before the wake-up was seen.
         let result = tokio::select! {
+            biased;
+            () = cancelled.notify.notified() => Err(GovernedError::Cancelled),
             r = tokio::time::timeout(timeout, governed) => {
                 r.unwrap_or(Err(GovernedError::TimedOut(timeout)))
             }
-            () = cancelled.notified() => Err(GovernedError::Cancelled),
+        };
+        let result = match result {
+            Err(_) if cancelled.requested.load(Ordering::SeqCst) => Err(GovernedError::Cancelled),
+            r => r,
         };
         match &result {
             Ok(_) => self.registry.finish(id, QueryState::Finished, None),
@@ -831,5 +849,25 @@ mod tests {
         assert_eq!(reg.cancel(999), CancelOutcome::NotFound);
         // A cancel signal is only kept while a query can still be cancelled.
         assert!(lock(&reg.cancels).is_empty());
+    }
+
+    /// A run that fails *because* it was cancelled (a streamed query whose
+    /// reader went away) can complete in the same poll as the cancel: it is
+    /// still recorded as cancelled, not failed.
+    #[tokio::test]
+    async fn a_run_failing_after_a_cancel_request_counts_as_cancelled() {
+        let adm = admission(lim(1, 1), lim(1, 1), lim(1, 1));
+        let reg = adm.registry().clone();
+        let out = adm
+            .execute(req("a"), Duration::from_secs(5), |id| {
+                let reg = reg.clone();
+                async move {
+                    assert_eq!(reg.cancel(id), CancelOutcome::Cancelling);
+                    Err::<(), _>("receiver dropped".to_owned())
+                }
+            })
+            .await;
+        assert!(matches!(out, Err(GovernedError::Cancelled)), "{out:?}");
+        assert_eq!(reg.get(1).unwrap().state, QueryState::Cancelled);
     }
 }

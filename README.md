@@ -137,9 +137,15 @@ Configuration is environment-only; invalid values abort startup.
 
 ### SQL API
 
-`POST /v1/sql` with `{"sql": "...", "user": "...", "resource_group": "..."?}`.
+`POST /v1/sql` with `{"sql": "...", "user": "...", "resource_group": "..."?, "format": "json"|"ndjson"?}`.
 
 - `200` → `{"query_id": 1, "columns": [...], "rows": [[...]]}`
+- `"format": "ndjson"` streams `application/x-ndjson` (ADR 0035): a header
+  line `{"query_id", "columns"}`, one JSON array per row, then
+  `{"done": true, "rows": N}`, or an `{"error": {...}}` line if the query
+  fails mid-stream. Results of any size stream under the memory ceiling;
+  errors before the header keep their HTTP status. Closing the connection
+  cancels the query.
 - error → `{"error": {"code": "...", "message": "...", "query_id": 1|null}}`
 
 | Code | HTTP | Meaning |

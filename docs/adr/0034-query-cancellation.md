@@ -145,4 +145,8 @@ log line. Rejected.
 - A coordinator/worker split needs cancel routing.
 - Operators need bulk cancel, or "cancel on drain" for long queries
   (ADR 0026's revisit item).
+- ADR 0035 reuses this path for disconnected stream readers. It added a
+  `requested` flag next to the `Notify`: a run that fails *because* of the
+  cancel is recorded as cancelled even if it completes before the wake-up
+  is seen.
 - A tight synchronous kernel is found to ignore cancellation for long.

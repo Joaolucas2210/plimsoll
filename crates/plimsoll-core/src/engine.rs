@@ -15,9 +15,10 @@ use datafusion::catalog::MemorySchemaProvider;
 use datafusion::common::ResolvedTableReference;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::SQLOptions;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::physical_plan::execute_stream;
+use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 
@@ -69,7 +70,7 @@ pub struct AccessDenied {
 pub struct Engine {
     ctx: SessionContext,
     pool: Arc<CeilingPool>,
-    spilled_total: AtomicU64,
+    spilled_total: Arc<AtomicU64>,
 }
 
 impl Engine {
@@ -91,7 +92,7 @@ impl Engine {
         Ok(Self {
             ctx,
             pool,
-            spilled_total: AtomicU64::new(0),
+            spilled_total: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -121,10 +122,27 @@ impl Engine {
     /// config for providers that depend on who is asking (ADR 0022). Same
     /// catalogs, runtime and pool; only the config is per query.
     pub async fn sql_with<T: TableAccess>(&self, sql: &str, access: Arc<T>) -> Result<QueryResult> {
-        let mut state = self.ctx.state();
-        state.config_mut().set_extension(access.clone());
-        let ctx = SessionContext::new_with_state(state);
+        let ctx = self.context_for(access.clone());
         self.run(&ctx, sql, Some(access.as_ref())).await
+    }
+
+    /// [`Engine::sql_with`] without collecting: the planned query as a
+    /// stream, pulled at the caller's pace, so results of any size flow
+    /// through (ADR 0035). Batches taken from it are the caller's to account
+    /// for.
+    pub async fn sql_stream_with<T: TableAccess>(
+        &self,
+        sql: &str,
+        access: Arc<T>,
+    ) -> Result<QueryStream> {
+        let ctx = self.context_for(access.clone());
+        self.plan_stream(&ctx, sql, Some(access.as_ref())).await
+    }
+
+    fn context_for<T: TableAccess>(&self, access: Arc<T>) -> SessionContext {
+        let mut state = self.ctx.state();
+        state.config_mut().set_extension(access);
+        SessionContext::new_with_state(state)
     }
 
     async fn run(
@@ -133,6 +151,31 @@ impl Engine {
         sql: &str,
         access: Option<&dyn TableAccess>,
     ) -> Result<QueryResult> {
+        let started = Instant::now();
+        let mut query = self.plan_stream(ctx, sql, access).await?;
+        let mut output = self.pool.register("query-output", ConsumerKind::Output);
+        let mut batches = Vec::new();
+        while let Some(batch) = query.stream.next().await {
+            let batch = batch?;
+            output.try_grow(batch.get_array_memory_size())?;
+            batches.push(batch);
+        }
+        let planning = query.planning;
+        drop(query);
+        Ok(QueryResult {
+            batches,
+            memory: output,
+            planning,
+            execution: started.elapsed() - planning,
+        })
+    }
+
+    async fn plan_stream(
+        &self,
+        ctx: &SessionContext,
+        sql: &str,
+        access: Option<&dyn TableAccess>,
+    ) -> Result<QueryStream> {
         let started = Instant::now();
         // Read-only SQL (ADR 0024): DDL would let any caller read or write
         // server files (`CREATE EXTERNAL TABLE ... LOCATION '/etc/...'`,
@@ -161,31 +204,30 @@ impl Engine {
         }
         let plan = preevaluate_scalar_subqueries(&state, plan).await?;
         let physical = state.create_physical_plan(&plan).await?;
-        let planning = started.elapsed();
-
-        let mut output = self.pool.register("query-output", ConsumerKind::Output);
-        let mut stream = execute_stream(physical.clone(), state.task_ctx())?;
-        let mut batches = Vec::new();
-        let result = async {
-            while let Some(batch) = stream.next().await {
-                let batch = batch?;
-                output.try_grow(batch.get_array_memory_size())?;
-                batches.push(batch);
-            }
-            Ok::<_, DataFusionError>(())
-        }
-        .await;
-        drop(stream);
-        // Count spill even for failed queries: the disk was written either way.
-        self.spilled_total
-            .fetch_add(spilled_bytes(&physical) as u64, Ordering::Relaxed);
-        result?;
-        Ok(QueryResult {
-            batches,
-            memory: output,
-            planning,
-            execution: started.elapsed() - planning,
+        let stream = execute_stream(physical.clone(), state.task_ctx())?;
+        Ok(QueryStream {
+            stream,
+            planning: started.elapsed(),
+            physical,
+            spilled_total: self.spilled_total.clone(),
         })
+    }
+}
+
+/// A planned query's result stream. Dropping it stops the query; spill is
+/// counted then, failed queries included (the disk was written either way).
+pub struct QueryStream {
+    pub stream: SendableRecordBatchStream,
+    /// SQL text -> physical plan.
+    pub planning: Duration,
+    physical: Arc<dyn ExecutionPlan>,
+    spilled_total: Arc<AtomicU64>,
+}
+
+impl Drop for QueryStream {
+    fn drop(&mut self) {
+        self.spilled_total
+            .fetch_add(spilled_bytes(&self.physical) as u64, Ordering::Relaxed);
     }
 }
 
