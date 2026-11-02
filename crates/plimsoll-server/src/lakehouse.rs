@@ -10,7 +10,7 @@
 //! `bronze."trips$snapshots"`, `$history` and `$refs` list them (ADR 0030);
 //! `$files` and `$manifests` list the current snapshot's files (ADR 0032).
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use async_trait::async_trait;
 use plimsoll_connectors::iceberg;
@@ -24,10 +24,10 @@ use plimsoll_core::datafusion::prelude::SessionContext;
 struct CatalogSchema {
     catalog: Arc<dyn Catalog>,
     namespace: Namespace,
-    /// Names listed at boot, for `SHOW TABLES` / `information_schema`.
-    /// ponytail: tables created later still resolve via `table()`, they just
-    /// don't show up in listings until restart.
-    names: Vec<String>,
+    /// Listed names, for `SHOW TABLES` / `information_schema`. Refreshed by
+    /// [`refresh`] (ADR 0033); lookups never depend on it: `table()` asks
+    /// the catalog every time.
+    names: RwLock<Vec<String>>,
 }
 
 impl std::fmt::Debug for CatalogSchema {
@@ -82,7 +82,10 @@ impl CatalogSchema {
 #[async_trait]
 impl SchemaProvider for CatalogSchema {
     fn table_names(&self) -> Vec<String> {
-        self.names.clone()
+        self.names
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
@@ -132,7 +135,7 @@ impl SchemaProvider for CatalogSchema {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.names.iter().any(|n| n == name)
+        self.table_names().iter().any(|n| n == name)
     }
 }
 
@@ -143,36 +146,113 @@ pub async fn register(
     ctx: &SessionContext,
     catalog: Arc<dyn Catalog>,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let r = refresh(ctx, catalog).await?;
+    for (namespace, reason) in &r.skipped {
+        crate::log::emit(
+            crate::log::Level::Warn,
+            "namespace_skipped",
+            serde_json::json!({ "namespace": namespace, "reason": reason }),
+        );
+    }
+    Ok(r.namespaces)
+}
+
+/// What a [`refresh`] saw and changed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Refreshed {
+    /// Every catalog-backed schema, sorted.
+    pub namespaces: Vec<String>,
+    /// Namespaces registered by this call.
+    pub new_namespaces: Vec<String>,
+    /// Schemas whose table list changed.
+    pub changed: Vec<String>,
+    /// Namespaces not exposed, with the reason.
+    pub skipped: Vec<(String, &'static str)>,
+}
+
+/// Re-lists the catalog (ADR 0033): updates each catalog schema's table
+/// names and registers namespaces created since. A namespace is only
+/// registered where no schema with tables exists, so env-registered tables
+/// are never shadowed. Any catalog error leaves every listing as it was.
+/// ponytail: dropped namespaces keep an (emptied) schema until restart.
+pub async fn refresh(
+    ctx: &SessionContext,
+    catalog: Arc<dyn Catalog>,
+) -> Result<Refreshed, Box<dyn std::error::Error>> {
     let default = ctx
         .catalog("datafusion")
         .ok_or("default DataFusion catalog missing")?;
-    let mut registered = Vec::new();
-    for namespace in catalog.list_namespaces().await? {
+    // Everything is listed before anything changes.
+    let mut listed = Vec::new();
+    let mut skipped = Vec::new();
+    let namespaces = catalog.list_namespaces().await?;
+    for namespace in &namespaces {
         // ponytail: `a.b.c` namespaces need nested catalogs in DataFusion;
         // skipped until someone has one.
         let [name] = namespace.0.as_slice() else {
-            crate::log::emit(
-                crate::log::Level::Warn,
-                "namespace_skipped",
-                serde_json::json!({ "namespace": namespace.to_string(), "reason": "multi-level" }),
-            );
+            skipped.push((namespace.to_string(), "multi-level"));
             continue;
         };
-        let names = catalog
-            .list_tables(&namespace)
+        let mut names: Vec<String> = catalog
+            .list_tables(namespace)
             .await?
             .into_iter()
             .map(|t| t.name)
             .collect();
-        let schema = CatalogSchema {
-            catalog: catalog.clone(),
-            namespace: namespace.clone(),
-            names,
-        };
-        default.register_schema(name, Arc::new(schema))?;
-        registered.push(name.clone());
+        names.sort();
+        listed.push((name.clone(), namespace.clone(), names));
     }
-    Ok(registered)
+    let mut out = Refreshed {
+        skipped,
+        ..Default::default()
+    };
+    for (name, namespace, names) in listed {
+        let existing = default.schema(&name);
+        match existing
+            .as_ref()
+            .and_then(|s| s.downcast_ref::<CatalogSchema>())
+        {
+            Some(schema) => {
+                let mut current = schema.names.write().unwrap_or_else(PoisonError::into_inner);
+                if *current != names {
+                    *current = names;
+                    out.changed.push(name.clone());
+                }
+            }
+            None if existing.as_ref().is_none_or(|s| s.table_names().is_empty()) => {
+                let schema = CatalogSchema {
+                    catalog: catalog.clone(),
+                    namespace,
+                    names: RwLock::new(names),
+                };
+                default.register_schema(&name, Arc::new(schema))?;
+                out.new_namespaces.push(name.clone());
+            }
+            None => {
+                out.skipped.push((name, "schema has env tables"));
+                continue;
+            }
+        }
+        out.namespaces.push(name);
+    }
+    // Namespaces gone from the catalog: their tables no longer resolve, so
+    // stop listing them.
+    for name in default.schema_names() {
+        if out.namespaces.contains(&name) {
+            continue;
+        }
+        if let Some(schema) = default.schema(&name) {
+            if let Some(schema) = schema.downcast_ref::<CatalogSchema>() {
+                let mut current = schema.names.write().unwrap_or_else(PoisonError::into_inner);
+                if !current.is_empty() {
+                    current.clear();
+                    out.changed.push(name);
+                }
+            }
+        }
+    }
+    out.namespaces.sort();
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -180,7 +260,7 @@ pub async fn register(
 mod tests {
     use super::*;
     use plimsoll_control::catalog::InMemoryCatalog;
-    use plimsoll_core::datafusion::arrow::array::Int64Array as arrow_i64;
+    use plimsoll_core::datafusion::arrow::array::{Int64Array as arrow_i64, RecordBatch};
     use serde_json::json;
 
     fn empty_table(column: &str) -> serde_json::Value {
@@ -385,6 +465,113 @@ mod tests {
             ctx.sql("SELECT * FROM silver.\"users$nope\"")
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_tracks_tables_and_namespaces_created_after_boot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        /// The in-memory catalog, unreachable while `down` is set.
+        #[derive(Default)]
+        struct Flaky(InMemoryCatalog, AtomicBool);
+        #[async_trait]
+        impl Catalog for Flaky {
+            async fn list_namespaces(&self) -> Result<Vec<Namespace>, CatalogError> {
+                if self.1.load(Ordering::Relaxed) {
+                    return Err(CatalogError::Http("down".into()));
+                }
+                self.0.list_namespaces().await
+            }
+            async fn list_tables(&self, ns: &Namespace) -> Result<Vec<TableIdent>, CatalogError> {
+                self.0.list_tables(ns).await
+            }
+            async fn load_table(&self, id: &TableIdent) -> Result<LoadedTable, CatalogError> {
+                self.0.load_table(id).await
+            }
+        }
+        let cat = Arc::new(Flaky::default());
+        let put = |ns: &str, t: &str| {
+            cat.0.put_table(
+                TableIdent::new(Namespace::new(&[ns]), t),
+                Some(format!("file:///wh/{ns}/{t}/metadata/1.metadata.json")),
+                empty_table("a"),
+            )
+        };
+        put("silver", "users");
+        let ctx = SessionContext::new_with_config(
+            plimsoll_core::datafusion::prelude::SessionConfig::new().with_information_schema(true),
+        );
+        ctx.catalog("datafusion")
+            .unwrap()
+            .register_schema(
+                "gold",
+                Arc::new(plimsoll_core::datafusion::catalog::MemorySchemaProvider::new()),
+            )
+            .unwrap();
+        // An env-registered table in `gold`: a later `gold` namespace must
+        // not shadow it.
+        ctx.register_batch(
+            "gold.kpis",
+            RecordBatch::try_from_iter([("x", Arc::new(arrow_i64::from(vec![1])) as _)]).unwrap(),
+        )
+        .unwrap();
+        register(&ctx, cat.clone()).await.unwrap();
+        let tables = async || {
+            let b = ctx
+                .sql(
+                    "SELECT table_schema || '.' || table_name AS t FROM information_schema.tables \
+                      WHERE table_schema NOT IN ('information_schema') ORDER BY 1",
+                )
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            plimsoll_core::datafusion::arrow::util::pretty::pretty_format_batches(&b)
+                .unwrap()
+                .to_string()
+                .lines()
+                .filter_map(|l| {
+                    l.strip_prefix("| ")
+                        .map(|l| l.trim_end_matches(" |").trim().to_owned())
+                })
+                .filter(|l| l.contains('.'))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tables().await, ["gold.kpis", "silver.users"]);
+
+        put("silver", "orders");
+        put("platinum", "facts");
+        put("gold", "shadow");
+        let r = refresh(&ctx, cat.clone()).await.unwrap();
+        assert_eq!(r.new_namespaces, ["platinum"]);
+        assert_eq!(r.changed, ["silver"]);
+        assert_eq!(r.skipped, [("gold".to_owned(), "schema has env tables")]);
+        assert_eq!(
+            tables().await,
+            [
+                "gold.kpis",
+                "platinum.facts",
+                "silver.orders",
+                "silver.users"
+            ]
+        );
+        // Unchanged catalog: nothing to report.
+        let r = refresh(&ctx, cat.clone()).await.unwrap();
+        assert!(r.changed.is_empty() && r.new_namespaces.is_empty());
+
+        // Catalog down: the listing stays as it was.
+        cat.1.store(true, Ordering::Relaxed);
+        assert!(refresh(&ctx, cat.clone()).await.is_err());
+        assert_eq!(tables().await.len(), 4);
+        cat.0.drop_namespace(&Namespace::new(&["platinum"]));
+        // Back up: the dropped namespace stops listing tables.
+        cat.1.store(false, Ordering::Relaxed);
+        let r = refresh(&ctx, cat.clone()).await.unwrap();
+        assert_eq!(r.changed, ["platinum"]);
+        assert_eq!(
+            tables().await,
+            ["gold.kpis", "silver.orders", "silver.users"]
         );
     }
 }

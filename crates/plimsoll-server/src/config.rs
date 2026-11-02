@@ -32,6 +32,8 @@ pub struct Config {
     pub auth: Auth,
     /// Trace export; `None` = traces are only propagated (ADR 0031).
     pub otlp: Option<OtlpConfig>,
+    /// How often catalog listings are refreshed; zero = boot only (ADR 0033).
+    pub catalog_refresh: Duration,
 }
 
 impl Config {
@@ -65,6 +67,13 @@ impl Config {
             "expected a non-negative integer",
         )?;
 
+        let refresh_ms: u64 = parse(
+            &lookup,
+            "PLIMSOLL_CATALOG_REFRESH_MS",
+            Some(60_000),
+            "expected a non-negative integer",
+        )?;
+
         let global = Limits {
             max_running,
             max_queued,
@@ -88,6 +97,7 @@ impl Config {
             drain_delay: Duration::from_millis(drain_ms),
             auth,
             otlp: otlp(&lookup)?,
+            catalog_refresh: Duration::from_millis(refresh_ms),
         })
     }
 }
@@ -315,5 +325,14 @@ mod tests {
         .unwrap_err();
         assert_eq!(e.var, "OTEL_EXPORTER_OTLP_HEADERS");
         assert!(!e.to_string().contains("s3cr3t"), "{e}");
+    }
+
+    #[test]
+    fn catalog_refresh_defaults_to_a_minute_and_zero_disables_it() {
+        assert_eq!(cfg(&[]).unwrap().catalog_refresh, Duration::from_secs(60));
+        let c = cfg(&[("PLIMSOLL_CATALOG_REFRESH_MS", "0")]).unwrap();
+        assert!(c.catalog_refresh.is_zero());
+        let e = cfg(&[("PLIMSOLL_CATALOG_REFRESH_MS", "-1")]).unwrap_err();
+        assert_eq!(e.var, "PLIMSOLL_CATALOG_REFRESH_MS");
     }
 }

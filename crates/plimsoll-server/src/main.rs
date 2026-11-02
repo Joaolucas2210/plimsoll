@@ -69,14 +69,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     system::register(engine.context(), admission.registry().clone())?;
     // Catalog first: env tables aimed at a catalog-backed schema then fail
     // fast (those schemas are read-only) instead of being silently shadowed.
-    if let Some(cfg) = catalog.clone() {
-        let catalog = Arc::new(RestCatalog::connect(cfg).await?);
-        let schemas = lakehouse::register(engine.context(), catalog).await?;
+    if let Some(catalog_cfg) = catalog.clone() {
+        let catalog = Arc::new(RestCatalog::connect(catalog_cfg).await?);
+        let schemas = lakehouse::register(engine.context(), catalog.clone()).await?;
         log::emit(
             Level::Info,
             "catalog_registered",
             json!({ "namespaces": schemas }),
         );
+        if !cfg.catalog_refresh.is_zero() {
+            tokio::spawn(refresh_catalog(
+                engine.clone(),
+                catalog,
+                cfg.catalog_refresh,
+            ));
+        }
     }
     let n = tables::register_from_env(engine.context(), |k| std::env::var(k).ok()).await?;
     log::emit(Level::Info, "env_tables_registered", json!({ "tables": n }));
@@ -151,6 +158,34 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     log::emit(Level::Info, "stopped", json!({}));
     Ok(())
+}
+
+/// Keeps `SHOW TABLES` / `information_schema` in step with the catalog
+/// (ADR 0033). Lookups do not need it: every query asks the catalog.
+async fn refresh_catalog(
+    engine: Arc<Engine>,
+    catalog: Arc<RestCatalog>,
+    every: std::time::Duration,
+) {
+    let mut tick = tokio::time::interval(every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await; // the first tick is immediate; boot just listed
+    loop {
+        tick.tick().await;
+        match lakehouse::refresh(engine.context(), catalog.clone()).await {
+            Ok(r) if r.new_namespaces.is_empty() && r.changed.is_empty() => {}
+            Ok(r) => log::emit(
+                Level::Info,
+                "catalog_refreshed",
+                json!({ "new_namespaces": r.new_namespaces, "changed": r.changed }),
+            ),
+            Err(e) => log::emit(
+                Level::Warn,
+                "catalog_refresh_failed",
+                json!({ "error": e.to_string() }),
+            ),
+        }
+    }
 }
 
 /// Resolves when the listener should close. SIGTERM (an orchestrator) drains

@@ -235,6 +235,10 @@ impl InMemoryCatalog {
         self.lock().entry(ns).or_default();
     }
 
+    pub fn drop_namespace(&self, ns: &Namespace) {
+        self.lock().remove(ns);
+    }
+
     pub fn put_table(
         &self,
         ident: TableIdent,

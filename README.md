@@ -133,6 +133,7 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_CATALOG_CREDENTIAL` | unset | OAuth2 `client_id:client_secret` (Polaris); exclusive with the token |
 | `PLIMSOLL_CATALOG_SCOPE` | `PRINCIPAL_ROLE:ALL` | OAuth2 scope |
 | `PLIMSOLL_CATALOG_VENDED_CREDENTIALS` | `false` | `true` asks the catalog for per-table storage credentials (Polaris credential vending) |
+| `PLIMSOLL_CATALOG_REFRESH_MS` | `60000` | How often `SHOW TABLES` / `information_schema` re-list the catalog (new tables and namespaces); `0` = boot only. Queries always resolve tables live (ADR 0033) |
 
 ### SQL API
 
