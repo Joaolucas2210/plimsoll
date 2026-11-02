@@ -91,6 +91,7 @@ pub(super) async fn equality_keys(
     path: &str,
     key: &[Field],
     ids: &[i64],
+    mapping: Option<&super::field_ids::NameMapping>,
     reservation: &MemoryReservation,
     hits: &AtomicUsize,
 ) -> Result<Vec<RecordBatch>> {
@@ -115,11 +116,16 @@ pub(super) async fn equality_keys(
                 .iter()
                 .zip(ids)
                 .map(|(f, id)| {
-                    builder
-                        .schema()
-                        .fields()
+                    let fields = builder.schema().fields();
+                    // By id, then through the name mapping (ADR 0042), then
+                    // by the current name.
+                    fields
                         .iter()
                         .find(|c| super::field_ids::field_id(c) == Some(*id))
+                        .or_else(|| {
+                            let m = mapping?;
+                            fields.iter().find(|c| m.get(c.name()) == Some(id))
+                        })
                         .map_or_else(|| f.name().clone(), |c| c.name().clone())
                 })
                 .collect();

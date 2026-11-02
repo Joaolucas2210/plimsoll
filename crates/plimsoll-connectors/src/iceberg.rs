@@ -223,6 +223,8 @@ struct IcebergTable {
     names: Arc<HashMap<i64, String>>,
     /// Some column was renamed or re-added in the table's history.
     renamed: bool,
+    /// `schema.name-mapping.default`, for files without field ids (ADR 0042).
+    name_mapping: Option<Arc<field_ids::NameMapping>>,
 }
 
 /// A data file the scan will read, from its manifest entry.
@@ -391,9 +393,16 @@ impl IcebergTable {
                 .filter_map(|f| Some((f["id"].as_i64()?, f["name"].as_str()?.to_owned())))
                 .collect(),
         );
-        // Tables with renamed/re-added columns carry field ids in their schema
-        // so every file is adapted by id (ADR 0040).
-        let schema = Arc::new(if renamed {
+        let name_mapping = match meta["properties"]["schema.name-mapping.default"].as_str() {
+            Some(json) => Some(Arc::new(
+                field_ids::parse_name_mapping(json).map_err(|m| invalid(path, m))?,
+            )),
+            None => None,
+        };
+        // Tables with renamed/re-added columns, or a name mapping (aliases),
+        // carry field ids in their schema so every differing file is
+        // adapted by id (ADR 0040, 0042).
+        let schema = Arc::new(if renamed || name_mapping.is_some() {
             field_ids::with_field_ids(&schema, &names)
         } else {
             schema
@@ -410,6 +419,7 @@ impl IcebergTable {
             unpartitioned,
             names,
             renamed,
+            name_mapping,
         })
     }
 
@@ -686,6 +696,7 @@ impl IcebergTable {
             .map(|(d, key, targets): (usize, Vec<Field>, Vec<usize>)| {
                 let (reservation, hits, path) = (&reservation, &hits, &equality[d].path);
                 let ids = &equality[d].ids;
+                let mapping = self.name_mapping.as_deref();
                 async move {
                     let batches = deletes::equality_keys(
                         state,
@@ -693,6 +704,7 @@ impl IcebergTable {
                         path,
                         &key,
                         ids,
+                        mapping,
                         reservation,
                         hits,
                     )
@@ -925,6 +937,7 @@ impl IcebergTable {
         .with_expr_adapter(Some(Arc::new(field_ids::FieldIds::new(
             self.names.clone(),
             self.renamed,
+            self.name_mapping.clone(),
             &self.name,
         ))))
         .build();

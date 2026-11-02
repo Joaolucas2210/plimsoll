@@ -40,14 +40,48 @@ pub(super) struct FieldIds {
     /// The table's history renamed or re-added a column, so a file without
     /// field ids cannot be read by name safely.
     renamed: bool,
+    /// `schema.name-mapping.default`: file column name -> field id, for
+    /// files written without ids (ADR 0042).
+    mapping: Option<Arc<NameMapping>>,
     table: String,
 }
 
+/// Top-level entries of an Iceberg name mapping: every name (aliases
+/// included) a file may use for a field.
+pub(super) type NameMapping = HashMap<String, i64>;
+
+/// Parses `schema.name-mapping.default`
+/// (`[{"field-id": 1, "names": ["id", "ident"]}, ...]`). Nested `fields`
+/// are ignored: children resolve by name inside their parent (ADR 0041).
+pub(super) fn parse_name_mapping(json: &str) -> Result<NameMapping, String> {
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_str(json).map_err(|e| format!("name mapping: {e}"))?;
+    let mut out = HashMap::new();
+    for e in entries {
+        let Some(id) = e["field-id"].as_i64() else {
+            continue; // entries without an id map names to nothing
+        };
+        for name in e["names"].as_array().into_iter().flatten() {
+            let name = name.as_str().ok_or("name mapping: non-string name")?;
+            if out.insert(name.to_owned(), id).is_some_and(|old| old != id) {
+                return Err(format!("name mapping: {name:?} maps to two fields"));
+            }
+        }
+    }
+    Ok(out)
+}
+
 impl FieldIds {
-    pub(super) fn new(names: Arc<HashMap<i64, String>>, renamed: bool, table: &str) -> Self {
+    pub(super) fn new(
+        names: Arc<HashMap<i64, String>>,
+        renamed: bool,
+        mapping: Option<Arc<NameMapping>>,
+        table: &str,
+    ) -> Self {
         Self {
             names,
             renamed,
+            mapping,
             table: table.to_owned(),
         }
     }
@@ -68,11 +102,19 @@ impl PhysicalExprAdapterFactory for FieldIds {
         logical_file_schema: SchemaRef,
         physical_file_schema: SchemaRef,
     ) -> Result<Arc<dyn PhysicalExprAdapter>> {
-        let ids: Vec<Option<i64>> = physical_file_schema
+        let mut ids: Vec<Option<i64>> = physical_file_schema
             .fields()
             .iter()
             .map(|f| field_id(f))
             .collect();
+        // A file without ids gets them from the name mapping, if any.
+        if let (true, Some(mapping)) = (ids.iter().all(Option::is_none), &self.mapping) {
+            ids = physical_file_schema
+                .fields()
+                .iter()
+                .map(|f| mapping.get(f.name()).copied())
+                .collect();
+        }
         if ids.iter().all(Option::is_none) {
             // Files without ids (e.g. imported with `add_files`) can only be
             // read by name, which is right unless names were reused.
@@ -80,7 +122,7 @@ impl PhysicalExprAdapterFactory for FieldIds {
                 return Err(DataFusionError::External(Box::new(
                     ConnectorError::Unsupported(format!(
                         "iceberg data file without Parquet field ids in {}, whose columns \
-                         were renamed or re-added (name mapping)",
+                         were renamed or re-added, and no name mapping resolves its columns",
                         self.table
                     )),
                 )));

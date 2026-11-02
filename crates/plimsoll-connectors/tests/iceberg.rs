@@ -504,6 +504,87 @@ async fn columns_resolve_by_field_id_across_renames() {
     assert!(text.contains("| 1  | lisbon |      |"), "{text}");
 }
 
+/// Files without field ids (imported with `add_files`) resolve through the
+/// table's name mapping (ADR 0042): aliases and renames both read.
+#[tokio::test]
+async fn files_without_ids_resolve_through_the_name_mapping() {
+    let dir = tmp("name-mapping");
+    // An imported file: no field ids, its own column names.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ident", DataType::Int64, false),
+        Field::new("town", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["lisbon", "porto"])),
+        ],
+    )
+    .unwrap();
+    let path = dir.join("data").join("imported.parquet");
+    let mut w = ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let file = format!("file://{}", path.display());
+    let manifest = avro(
+        &dir.join("metadata/m0.avro"),
+        MANIFEST,
+        vec![vec![
+            ("status", Value::Int(1)),
+            ("data_file", data_file(0, &file)),
+        ]],
+    );
+    let list = avro(
+        &dir.join("metadata/snap-1.avro"),
+        MANIFEST_LIST,
+        vec![vec![
+            ("manifest_path", Value::String(manifest)),
+            ("content", Value::Int(0)),
+            ("sequence_number", Value::Long(1)),
+        ]],
+    );
+    let field =
+        |id, name: &str, ty: &str| json!({"id": id, "name": name, "type": ty, "required": false});
+    let write = |mapping: &str| {
+        let meta = json!({
+            "format-version": 2, "current-schema-id": 1,
+            "schemas": [
+                {"schema-id": 0, "type": "struct", "fields": [field(1, "id", "long"), field(2, "town", "string")]},
+                {"schema-id": 1, "type": "struct", "fields": [field(1, "id", "long"), field(2, "city", "string")]}],
+            "properties": {"schema.name-mapping.default": mapping},
+            "current-snapshot-id": 1,
+            "snapshots": [{"snapshot-id": 1, "manifest-list": list}],
+        });
+        std::fs::write(dir.join("metadata/v1.metadata.json"), meta.to_string()).unwrap();
+    };
+    write(
+        r#"[{"field-id": 1, "names": ["id", "ident"]}, {"field-id": 2, "names": ["town", "city"]}]"#,
+    );
+    let ctx = SessionContext::new();
+    register(&ctx, &dir).await.unwrap();
+    let out = ctx
+        .sql("SELECT id, city FROM t WHERE city = 'porto'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let text = datafusion::arrow::util::pretty::pretty_format_batches(&out)
+        .unwrap()
+        .to_string();
+    assert!(text.contains("| 2  | porto |"), "{text}");
+    assert_eq!(
+        ids(&ctx, "SELECT id FROM t ORDER BY id").await.unwrap(),
+        [1, 2]
+    );
+
+    // A mapping that sends one name to two fields is invalid metadata.
+    write(r#"[{"field-id": 1, "names": ["id"]}, {"field-id": 2, "names": ["id"]}]"#);
+    let err = register(&SessionContext::new(), &dir).await.unwrap_err();
+    assert!(err.to_string().contains("maps to two fields"), "{err}");
+}
+
 /// Nested Iceberg types map to Arrow nested types (ADR 0041); a history
 /// that renamed a nested child is refused (children resolve by name).
 #[tokio::test]
@@ -1004,6 +1085,41 @@ async fn reads_nested_spark_types() {
         .unwrap()
         .to_string();
     assert!(text.contains("{a: 1, b: x, c: }"), "{text}");
+    assert_eq!(pool.used(), 0);
+}
+
+/// Plain Parquet imported with Spark's `add_files` (no field ids; Iceberg
+/// records a name mapping), then both columns renamed and a native insert
+/// (ADR 0042). Spark reads ids 0..4 as t0..t4, plus (10, native).
+#[tokio::test]
+#[ignore = "needs PLIMSOLL_ICEBERG_IMPORTED from scripts/spark_mor_fixture.sh"]
+async fn reads_files_imported_without_field_ids() {
+    let Ok(location) = std::env::var("PLIMSOLL_ICEBERG_IMPORTED") else {
+        return;
+    };
+    let pool = Arc::new(CeilingPool::new(256 << 20, 0).unwrap());
+    let ctx = session_context_with_ceiling(pool.clone(), None, SessionConfig::new()).unwrap();
+    IcebergConnector::try_new("imp", &location, &ctx.state())
+        .await
+        .unwrap()
+        .register(&ctx)
+        .unwrap();
+    assert_eq!(
+        ids(&ctx, "SELECT id FROM imp ORDER BY id").await.unwrap(),
+        [0, 1, 2, 3, 4, 10]
+    );
+    assert_eq!(
+        ids(&ctx, "SELECT id FROM imp WHERE city = 't3'")
+            .await
+            .unwrap(),
+        [3]
+    );
+    assert_eq!(
+        ids(&ctx, "SELECT id FROM imp WHERE city = 'native'")
+            .await
+            .unwrap(),
+        [10]
+    );
     assert_eq!(pool.used(), 0);
 }
 

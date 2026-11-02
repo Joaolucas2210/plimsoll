@@ -98,9 +98,8 @@ then be unusable on any table with ordinary maintenance. Rejected.
   metadata, schemas usually compare equal, and the adapter rarely runs.
 
 **Negative (accepted)**
-- **Files without field ids in renamed tables are refused.** Iceberg's
-  name mapping (`schema.name-mapping.default`), used by `add_files`
-  imports, is not implemented.
+- **Files without field ids in renamed tables are refused** unless the
+  table has a name mapping, which ADR 0042 adds.
 - **Field-id metadata reaches the results of renamed tables.** Their
   query output schemas carry `PARQUET:field_id` metadata on table
   columns. JSON responses do not show it; Arrow IPC results (ADR 0037)

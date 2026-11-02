@@ -4,10 +4,11 @@
 # position deletes (reads_a_spark_merge_on_read_table) and equality deletes
 # (reads_reference_equality_deletes), v3 deletion vectors
 # (reads_reference_deletion_vectors), schema evolution
-# (reads_an_evolved_spark_table) and nested types (reads_nested_spark_types).
+# (reads_an_evolved_spark_table), nested types (reads_nested_spark_types) and
+# name-mapped imports (reads_files_imported_without_field_ids).
 #
 #   scripts/spark_mor_fixture.sh <warehouse-dir>
-#   # prints PLIMSOLL_ICEBERG_{MOR,EQ,EVOLVED,NESTED,DV}=...
+#   # prints PLIMSOLL_ICEBERG_{MOR,EQ,EVOLVED,NESTED,IMPORTED,DV}=...
 #
 # The warehouse is mounted at the same absolute path inside the container, so
 # the paths Spark records in the metadata are valid on the host.
@@ -141,6 +142,24 @@ try {
     .collect().map(_.toString).mkString(";")
   require(nested == "[1,1,null,2,1];[2,null,null,0,null];[3,3,new,1,3]", s"Spark reads $nested")
 
+  // Name mapping (ADR 0042): plain Parquet (no field ids) imported with
+  // add_files, which records schema.name-mapping.default; then both
+  // columns renamed (the mapping keeps the old names) and a native insert.
+  val raw = spark.conf.get("spark.sql.catalog.local.warehouse") + "/raw/imported"
+  spark.range(0, 5).selectExpr("id AS ident", "concat('t', CAST(id AS STRING)) AS town")
+    .write.parquet(raw)
+  Seq(
+    """CREATE TABLE local.db.imported (ident BIGINT, town STRING) USING iceberg
+       TBLPROPERTIES ('format-version'='2')""",
+    s"CALL local.system.add_files(table => 'db.imported', source_table => '`parquet`.`$raw`')",
+    "ALTER TABLE local.db.imported RENAME COLUMN ident TO id",
+    "ALTER TABLE local.db.imported RENAME COLUMN town TO city",
+    "INSERT INTO local.db.imported VALUES (10, 'native')"
+  ).foreach(spark.sql)
+  val imported = spark.sql("SELECT id, city FROM local.db.imported ORDER BY id")
+    .collect().map(_.toString).mkString(";")
+  require(imported == "[0,t0];[1,t1];[2,t2];[3,t3];[4,t4];[10,native]", s"Spark reads $imported")
+
   // The fixture is only useful if the reference engine agrees with it.
   val ids = spark.sql("SELECT id FROM local.db.eq ORDER BY id").collect().map(_.getLong(0)).toSeq
   require(ids == Seq(2L, 4L, 5L, 6L), s"Spark reads $ids")
@@ -162,4 +181,5 @@ echo "PLIMSOLL_ICEBERG_MOR=$wh/db/mor"
 echo "PLIMSOLL_ICEBERG_EQ=$wh/db/eq"
 echo "PLIMSOLL_ICEBERG_EVOLVED=$wh/db/evolved"
 echo "PLIMSOLL_ICEBERG_NESTED=$wh/db/nested"
+echo "PLIMSOLL_ICEBERG_IMPORTED=$wh/db/imported"
 echo "PLIMSOLL_ICEBERG_DV=$wh/db/dv"
