@@ -117,6 +117,9 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_MAX_RUNNING_PER_USER` | `PLIMSOLL_MAX_RUNNING` | Per-user running limit |
 | `PLIMSOLL_QUERY_TIMEOUT_MS` | `30000` | Deadline for queue wait + execution |
 | `PLIMSOLL_DRAIN_DELAY_MS` | `5000` | After SIGTERM: `/readyz` is 503 but queries are still served for this long, then the listener closes (ctrl-c skips it) (ADR 0026) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP/HTTP collector base URL (e.g. `http://collector:4318`); spans go to `/v1/traces` as JSON. Unset = trace context is still propagated, nothing exported (ADR 0031) |
+| `OTEL_EXPORTER_OTLP_HEADERS` | unset | `x-api-key=...,x-tenant=...` sent with every export (secret, env only, never logged) |
+| `OTEL_SERVICE_NAME` | `plimsoll` | `service.name` of exported spans |
 | `PLIMSOLL_SPILL_DIR` | unset | Spill directory; unset = no spill, pressure fails the query |
 | `PLIMSOLL_PARQUET_TABLES` | unset | `bronze.trips=/data/trips/,gold.daily=/data/d.parquet` |
 | `PLIMSOLL_ICEBERG_TABLES` | unset | `bronze.trips=/wh/bronze/trips` (table dir or `*.metadata.json`) |

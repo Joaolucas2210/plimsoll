@@ -8,6 +8,7 @@ use std::time::Duration;
 use plimsoll_control::governance::{AdmissionConfig, Limits};
 
 use crate::auth::Auth;
+use crate::trace::OtlpConfig;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("invalid {var}={value:?}: {reason}")]
@@ -29,6 +30,8 @@ pub struct Config {
     pub drain_delay: Duration,
     /// Who may run SQL (ADR 0021).
     pub auth: Auth,
+    /// Trace export; `None` = traces are only propagated (ADR 0031).
+    pub otlp: Option<OtlpConfig>,
 }
 
 impl Config {
@@ -84,8 +87,66 @@ impl Config {
             query_timeout: Duration::from_millis(timeout_ms),
             drain_delay: Duration::from_millis(drain_ms),
             auth,
+            otlp: otlp(&lookup)?,
         })
     }
+}
+
+/// The standard OpenTelemetry variables, so a deployment's existing OTel
+/// settings apply: `OTEL_EXPORTER_OTLP_ENDPOINT` (http/protobuf-style base
+/// URL; Plimsoll sends JSON), `OTEL_EXPORTER_OTLP_HEADERS=k=v,k2=v2`,
+/// `OTEL_SERVICE_NAME` (default `plimsoll`).
+fn otlp(lookup: &impl Fn(&str) -> Option<String>) -> Result<Option<OtlpConfig>, ConfigError> {
+    let Some(endpoint) = lookup("OTEL_EXPORTER_OTLP_ENDPOINT") else {
+        return Ok(None);
+    };
+    let endpoint = endpoint.trim().to_owned();
+    if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+        return Err(ConfigError {
+            var: "OTEL_EXPORTER_OTLP_ENDPOINT",
+            value: endpoint,
+            reason: "expected an http:// or https:// URL",
+        });
+    }
+    const VAR: &str = "OTEL_EXPORTER_OTLP_HEADERS";
+    let mut headers = Vec::new();
+    for entry in lookup(VAR).unwrap_or_default().split(',') {
+        if entry.trim().is_empty() {
+            continue;
+        }
+        // The value is a secret: never echoed in the error.
+        let err = |reason| ConfigError {
+            var: VAR,
+            value: entry
+                .split('=')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+            reason,
+        };
+        let (k, v) = entry
+            .split_once('=')
+            .ok_or_else(|| err("expected `name=value` entries"))?;
+        let (k, v) = (k.trim(), v.trim());
+        // ponytail: values are taken verbatim; the spec allows %-encoding,
+        // decode it when a collector's key needs reserved characters.
+        if axum::http::HeaderName::from_bytes(k.as_bytes()).is_err()
+            || axum::http::HeaderValue::from_str(v).is_err()
+        {
+            return Err(err("invalid header name or value"));
+        }
+        headers.push((k.to_owned(), v.to_owned()));
+    }
+    let service_name = lookup("OTEL_SERVICE_NAME")
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "plimsoll".to_owned());
+    Ok(Some(OtlpConfig {
+        endpoint,
+        headers,
+        service_name,
+    }))
 }
 
 /// `PLIMSOLL_RESOURCE_GROUPS=interactive=4/16,batch=2/64`: per group, max
@@ -228,5 +289,31 @@ mod tests {
                 .max_queued,
             0
         );
+    }
+
+    #[test]
+    fn otlp_export_uses_the_standard_otel_variables() {
+        assert_eq!(cfg(&[]).unwrap().otlp, None);
+        let c = cfg(&[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318"),
+            ("OTEL_EXPORTER_OTLP_HEADERS", "x-api-key=s3cr3t, x-tenant=a"),
+        ])
+        .unwrap()
+        .otlp
+        .unwrap();
+        assert_eq!(c.endpoint, "http://collector:4318");
+        assert_eq!(c.service_name, "plimsoll");
+        assert_eq!(c.headers[1], ("x-tenant".into(), "a".into()));
+        assert!(!format!("{c:?}").contains("s3cr3t"));
+
+        let e = cfg(&[("OTEL_EXPORTER_OTLP_ENDPOINT", "collector:4318")]).unwrap_err();
+        assert_eq!(e.var, "OTEL_EXPORTER_OTLP_ENDPOINT");
+        let e = cfg(&[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://c"),
+            ("OTEL_EXPORTER_OTLP_HEADERS", "bad header=s3cr3t"),
+        ])
+        .unwrap_err();
+        assert_eq!(e.var, "OTEL_EXPORTER_OTLP_HEADERS");
+        assert!(!e.to_string().contains("s3cr3t"), "{e}");
     }
 }

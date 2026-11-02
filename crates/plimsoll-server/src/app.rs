@@ -22,6 +22,7 @@ use crate::auth::Auth;
 use crate::engine::{EngineError, QueryEngine, QueryOutput};
 use crate::log::{QueryLog, level_for};
 use crate::metrics::{self, Latency, PoolStatsProvider};
+use crate::trace::{self, TraceContext, Tracer};
 use futures::StreamExt;
 
 pub struct AppState {
@@ -40,6 +41,8 @@ pub struct AppState {
     pub errors: ErrorCounts,
     pub latency: Latency,
     pub auth: Auth,
+    /// OTLP export; traces are propagated even without it (ADR 0031).
+    pub tracer: Option<Tracer>,
 }
 
 #[derive(Default)]
@@ -245,8 +248,14 @@ async fn sql(
     body: Result<Json<SqlRequest>, JsonRejection>,
 ) -> Response {
     let started = Instant::now();
-    let mut log = QueryLog::default();
-    let response = run_sql(&st, &headers, body, &mut log).await;
+    let wall = std::time::SystemTime::now();
+    let ctx =
+        TraceContext::from_traceparent(headers.get("traceparent").and_then(|v| v.to_str().ok()));
+    let mut log = QueryLog {
+        trace_id: Some(ctx.trace_id.clone()),
+        ..Default::default()
+    };
+    let mut response = run_sql(&st, &headers, body, &mut log).await;
     log.total = started.elapsed();
     let status = response.status().as_u16();
     let error = response
@@ -254,6 +263,12 @@ async fn sql(
         .get::<ErrorInfo>()
         .map(|e| (e.code, e.message.as_str()));
     crate::log::emit(level_for(status), "query", log.fields(status, error));
+    if let (Some(tracer), true) = (&st.tracer, ctx.sampled) {
+        tracer.record(trace::spans(&ctx, wall, &log, status, error));
+    }
+    if let Ok(v) = HeaderValue::from_str(&ctx.traceparent()) {
+        response.headers_mut().insert("traceparent", v);
+    }
     response
 }
 
@@ -450,6 +465,7 @@ mod tests {
             errors: ErrorCounts::default(),
             latency: Latency::default(),
             auth: Auth::Disabled,
+            tracer: None,
         })
     }
 
@@ -527,6 +543,31 @@ mod tests {
         let (_, body) = call(router(st), get_req("/metrics")).await;
         assert!(body.contains("plimsoll_pool_used_bytes 5"));
         assert!(body.contains("plimsoll_queries_total{state=\"finished\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn sql_continues_the_callers_trace() {
+        let mut req = sql_req(json!({"sql": "select 1", "user": "ana"}));
+        req.headers_mut().insert(
+            "traceparent",
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+        let res = router(default_state()).oneshot(req).await.unwrap();
+        let tp = res.headers()["traceparent"].to_str().unwrap();
+        assert!(
+            tp.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-"),
+            "{tp}"
+        );
+        assert!(
+            !tp.contains("00f067aa0ba902b7"),
+            "a new span for this request"
+        );
+        // Without one, every request (rejections included) starts a trace.
+        let res = router(default_state())
+            .oneshot(sql_req(json!({"sql": "select 1"})))
+            .await
+            .unwrap();
+        assert_eq!(res.headers()["traceparent"].len(), 55);
     }
 
     #[tokio::test]

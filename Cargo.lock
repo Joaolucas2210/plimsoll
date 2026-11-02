@@ -2605,6 +2605,7 @@ dependencies = [
  "plimsoll-connectors",
  "plimsoll-control",
  "plimsoll-core",
+ "reqwest",
  "ring",
  "serde",
  "serde_json",

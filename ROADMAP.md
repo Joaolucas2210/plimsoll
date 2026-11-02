@@ -47,6 +47,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Query traces: W3C `traceparent` in/out, `trace_id` in logs, OTLP/HTTP JSON export of a span per query and phase (ADR 0031)
 - [x] Iceberg metadata tables: `"table$snapshots"`, `"table$history"`, `"table$refs"` (ADR 0030)
 - [x] Iceberg branches and tags: `"table@<ref>"` (ADR 0029)
 - [x] Iceberg time travel: `"table@<snapshot-id>"` / `"table@<RFC 3339 instant>"`, snapshot's own schema, grants unchanged (ADR 0028)
@@ -62,10 +63,14 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**OTLP traces and metrics export** (OpenTelemetry): query-level spans for
-admission wait, planning and execution, keyed by `query_id`, replacing the
-hand-rolled logger with `tracing` (ADR 0027's upgrade path).
+**Iceberg file metadata tables**: `"trips$files"`, `"trips$partitions"`,
+`"trips$manifests"`, read through the planning path under the ceiling, so
+users can see file sizes, partition skew and small-file problems
+(ADR 0030's revisit item).
 
 ## Later
+
+- Spans below the request (per-operator, per-fetch) via `tracing` +
+  `opentelemetry-otlp`, and OTLP metrics (ADR 0031's upgrade path).
 
 - Coordinator/worker split along the existing plane boundary.

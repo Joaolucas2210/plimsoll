@@ -21,6 +21,9 @@ futures.workspace = true
 # ADR 0021: SHA-256 for token digests. Already in the build as the rustls
 # provider (ADR 0015), so no new crate.
 ring = "0.17"
+# ADR 0031: OTLP/HTTP trace export. Same reqwest line and features as the
+# catalog client (ADR 0015), so no new crate in the build.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 
 [dev-dependencies]
 tower = { version = "0.5", default-features = false, features = ["util"] }

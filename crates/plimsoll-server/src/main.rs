@@ -21,6 +21,7 @@ use plimsoll_server::config::Config;
 use plimsoll_server::engine::CoreEngine;
 use plimsoll_server::log::{self, Level};
 use plimsoll_server::metrics::PoolStats;
+use plimsoll_server::trace::Tracer;
 use plimsoll_server::{lakehouse, system, tables};
 use serde_json::json;
 
@@ -80,6 +81,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let n = tables::register_from_env(engine.context(), |k| std::env::var(k).ok()).await?;
     log::emit(Level::Info, "env_tables_registered", json!({ "tables": n }));
 
+    let (tracer, exporter) = match cfg.otlp.clone() {
+        Some(otlp) => {
+            let (t, h) = Tracer::spawn(otlp)?;
+            (Some(t), Some(h))
+        }
+        None => (None, None),
+    };
+
     let stats_engine = engine.clone();
     let state = Arc::new(AppState {
         engine: Arc::new(CoreEngine(engine)),
@@ -97,6 +106,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         errors: Default::default(),
         latency: Default::default(),
         auth: cfg.auth.clone(),
+        tracer,
     });
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
@@ -107,6 +117,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "addr": listener.local_addr()?.to_string(),
             "catalog": catalog.as_ref().map(|c| c.uri.as_str()),
             "auth": format!("{:?}", cfg.auth),
+            "otlp": cfg.otlp.as_ref().map(|o| o.endpoint.as_str()),
         }),
     );
     if cfg.auth == Auth::Disabled {
@@ -126,8 +137,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     state.ready.store(true, Ordering::Relaxed);
 
     axum::serve(listener, app::router(state.clone()))
-        .with_graceful_shutdown(shutdown_signal(state, cfg.drain_delay))
+        .with_graceful_shutdown(shutdown_signal(state.clone(), cfg.drain_delay))
         .await?;
+    // Spans of the last queries: flushed, but never allowed to hold the exit.
+    if let (Some(tracer), Some(exporter)) = (&state.tracer, exporter) {
+        tracer.shutdown();
+        if tokio::time::timeout(std::time::Duration::from_secs(5), exporter)
+            .await
+            .is_err()
+        {
+            log::emit(Level::Warn, "trace_flush_timeout", json!({}));
+        }
+    }
     log::emit(Level::Info, "stopped", json!({}));
     Ok(())
 }

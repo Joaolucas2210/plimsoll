@@ -60,6 +60,8 @@ pub struct QueryLog {
     /// do not belong in logs. Correlate with `system.runtime.queries`.
     pub sql_sha256: Option<String>,
     pub sql_bytes: usize,
+    /// W3C trace id, to jump from a log line to its trace (ADR 0031).
+    pub trace_id: Option<String>,
     pub queue: Option<Duration>,
     pub planning: Option<Duration>,
     pub execution: Option<Duration>,
@@ -96,6 +98,7 @@ impl QueryLog {
             "resource_group": self.resource_group,
             "sql_sha256": self.sql_sha256,
             "sql_bytes": self.sql_bytes,
+            "trace_id": self.trace_id,
             "queue_ms": ms(self.queue),
             "planning_ms": ms(self.planning),
             "execution_ms": ms(self.execution),
