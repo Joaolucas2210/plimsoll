@@ -20,6 +20,7 @@ use futures::StreamExt;
 pub struct AccountedExec {
     label: String,
     input: Arc<dyn ExecutionPlan>,
+    pinned: Option<String>,
 }
 
 impl AccountedExec {
@@ -28,7 +29,20 @@ impl AccountedExec {
         Self {
             label: label.into(),
             input,
+            pinned: None,
         }
+    }
+
+    /// Declares that this source reads immutable data identified by `id`
+    /// (an Iceberg table at a snapshot): the same `id` always yields the
+    /// same rows. Lets the result cache key on it (ADR 0038).
+    pub fn with_pinned(mut self, id: impl Into<String>) -> Self {
+        self.pinned = Some(id.into());
+        self
+    }
+
+    pub fn pinned(&self) -> Option<&str> {
+        self.pinned.as_deref()
     }
 }
 
@@ -67,7 +81,11 @@ impl ExecutionPlan for AccountedExec {
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match (children.pop(), children.is_empty()) {
-            (Some(input), true) => Ok(Arc::new(Self::new(self.label.clone(), input))),
+            (Some(input), true) => Ok(Arc::new(Self {
+                label: self.label.clone(),
+                input,
+                pinned: self.pinned.clone(),
+            })),
             _ => internal_err!("AccountedExec takes exactly one child"),
         }
     }

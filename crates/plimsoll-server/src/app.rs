@@ -810,6 +810,7 @@ mod tests {
                 cache_reserve_bytes: 0,
                 spill_bytes_total: 0,
                 groups: vec![],
+                result_cache: None,
             }),
             query_timeout: timeout,
             ready: AtomicBool::new(true),

@@ -69,7 +69,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(dir) = &spill_dir {
         std::fs::create_dir_all(dir)?;
     }
-    let engine = Arc::new(Engine::new(pool.clone(), spill_dir)?);
+    let engine = Arc::new(
+        Engine::new(pool.clone(), spill_dir)?
+            .with_result_cache(usize::try_from(cfg.result_cache_bytes)?),
+    );
     system::register(engine.context(), admission.registry().clone())?;
     // Catalog first: env tables aimed at a catalog-backed schema then fail
     // fast (those schemas are read-only) instead of being silently shadowed.
@@ -114,6 +117,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .into_iter()
                 .map(|(g, share, used)| (g, share as u64, used as u64))
                 .collect(),
+            result_cache: stats_engine.result_cache_stats(),
         }),
         query_timeout: cfg.query_timeout,
         ready: AtomicBool::new(false),

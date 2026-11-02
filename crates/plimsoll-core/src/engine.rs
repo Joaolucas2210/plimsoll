@@ -27,6 +27,7 @@ use crate::federation::preevaluate_scalar_subqueries;
 use crate::memory::{
     CeilingPool, ConsumerKind, GroupPool, Reservation, session_context_with_ceiling, spilled_bytes,
 };
+use crate::result_cache::{self, CacheStats, ResultCache};
 
 /// Medallion convention: these schemas always exist in the default catalog.
 pub const MEDALLION: [&str; 3] = ["bronze", "silver", "gold"];
@@ -77,6 +78,7 @@ pub struct AccessDenied {
 pub struct Engine {
     ctx: SessionContext,
     pool: Arc<CeilingPool>,
+    result_cache: Option<Arc<ResultCache>>,
     spilled_total: Arc<AtomicU64>,
 }
 
@@ -99,8 +101,21 @@ impl Engine {
         Ok(Self {
             ctx,
             pool,
+            result_cache: None,
             spilled_total: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Caches results of queries over pinned inputs, up to `max_bytes`
+    /// reserved in the pool (ADR 0038). `0` disables it.
+    pub fn with_result_cache(mut self, max_bytes: usize) -> Self {
+        self.result_cache =
+            (max_bytes > 0).then(|| Arc::new(ResultCache::new(&self.pool, max_bytes)));
+        self
+    }
+
+    pub fn result_cache_stats(&self) -> Option<CacheStats> {
+        self.result_cache.as_ref().map(|c| c.stats())
     }
 
     /// For registering tables, catalogs and system tables.
@@ -227,9 +242,23 @@ impl Engine {
                 Ok(TreeNodeRecursion::Continue)
             })?;
         }
+        // Before optimization and subquery pre-evaluation (ADR 0038).
+        let cache = self
+            .result_cache
+            .as_ref()
+            .filter(|_| result_cache::deterministic(&plan));
         let plan = preevaluate_scalar_subqueries(&state, plan).await?;
         let physical = state.create_physical_plan(&plan).await?;
-        let stream = execute_stream(physical.clone(), state.task_ctx())?;
+        // Grants were checked above: a hit is only served to a principal
+        // allowed to read every input.
+        let key = cache.and_then(|_| result_cache::key(sql, &physical));
+        let stream = match (cache, key) {
+            (Some(cache), Some(key)) => match cache.get(&key) {
+                Some(hit) => hit,
+                None => cache.tee(key, execute_stream(physical.clone(), state.task_ctx())?),
+            },
+            _ => execute_stream(physical.clone(), state.task_ctx())?,
+        };
         Ok(QueryStream {
             stream,
             planning: started.elapsed(),

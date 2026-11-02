@@ -36,6 +36,8 @@ pub struct Config {
     pub catalog_refresh: Duration,
     /// Percent of the memory ceiling each capped group may hold (ADR 0036).
     pub group_memory: HashMap<String, u8>,
+    /// Result cache size, reserved in the pool; zero = off (ADR 0038).
+    pub result_cache_bytes: u64,
 }
 
 impl Config {
@@ -77,6 +79,19 @@ impl Config {
         )?;
 
         let (groups, group_memory) = resource_groups(&lookup)?;
+        let result_cache_bytes: u64 = parse(
+            &lookup,
+            "PLIMSOLL_RESULT_CACHE_BYTES",
+            Some(0),
+            "expected a non-negative integer",
+        )?;
+        if result_cache_bytes > memory_limit_bytes / 2 {
+            return Err(ConfigError {
+                var: "PLIMSOLL_RESULT_CACHE_BYTES",
+                value: result_cache_bytes.to_string(),
+                reason: "at most half of PLIMSOLL_MEMORY_LIMIT_BYTES",
+            });
+        }
         let global = Limits {
             max_running,
             max_queued,
@@ -102,6 +117,7 @@ impl Config {
             otlp: otlp(&lookup)?,
             catalog_refresh: Duration::from_millis(refresh_ms),
             group_memory,
+            result_cache_bytes,
         })
     }
 }
@@ -363,5 +379,18 @@ mod tests {
         assert!(c.catalog_refresh.is_zero());
         let e = cfg(&[("PLIMSOLL_CATALOG_REFRESH_MS", "-1")]).unwrap_err();
         assert_eq!(e.var, "PLIMSOLL_CATALOG_REFRESH_MS");
+    }
+
+    #[test]
+    fn result_cache_is_off_by_default_and_bounded_by_the_ceiling() {
+        assert_eq!(cfg(&[]).unwrap().result_cache_bytes, 0);
+        let c = cfg(&[("PLIMSOLL_RESULT_CACHE_BYTES", "1048576")]).unwrap();
+        assert_eq!(c.result_cache_bytes, 1 << 20);
+        let e = cfg(&[
+            ("PLIMSOLL_MEMORY_LIMIT_BYTES", "1000"),
+            ("PLIMSOLL_RESULT_CACHE_BYTES", "501"),
+        ])
+        .unwrap_err();
+        assert_eq!(e.var, "PLIMSOLL_RESULT_CACHE_BYTES");
     }
 }

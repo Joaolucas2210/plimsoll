@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use plimsoll_control::governance::QueryTotals;
+use plimsoll_core::result_cache::CacheStats;
 
 /// Memory pool figures from the compute plane's CeilingPool.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -23,6 +24,8 @@ pub struct PoolStats {
     pub spill_bytes_total: u64,
     /// `(group, share, used)` for resource groups with a share (ADR 0036).
     pub groups: Vec<(String, u64, u64)>,
+    /// When the result cache is on (ADR 0038).
+    pub result_cache: Option<CacheStats>,
 }
 
 /// INTEGRATION POINT: a closure reading the live CeilingPool counters.
@@ -142,6 +145,29 @@ pub fn render(
         "Bytes held by a resource group's queries.",
         &refs(&used),
     );
+    if let Some(c) = pool.result_cache {
+        metric(
+            "plimsoll_result_cache_requests_total",
+            "counter",
+            "Cacheable queries by outcome (ADR 0038).",
+            &[
+                ("{outcome=\"hit\"}", c.hits),
+                ("{outcome=\"miss\"}", c.misses),
+            ],
+        );
+        metric(
+            "plimsoll_result_cache_bytes",
+            "gauge",
+            "Bytes held by cached results and results being collected.",
+            &[("", c.bytes as u64)],
+        );
+        metric(
+            "plimsoll_result_cache_entries",
+            "gauge",
+            "Cached results.",
+            &[("", c.entries as u64)],
+        );
+    }
     metric(
         "plimsoll_spill_bytes_total",
         "counter",
@@ -212,6 +238,13 @@ mod tests {
             cache_reserve_bytes: 6,
             spill_bytes_total: 3,
             groups: vec![("batch".into(), 40, 7)],
+            result_cache: Some(CacheStats {
+                hits: 3,
+                misses: 2,
+                entries: 1,
+                bytes: 64,
+                max_bytes: 128,
+            }),
         };
         let totals = QueryTotals {
             finished: 4,
@@ -231,6 +264,8 @@ mod tests {
             "plimsoll_spill_bytes_total 3",
             "plimsoll_pool_group_share_bytes{group=\"batch\"} 40",
             "plimsoll_pool_group_used_bytes{group=\"batch\"} 7",
+            "plimsoll_result_cache_requests_total{outcome=\"hit\"} 3",
+            "plimsoll_result_cache_bytes 64",
             "plimsoll_queries_running 2",
             "plimsoll_queries_queued 1",
             "plimsoll_queries_total{state=\"finished\"} 4",

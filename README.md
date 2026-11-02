@@ -121,6 +121,7 @@ Configuration is environment-only; invalid values abort startup.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP/HTTP collector base URL (e.g. `http://collector:4318`); spans go to `/v1/traces` as JSON. Unset = trace context is still propagated, nothing exported (ADR 0031) |
 | `OTEL_EXPORTER_OTLP_HEADERS` | unset | `x-api-key=...,x-tenant=...` sent with every export (secret, env only, never logged) |
 | `OTEL_SERVICE_NAME` | `plimsoll` | `service.name` of exported spans |
+| `PLIMSOLL_RESULT_CACHE_BYTES` | `0` (off) | Result cache for repeated queries over Iceberg snapshots, reserved in the memory pool, at most half the ceiling; keyed by SQL + every table's snapshot id, so a new commit is a miss (ADR 0038) |
 | `PLIMSOLL_SPILL_DIR` | unset | Spill directory; unset = no spill, pressure fails the query |
 | `PLIMSOLL_PARQUET_TABLES` | unset | `bronze.trips=/data/trips/,gold.daily=/data/d.parquet` |
 | `PLIMSOLL_ICEBERG_TABLES` | unset | `bronze.trips=/wh/bronze/trips` (table dir or `*.metadata.json`) |

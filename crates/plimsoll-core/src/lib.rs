@@ -5,6 +5,7 @@
 pub mod engine;
 pub mod federation;
 pub mod memory;
+pub mod result_cache;
 pub mod storage;
 
 /// Re-exported so downstream crates share one DataFusion version.

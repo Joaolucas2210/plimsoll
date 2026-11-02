@@ -743,7 +743,14 @@ impl TableProvider for IcebergTable {
                 stats.cache_hits,
             ),
             UnionExec::try_new(plans)?,
-        )))
+        )
+        // A snapshot never changes: same table + snapshot, same rows. The
+        // result cache keys on this (ADR 0038).
+        .with_pinned(format!(
+            "{}@{}",
+            self.name,
+            self.snapshot_id.map_or("none".to_owned(), |id| id.to_string())
+        ))))
     }
 }
 

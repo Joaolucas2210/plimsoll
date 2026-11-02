@@ -311,6 +311,25 @@ async fn reads_only_live_files_of_the_current_snapshot() {
     assert!(plan.contains("AccountedExec: IcebergScan[t]"), "{plan}");
 }
 
+/// Iceberg scans declare table@snapshot, so results over them can be
+/// cached and a new snapshot is a new key (ADR 0038).
+#[tokio::test]
+async fn iceberg_scans_are_pinned_to_their_snapshot() {
+    let dir = tmp("pinned");
+    table(&dir, Deletes::None, false);
+    let ctx = SessionContext::new();
+    register(&ctx, &dir).await.unwrap();
+    let physical = ctx
+        .sql("SELECT id FROM t WHERE id > 1")
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let key = plimsoll_core::result_cache::key("q", &physical).unwrap();
+    assert!(key.ends_with("t@1"), "{key:?}");
+}
+
 #[tokio::test]
 async fn position_deletes_are_applied_as_row_selections() {
     let dir = tmp("pos-deletes");
