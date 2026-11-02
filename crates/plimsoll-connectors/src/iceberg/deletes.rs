@@ -85,6 +85,9 @@ impl EqualityDelete {
 /// named after the table's `key` fields. Cached per (file, key types); on a
 /// miss the file is read whole. The keys are reserved while planning (the hash
 /// join reserves them again when it builds, ADR 0016).
+// ponytail: eight arguments; a struct for the key columns (fields, ids,
+// mapping) if a ninth ever arrives.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn equality_keys(
     state: &dyn Session,
     scoped: Option<&ScopedStore>,
