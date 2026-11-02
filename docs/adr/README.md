@@ -41,6 +41,7 @@ are allowed in place.
 | [0031](0031-query-traces.md) | Query traces over OTLP/HTTP JSON | Accepted | 2026-11-01 | W3C `traceparent` continued or started per `/v1/sql` request and echoed; `trace_id` in the query log; with `OTEL_EXPORTER_OTLP_ENDPOINT`, a `query` span plus one per phase, batched to `/v1/traces` without an OTel SDK | 0019, 0027, 0015, 0004 |
 | [0032](0032-iceberg-file-metadata-tables.md) | Iceberg file metadata tables: `$files`, `$manifests` | Accepted | 2026-11-01 | Manifests read at execution through a streaming partition, one batch per manifest, fetches reserved in the pool; Spark column names; partition as JSON text | 0030, 0012, 0020, 0025 |
 | [0033](0033-live-catalog-listings.md) | Live catalog listings | Accepted | 2026-11-01 | A periodic re-list (`PLIMSOLL_CATALOG_REFRESH_MS`, 60 s) updates table names and registers new namespaces; list-then-swap so a catalog error changes nothing; never shadows env tables | 0008, 0030 |
+| [0034](0034-query-cancellation.md) | Query cancellation | Accepted | 2026-11-01 | `DELETE /v1/queries/{id}`: a per-query `Notify` in the registry races the deadline; cancelling drops the governed future (queue wait or execution); owners and operators only, others get 404; the query answers `409 query_cancelled` | 0013, 0021, 0022, 0026 |
 
 ## Reading order
 

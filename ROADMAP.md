@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Query cancellation: `DELETE /v1/queries/{id}` for owners and operators; queued or running; slot and memory released (ADR 0034)
 - [x] Live catalog listings: tables and namespaces created after boot appear in `SHOW TABLES` / `information_schema` (`PLIMSOLL_CATALOG_REFRESH_MS`) (ADR 0033)
 - [x] Iceberg file metadata tables: `"table$files"`, `"table$manifests"`, streamed per manifest under the ceiling (ADR 0032)
 - [x] Query traces: W3C `traceparent` in/out, `trace_id` in logs, OTLP/HTTP JSON export of a span per query and phase (ADR 0031)
@@ -66,9 +67,10 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Query cancellation**: `DELETE /v1/queries/{id}` (owner or operator)
-stops a running query, releases its memory and admission slot, and is
-recorded as `cancelled` in `system.runtime.queries`.
+**Paged results for large answers**: today a result is materialised as one
+JSON body under the output reserve, so big answers fail with
+`memory_limit_exceeded`. Stream rows (NDJSON or Arrow IPC) with
+back-pressure, keeping the reservation bounded by the in-flight window.
 
 ## Later
 

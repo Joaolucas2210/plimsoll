@@ -151,6 +151,14 @@ Configuration is environment-only; invalid values abort startup.
 | `engine_not_wired` | 501 | Compute plane not connected yet |
 | `not_ready` | 503 | Starting or draining |
 | `query_timeout` | 504 | Deadline exceeded; query cancelled |
+| `query_cancelled` | 409 | Stopped by `DELETE /v1/queries/{id}` (ADR 0034) |
+
+`DELETE /v1/queries/{id}` stops a queued or running query and releases its
+memory and admission slot. Owners cancel their own queries,
+`PLIMSOLL_AUTH_OPERATORS` any. `202` → `{"query_id": 1, "state": "cancelling"}`;
+`404 query_not_found` for unknown ids and for other users' queries;
+`409 query_not_running` once it has finished. Ids are in every response,
+log line and `system.runtime.queries`.
 
 ### Probes
 

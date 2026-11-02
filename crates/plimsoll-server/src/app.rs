@@ -10,10 +10,10 @@ use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use plimsoll_control::governance::{
-    Admission, AdmissionError, DEFAULT_GROUP, GovernedError, QueryRequest,
+    Admission, AdmissionError, CancelOutcome, DEFAULT_GROUP, GovernedError, QueryRequest,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -73,6 +73,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_handler))
         .route("/v1/sql", post(sql))
+        .route("/v1/queries/{id}", delete(cancel_query))
         .with_state(state)
 }
 
@@ -188,6 +189,8 @@ impl ApiError {
                 Self::new(S::SERVICE_UNAVAILABLE, "not_ready", true)
             }
             GovernedError::TimedOut(_) => Self::new(S::GATEWAY_TIMEOUT, "query_timeout", true),
+            // 409: the query conflicted with a cancel request (ADR 0034).
+            GovernedError::Cancelled => Self::new(S::CONFLICT, "query_cancelled", false),
             GovernedError::Failed(e) => match e {
                 EngineError::InvalidQuery(_) => Self::new(S::BAD_REQUEST, "invalid_query", false),
                 // 4xx: the node is healthy; retrying unchanged will not help.
@@ -238,6 +241,67 @@ impl ApiError {
 struct ErrorInfo {
     code: &'static str,
     message: String,
+}
+
+/// `DELETE /v1/queries/{id}` (ADR 0034): stops a queued or running query.
+/// Owners cancel their own queries, operators any. A query the caller may
+/// not see is "not found", so ids of other users' queries leak nothing.
+async fn cancel_query(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let st = st.as_ref();
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let principal = match st.auth.principal(authorization) {
+        Ok(p) => p.map(str::to_owned),
+        Err(e) => {
+            let mut r =
+                ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", false).respond(st, e, None);
+            r.headers_mut()
+                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+            return r;
+        }
+    };
+    let not_found = || {
+        ApiError::new(StatusCode::NOT_FOUND, "query_not_found", false).respond(
+            st,
+            format!("no query {id} visible to this principal"),
+            None,
+        )
+    };
+    let Ok(query_id) = id.parse::<u64>() else {
+        return not_found();
+    };
+    let registry = st.admission.registry();
+    // Auth disabled: development, anyone may cancel (ADR 0021).
+    let viewer = principal.as_deref().map(|p| st.auth.viewer(p));
+    let visible = registry.get(query_id).is_some_and(|q| {
+        viewer
+            .as_ref()
+            .and_then(|v| v.only.as_deref())
+            .is_none_or(|only| only == q.user)
+    });
+    if !visible {
+        return not_found();
+    }
+    match registry.cancel(query_id) {
+        CancelOutcome::Cancelling => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "query_id": query_id, "state": "cancelling" })),
+        )
+            .into_response(),
+        CancelOutcome::NotRunning(state) => {
+            ApiError::new(StatusCode::CONFLICT, "query_not_running", false).respond(
+                st,
+                format!("query {query_id} is already {state}"),
+                Some(query_id),
+            )
+        }
+        CancelOutcome::NotFound => not_found(),
+    }
 }
 
 /// `/v1/sql`: runs the request and writes one structured `query` log line
@@ -411,7 +475,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
-    use plimsoll_control::governance::{AdmissionConfig, Limits, QueryRegistry};
+    use plimsoll_control::governance::{AdmissionConfig, Limits, QueryRegistry, QueryState};
     use tower::ServiceExt;
 
     struct FakeEngine;
@@ -758,6 +822,95 @@ mod tests {
             let (got, text) = call(router(default_state()), sql_req(body)).await;
             assert_eq!((got, error_code(&text).as_str()), (status, code), "{text}");
         }
+    }
+
+    #[tokio::test]
+    async fn owners_and_operators_cancel_queries_others_see_nothing() {
+        let mut st = Arc::into_inner(default_state()).unwrap();
+        let digest = |t: &str| -> String {
+            crate::auth::token_digest(t)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        let tokens = format!(
+            "ana:sha256:{},bob:sha256:{},ops:sha256:{}",
+            digest("ta"),
+            digest("tb"),
+            digest("to")
+        );
+        st.auth = Auth::from_lookup(
+            &|k| match k {
+                "PLIMSOLL_AUTH_TOKENS" => Some(tokens.clone()),
+                "PLIMSOLL_AUTH_OPERATORS" => Some("ops".into()),
+                _ => None,
+            },
+            &|g| g == "default",
+        )
+        .unwrap();
+        let st = Arc::new(st);
+        let run = |token: &str| {
+            Request::post("/v1/sql")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(json!({"sql": "slow"}).to_string()))
+                .unwrap()
+        };
+        let cancel = |token: &str, id: &str| {
+            Request::delete(format!("/v1/queries/{id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let running = |id: u64| {
+            st.admission
+                .registry()
+                .get(id)
+                .is_some_and(|q| q.state == QueryState::Running)
+        };
+        let q1 = tokio::spawn(call(router(st.clone()), run("ta")));
+        while !running(1) {
+            tokio::task::yield_now().await;
+        }
+        // Another user: indistinguishable from a missing query.
+        for (token, id) in [("tb", "1"), ("ta", "999"), ("ta", "x")] {
+            let (status, body) = call(router(st.clone()), cancel(token, id)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{token} {id}: {body}");
+            assert_eq!(error_code(&body), "query_not_found");
+        }
+        let res = router(st.clone())
+            .oneshot(
+                Request::delete("/v1/queries/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(running(1), "nothing above touched the query");
+
+        // The owner cancels; the query's own request ends with 409.
+        let (status, body) = call(router(st.clone()), cancel("ta", "1")).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let (status, body) = q1.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(error_code(&body), "query_cancelled");
+        assert_eq!(st.admission.load(), (0, 0), "slot released");
+        let (status, body) = call(router(st.clone()), cancel("ta", "1")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error_code(&body), "query_not_running");
+
+        // Operators cancel anyone's query.
+        let q2 = tokio::spawn(call(router(st.clone()), run("tb")));
+        while !running(2) {
+            tokio::task::yield_now().await;
+        }
+        let (status, _) = call(router(st.clone()), cancel("to", "2")).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(q2.await.unwrap().0, StatusCode::CONFLICT);
+        let reg = st.admission.registry();
+        assert_eq!(reg.get(2).unwrap().state, QueryState::Cancelled);
+        assert_eq!(reg.totals().cancelled, 2);
     }
 
     #[tokio::test]

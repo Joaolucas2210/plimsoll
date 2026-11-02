@@ -10,7 +10,8 @@
 //! register (Queued) ─► acquire slot ─► Running ─► run future ─► Finished
 //!        │                 │                          │
 //!        │                 └─ queue full ─► Failed    └─ error/timeout ─► Failed
-//!        └─ caller dropped the future at any point ──────────────────────► Cancelled
+//!        ├─ caller dropped the future at any point ──────────────────────► Cancelled
+//!        └─ [`QueryRegistry::cancel`] (queued or running) ────────────────► Cancelled
 //! ```
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -20,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 pub type QueryId = u64;
 
@@ -109,6 +110,18 @@ pub struct QueryRegistry {
     finished: AtomicU64,
     failed: AtomicU64,
     cancelled: AtomicU64,
+    /// Cancel signals of queries not yet terminal (ADR 0034).
+    cancels: Mutex<HashMap<QueryId, Arc<Notify>>>,
+}
+
+/// Result of [`QueryRegistry::cancel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// Signalled; the query stops at its next await point.
+    Cancelling,
+    /// Already finished, failed or cancelled.
+    NotRunning(QueryState),
+    NotFound,
 }
 
 impl QueryRegistry {
@@ -120,7 +133,34 @@ impl QueryRegistry {
             finished: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             cancelled: AtomicU64::new(0),
+            cancels: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Asks a queued or running query to stop. Who may cancel what is the
+    /// caller's decision (the server allows owners and operators).
+    pub fn cancel(&self, id: QueryId) -> CancelOutcome {
+        let Some(info) = self.get(id) else {
+            return CancelOutcome::NotFound;
+        };
+        if info.state.is_terminal() {
+            return CancelOutcome::NotRunning(info.state);
+        }
+        match lock(&self.cancels).get(&id) {
+            Some(signal) => {
+                // Stored as a permit if the query is not awaiting it yet.
+                signal.notify_one();
+                CancelOutcome::Cancelling
+            }
+            // Registered but terminal by now (raced with `finish`).
+            None => {
+                CancelOutcome::NotRunning(self.get(id).map_or(QueryState::Finished, |q| q.state))
+            }
+        }
+    }
+
+    fn cancel_signal(&self, id: QueryId) -> Arc<Notify> {
+        Arc::clone(lock(&self.cancels).entry(id).or_default())
     }
 
     pub fn register(&self, req: &QueryRequest) -> QueryId {
@@ -161,6 +201,7 @@ impl QueryRegistry {
         q.state = state;
         q.finished_at_ms = Some(now_ms());
         q.error = error;
+        lock(&self.cancels).remove(&id);
         let counter = match state {
             QueryState::Finished => &self.finished,
             QueryState::Cancelled => &self.cancelled,
@@ -265,6 +306,8 @@ pub enum GovernedError<E> {
     Rejected(AdmissionError),
     #[error("query exceeded time limit of {}ms", .0.as_millis())]
     TimedOut(Duration),
+    #[error("query cancelled by request")]
+    Cancelled,
     #[error("{0}")]
     Failed(E),
 }
@@ -514,6 +557,7 @@ impl Admission {
         E: fmt::Display,
     {
         let id = self.registry.register(&req);
+        let cancelled = self.registry.cancel_signal(id);
         let _cancel = CancelOnDrop {
             registry: &self.registry,
             id,
@@ -526,11 +570,21 @@ impl Admission {
             self.registry.mark_running(id);
             run(id).await.map_err(GovernedError::Failed)
         };
-        let result = tokio::time::timeout(timeout, governed)
-            .await
-            .unwrap_or(Err(GovernedError::TimedOut(timeout)));
+        // A cancel drops `governed` like the timeout does: queue wait or
+        // execution stops, and the slot and memory are released.
+        let result = tokio::select! {
+            r = tokio::time::timeout(timeout, governed) => {
+                r.unwrap_or(Err(GovernedError::TimedOut(timeout)))
+            }
+            () = cancelled.notified() => Err(GovernedError::Cancelled),
+        };
         match &result {
             Ok(_) => self.registry.finish(id, QueryState::Finished, None),
+            Err(GovernedError::Cancelled) => self.registry.finish(
+                id,
+                QueryState::Cancelled,
+                Some("cancelled by request".to_owned()),
+            ),
             Err(e) => self
                 .registry
                 .finish(id, QueryState::Failed, Some(e.to_string())),
@@ -725,5 +779,57 @@ mod tests {
                 cancelled: 0
             }
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_running_and_queued_queries_and_frees_the_slot() {
+        let adm = admission(lim(1, 10), lim(10, 10), lim(10, 10));
+        let adm = Arc::new(adm);
+        let slow = |adm: Arc<Admission>| async move {
+            adm.execute(req("a"), Duration::from_secs(60), |_| async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok::<_, String>(())
+            })
+            .await
+        };
+        let running = tokio::spawn(slow(adm.clone()));
+        let queued = tokio::spawn(slow(adm.clone()));
+        tokio::task::yield_now().await;
+        while adm.load() != (1, 1) {
+            tokio::task::yield_now().await;
+        }
+        let reg = adm.registry().clone();
+        let (r, q) = (1, 2);
+        assert_eq!(reg.get(r).unwrap().state, QueryState::Running);
+        assert_eq!(reg.get(q).unwrap().state, QueryState::Queued);
+
+        // Queued first: it leaves the queue without ever running.
+        assert_eq!(reg.cancel(q), CancelOutcome::Cancelling);
+        assert!(matches!(
+            queued.await.unwrap(),
+            Err(GovernedError::Cancelled)
+        ));
+        assert_eq!(reg.get(q).unwrap().state, QueryState::Cancelled);
+        assert_eq!(reg.get(q).unwrap().started_at_ms, None);
+        assert_eq!(adm.load(), (1, 0));
+
+        assert_eq!(reg.cancel(r), CancelOutcome::Cancelling);
+        assert!(matches!(
+            running.await.unwrap(),
+            Err(GovernedError::Cancelled)
+        ));
+        let info = reg.get(r).unwrap();
+        assert_eq!(info.state, QueryState::Cancelled);
+        assert_eq!(info.error.as_deref(), Some("cancelled by request"));
+        assert_eq!(adm.load(), (0, 0), "slot released");
+        assert_eq!(reg.totals().cancelled, 2);
+
+        assert_eq!(
+            reg.cancel(r),
+            CancelOutcome::NotRunning(QueryState::Cancelled)
+        );
+        assert_eq!(reg.cancel(999), CancelOutcome::NotFound);
+        // A cancel signal is only kept while a query can still be cancelled.
+        assert!(lock(&reg.cancels).is_empty());
     }
 }
