@@ -401,12 +401,107 @@ async fn equality_deletes_apply_only_to_older_data() {
     );
 }
 
+/// A renamed column in a table whose files carry no field ids cannot be
+/// resolved by name safely: a typed error, never a wrong column (ADR 0040).
 #[tokio::test]
-async fn renamed_columns_are_rejected_at_registration() {
+async fn renamed_tables_without_field_ids_are_refused() {
     let dir = tmp("renamed");
     table(&dir, Deletes::None, true);
-    let err = register(&SessionContext::new(), &dir).await.unwrap_err();
-    assert!(err.to_string().contains("renamed"), "{err}");
+    let ctx = SessionContext::new();
+    register(&ctx, &dir).await.unwrap();
+    let err = ids(&ctx, "SELECT id FROM t").await.unwrap_err();
+    assert!(
+        err.to_string().contains("without Parquet field ids"),
+        "{err}"
+    );
+}
+
+/// Columns resolve by Iceberg field id (ADR 0040): a file written before a
+/// rename reads under the new name, filters included; a column dropped and
+/// re-added under an old name is NULL in older files.
+#[tokio::test]
+async fn columns_resolve_by_field_id_across_renames() {
+    use std::collections::HashMap;
+    let dir = tmp("field-ids");
+    let with_id = |name: &str, ty: DataType, id: i64| {
+        Field::new(name, ty, true).with_metadata(HashMap::from([(
+            "PARQUET:field_id".to_owned(),
+            id.to_string(),
+        )]))
+    };
+    // Written under the first schema: id (1), town (2).
+    let schema = Arc::new(Schema::new(vec![
+        with_id("id", DataType::Int64, 1),
+        with_id("town", DataType::Utf8, 2),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["lisbon", "porto", "braga"])),
+        ],
+    )
+    .unwrap();
+    let path = dir.join("data").join("old.parquet");
+    let mut w = ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let file = format!("file://{}", path.display());
+    let manifest = avro(
+        &dir.join("metadata/m0.avro"),
+        MANIFEST,
+        vec![vec![
+            ("status", Value::Int(1)),
+            ("data_file", data_file(0, &file)),
+        ]],
+    );
+    let list = avro(
+        &dir.join("metadata/snap-1.avro"),
+        MANIFEST_LIST,
+        vec![vec![
+            ("manifest_path", Value::String(manifest)),
+            ("content", Value::Int(0)),
+            ("sequence_number", Value::Long(1)),
+        ]],
+    );
+    let field =
+        |id, name: &str, ty: &str| json!({"id": id, "name": name, "type": ty, "required": false});
+    // Then `town` was renamed to `city`, and a new `town` (field 3) added.
+    let meta = json!({
+        "format-version": 2, "current-schema-id": 1,
+        "schemas": [
+            {"schema-id": 0, "type": "struct", "fields": [field(1, "id", "long"), field(2, "town", "string")]},
+            {"schema-id": 1, "type": "struct", "fields": [
+                field(1, "id", "long"), field(2, "city", "string"), field(3, "town", "string")]}],
+        "current-snapshot-id": 1,
+        "snapshots": [{"snapshot-id": 1, "manifest-list": list}],
+    });
+    std::fs::write(dir.join("metadata/v1.metadata.json"), meta.to_string()).unwrap();
+    let ctx = SessionContext::new();
+    register(&ctx, &dir).await.unwrap();
+    let out = ctx
+        .sql("SELECT id, city, town FROM t WHERE city <> 'porto' ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let text = datafusion::arrow::util::pretty::pretty_format_batches(&out)
+        .unwrap()
+        .to_string();
+    let rows: Vec<Vec<&str>> = text
+        .lines()
+        .filter(|l| l.starts_with("| ") && !l.contains("city"))
+        .map(|l| {
+            l.split('|')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .collect()
+        })
+        .collect();
+    assert_eq!(rows, [["1", "lisbon"], ["3", "braga"]], "{text}");
+    // The re-added `town` is NULL (empty cell) in the old file.
+    assert!(text.contains("| 1  | lisbon |      |"), "{text}");
 }
 
 #[tokio::test]
@@ -719,6 +814,72 @@ async fn reads_reference_equality_deletes() {
         [4, 5]
     );
     assert_eq!(ids(&ctx, "SELECT count(*) FROM eq").await.unwrap(), [4]);
+    assert_eq!(pool.used(), 0);
+}
+
+/// Schema evolution written by Spark (ADR 0040): an equality delete keyed
+/// on `town`, then `town` renamed to `city`, `score` promoted int -> bigint
+/// and a new `town` column (new field id). Spark reads
+/// (1, lisbon, 10, NULL), (3, braga, 3000000000, new), (4, faro, 40, NULL).
+#[tokio::test]
+#[ignore = "needs PLIMSOLL_ICEBERG_EVOLVED from scripts/spark_mor_fixture.sh"]
+async fn reads_an_evolved_spark_table() {
+    let Ok(location) = std::env::var("PLIMSOLL_ICEBERG_EVOLVED") else {
+        return;
+    };
+    let pool = Arc::new(CeilingPool::new(256 << 20, 0).unwrap());
+    let ctx = session_context_with_ceiling(pool.clone(), None, SessionConfig::new()).unwrap();
+    IcebergConnector::try_new("ev", &location, &ctx.state())
+        .await
+        .unwrap()
+        .register(&ctx)
+        .unwrap();
+    let out = ctx
+        .sql("SELECT id, city, score, town FROM ev ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let text = datafusion::arrow::util::pretty::pretty_format_batches(&out)
+        .unwrap()
+        .to_string();
+    let rows: Vec<String> = text
+        .lines()
+        .filter(|l| l.starts_with("| ") && !l.contains("city"))
+        .map(|l| {
+            l.split('|')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect();
+    // NULL prints as an empty cell, so the row has three fields.
+    assert_eq!(
+        rows,
+        ["1,lisbon,10", "3,braga,3000000000,new", "4,faro,40"],
+        "{text}"
+    );
+    // Filters on renamed and promoted columns are adapted too.
+    assert_eq!(
+        ids(&ctx, "SELECT id FROM ev WHERE city = 'faro'")
+            .await
+            .unwrap(),
+        [4]
+    );
+    assert_eq!(
+        ids(&ctx, "SELECT id FROM ev WHERE score > 2147483647")
+            .await
+            .unwrap(),
+        [3]
+    );
+    assert_eq!(
+        ids(&ctx, "SELECT id FROM ev WHERE town IS NULL ORDER BY id")
+            .await
+            .unwrap(),
+        [1, 4]
+    );
     assert_eq!(pool.used(), 0);
 }
 

@@ -90,6 +90,7 @@ pub(super) async fn equality_keys(
     scoped: Option<&ScopedStore>,
     path: &str,
     key: &[Field],
+    ids: &[i64],
     reservation: &MemoryReservation,
     hits: &AtomicUsize,
 ) -> Result<Vec<RecordBatch>> {
@@ -107,9 +108,24 @@ pub(super) async fn equality_keys(
             let bytes = super::read(path, state, scoped).await?;
             reservation.try_grow(bytes.len())?;
             let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?;
+            // Key columns by field id when the file carries ids (a delete
+            // written before a rename uses the old name, ADR 0040), else by
+            // the current name.
+            let file_names: Vec<String> = key
+                .iter()
+                .zip(ids)
+                .map(|(f, id)| {
+                    builder
+                        .schema()
+                        .fields()
+                        .iter()
+                        .find(|c| super::field_ids::field_id(c) == Some(*id))
+                        .map_or_else(|| f.name().clone(), |c| c.name().clone())
+                })
+                .collect();
             let mask = ProjectionMask::columns(
                 builder.parquet_schema(),
-                key.iter().map(|f| f.name().as_str()),
+                file_names.iter().map(String::as_str),
             );
             let schema = Arc::new(Schema::new(
                 key.iter()
@@ -121,12 +137,13 @@ pub(super) async fn equality_keys(
                 let batch = batch?;
                 let columns = key
                     .iter()
-                    .map(|f| {
-                        let c = batch.column_by_name(f.name()).ok_or_else(|| {
+                    .zip(&file_names)
+                    .map(|(f, name)| {
+                        let c = batch.column_by_name(name).ok_or_else(|| {
                             invalid_delete(
                                 path,
                                 "equality delete",
-                                &format!("missing key column {}", f.name()),
+                                &format!("missing key column {} (field {name:?})", f.name()),
                             )
                         })?;
                         Ok(cast(c, f.data_type())?)

@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Schema evolution by field id: renames, type promotion and re-added columns, equality-delete keys by id, validated on a Spark-evolved table (ADR 0040)
 - [x] Manifest cache: manifest lists and manifests cached by path in the cache reserve; replanning a snapshot reads nothing (ADR 0039)
 - [x] Result cache: SQL + pinned Iceberg snapshots as key, deterministic plans only, reserved in the pool, opt-in (ADR 0038)
 - [x] Arrow IPC results: `"format": "arrow"`, same bounded chunk path, mid-stream errors abort the stream (ADR 0037)
@@ -72,10 +73,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Iceberg schema evolution by field id**: renamed columns are refused
-today (ADR 0007's name-mapping check). Map Parquet columns to the table
-schema by Iceberg field id (Parquet `field_id`) so renamed and re-added
-columns read correctly instead of failing.
+**Nested types**: Iceberg `struct`, `list` and `map` columns are refused
+today (`arrow_schema`). Map them to Arrow nested types with field ids on
+every child, so tables with nested columns read instead of failing.
 
 ## Later
 

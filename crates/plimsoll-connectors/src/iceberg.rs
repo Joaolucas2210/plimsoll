@@ -49,6 +49,7 @@ use serde_json::Value as Json;
 use crate::{Connector, ConnectorError};
 
 mod deletes;
+mod field_ids;
 mod files;
 pub mod meta;
 mod prune;
@@ -217,8 +218,11 @@ struct IcebergTable {
     specs: HashMap<i64, Vec<Option<PartitionField>>>,
     /// Spec ids without a non-void field (equality deletes there are global).
     unpartitioned: HashSet<i64>,
-    /// Field id -> column name in the current schema (equality delete keys).
-    names: HashMap<i64, String>,
+    /// Field id -> column name in the current schema (scan column
+    /// resolution, equality delete keys; ADR 0040).
+    names: Arc<HashMap<i64, String>>,
+    /// Some column was renamed or re-added in the table's history.
+    renamed: bool,
 }
 
 /// A data file the scan will read, from its manifest entry.
@@ -288,7 +292,7 @@ impl IcebergTable {
                 .ok_or_else(|| err("current-schema-id not found"))?,
             None => schemas.first().copied().ok_or_else(|| err("no schema"))?,
         };
-        check_name_mapping(path, &schemas)?;
+        let renamed = renamed_columns(path, &schemas)?;
         // v3 defaults: files written before a column was added must read its
         // `initial-default`; the Parquet scan would return NULL instead.
         if let Some(f) = current["fields"]
@@ -305,7 +309,7 @@ impl IcebergTable {
                 ),
             ));
         }
-        let schema = Arc::new(arrow_schema(path, current)?);
+        let schema = arrow_schema(path, current)?;
 
         let snapshot_id = meta["current-snapshot-id"].as_i64().filter(|id| *id != -1);
         let manifest_list = match snapshot_id {
@@ -347,12 +351,21 @@ impl IcebergTable {
             })
             .filter_map(|s| s["spec-id"].as_i64())
             .collect();
-        let names = current["fields"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|f| Some((f["id"].as_i64()?, f["name"].as_str()?.to_owned())))
-            .collect();
+        let names: Arc<HashMap<i64, String>> = Arc::new(
+            current["fields"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|f| Some((f["id"].as_i64()?, f["name"].as_str()?.to_owned())))
+                .collect(),
+        );
+        // Tables with renamed/re-added columns carry field ids in their schema
+        // so every file is adapted by id (ADR 0040).
+        let schema = Arc::new(if renamed {
+            field_ids::with_field_ids(&schema, &names)
+        } else {
+            schema
+        });
         Ok(Self {
             name: name.to_owned(),
             schema,
@@ -364,6 +377,7 @@ impl IcebergTable {
             specs,
             unpartitioned,
             names,
+            renamed,
         })
     }
 
@@ -639,12 +653,14 @@ impl IcebergTable {
         let mut loaded = futures::stream::iter(pending)
             .map(|(d, key, targets): (usize, Vec<Field>, Vec<usize>)| {
                 let (reservation, hits, path) = (&reservation, &hits, &equality[d].path);
+                let ids = &equality[d].ids;
                 async move {
                     let batches = deletes::equality_keys(
                         state,
                         self.scoped.as_ref(),
                         path,
                         &key,
+                        ids,
                         reservation,
                         hits,
                     )
@@ -873,6 +889,12 @@ impl IcebergTable {
         )
         .with_projection_indices(projection.cloned())?
         .with_limit(limit)
+        // Columns are matched by Iceberg field id, not name (ADR 0040).
+        .with_expr_adapter(Some(Arc::new(field_ids::FieldIds::new(
+            self.names.clone(),
+            self.renamed,
+            &self.name,
+        ))))
         .build();
         Ok(DataSourceExec::from_data_source(config))
     }
@@ -962,10 +984,10 @@ async fn read_env(
         .map_err(external)
 }
 
-/// DataFusion's Parquet scan maps file columns to the table by *name*, while
-/// Iceberg tracks them by field id. Reject histories where those disagree
-/// (a rename, or a dropped column re-added under the same name).
-fn check_name_mapping(path: &str, schemas: &[&Json]) -> Result<(), ConnectorError> {
+/// Whether any column was renamed, or dropped and re-added under the same
+/// name, across the table's schemas. Columns are resolved by field id
+/// (ADR 0040), so this only matters for files that carry no ids.
+fn renamed_columns(path: &str, schemas: &[&Json]) -> Result<bool, ConnectorError> {
     let mut by_id: HashMap<i64, &str> = HashMap::new();
     let mut by_name: HashMap<&str, i64> = HashMap::new();
     for field in schemas
@@ -979,13 +1001,10 @@ fn check_name_mapping(path: &str, schemas: &[&Json]) -> Result<(), ConnectorErro
         let conflict = by_id.insert(id, name).is_some_and(|n| n != name)
             || by_name.insert(name, id).is_some_and(|i| i != id);
         if conflict {
-            return Err(unsupported(
-                path,
-                format!("column {name:?} was renamed or re-added (field-id mapping)"),
-            ));
+            return Ok(true);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn arrow_schema(path: &str, schema: &Json) -> Result<Schema, ConnectorError> {

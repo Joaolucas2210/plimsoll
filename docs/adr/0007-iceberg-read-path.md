@@ -118,7 +118,7 @@ mapping: `ConnectorError::Iceberg` reaches the server as
 | Merge-on-read tables in the wild fail every query | High | Medium | Resolved by ADR 0014 (position) and ADR 0016 (equality) |
 | Planning latency on large tables | High | Medium | ADR 0010 (manifest and file pruning) |
 | Spec edge cases misparsed (v1 vs v2 fields) | Medium | High | Interop test against pyiceberg; refuse on missing required fields |
-| Column renamed in a future writer | Medium | High | Name/id mismatch check across all schemas rejects at registration |
+| Column renamed in a future writer | Medium | High | Resolved by field id since ADR 0040 (files without ids in renamed tables are refused) |
 
 ## Validation
 
@@ -126,7 +126,7 @@ mapping: `ConnectorError::Iceberg` reaches the server as
   `reads_only_live_files_of_the_current_snapshot` (orphan and status-2 files
   ignored; asserts `AccountedExec: IcebergScan[t]`),
   delete tests (ADR 0014, ADR 0016),
-  `renamed_columns_are_rejected_at_registration`, `empty_table_has_no_rows`,
+  `renamed_tables_without_field_ids_are_refused` (ADR 0040), `empty_table_has_no_rows`,
   `read_path_runs_under_the_ceiling` (512-byte ceiling → `ResourcesExhausted`
   naming `Iceberg`, pool back to 0).
 - CI job `iceberg-interop`: `reads_a_pyiceberg_table` against

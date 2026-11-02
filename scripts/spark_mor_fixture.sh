@@ -2,11 +2,12 @@
 # Writes merge-on-read Iceberg tables with Apache Spark and Iceberg's Java
 # writers (the reference implementation) for tests/iceberg.rs:
 # position deletes (reads_a_spark_merge_on_read_table) and equality deletes
-# (reads_reference_equality_deletes), and v3 deletion vectors
-# (reads_reference_deletion_vectors).
+# (reads_reference_equality_deletes), v3 deletion vectors
+# (reads_reference_deletion_vectors), and schema evolution
+# (reads_an_evolved_spark_table).
 #
 #   scripts/spark_mor_fixture.sh <warehouse-dir>
-#   # prints PLIMSOLL_ICEBERG_{MOR,EQ,DV}=...
+#   # prints PLIMSOLL_ICEBERG_{MOR,EQ,EVOLVED,DV}=...
 #
 # The warehouse is mounted at the same absolute path inside the container, so
 # the paths Spark records in the metadata are valid on the host.
@@ -91,6 +92,37 @@ try {
   val dv = spark.sql("SELECT count(*), sum(id) FROM local.db.dv").collect()(0)
   println(s"DV-CHECK ${dv.getLong(0)} ${dv.getLong(1)}")
 
+  // Schema evolution (ADR 0040): an equality delete keyed on `town`, then
+  // `town` renamed to `city`, `score` promoted int -> bigint, and a new
+  // column re-using the name `town` (a new field id). Old files and the
+  // delete only know the old names; Plimsoll must resolve by field id.
+  Seq(
+    """CREATE TABLE local.db.evolved (id BIGINT, town STRING, score INT) USING iceberg
+       TBLPROPERTIES ('format-version'='2')""",
+    "INSERT INTO local.db.evolved VALUES (1, 'lisbon', 10), (2, 'porto', 20), (4, 'faro', 40)"
+  ).foreach(spark.sql)
+  val ev = Spark3Util.loadIcebergTable(spark, "local.db.evolved")
+  val evKey = ev.schema().select("town")
+  val evFactory = new GenericAppenderFactory(ev.schema(), ev.spec(),
+    Array(ev.schema().findField("town").fieldId()), evKey, null)
+  val evOut = ev.io().newOutputFile(ev.locationProvider().newDataLocation("eq-town.parquet"))
+  val evWriter = evFactory.newEqDeleteWriter(EncryptedFiles.plainAsEncryptedOutput(evOut), FileFormat.PARQUET, null)
+  val porto = GenericRecord.create(evKey)
+  porto.setField("town", "porto")
+  evWriter.write(porto)
+  evWriter.close()
+  ev.newRowDelta().addDeletes(evWriter.toDeleteFile()).commit()
+  Seq(
+    "ALTER TABLE local.db.evolved RENAME COLUMN town TO city",
+    "ALTER TABLE local.db.evolved ALTER COLUMN score TYPE BIGINT",
+    "ALTER TABLE local.db.evolved ADD COLUMN town STRING",
+    "INSERT INTO local.db.evolved VALUES (3, 'braga', 3000000000, 'new')"
+  ).foreach(spark.sql)
+  val evolved = spark.sql("SELECT id, city, score, town FROM local.db.evolved ORDER BY id")
+    .collect().map(_.toString).mkString(";")
+  require(evolved == "[1,lisbon,10,null];[3,braga,3000000000,new];[4,faro,40,null]",
+    s"Spark reads $evolved")
+
   // The fixture is only useful if the reference engine agrees with it.
   val ids = spark.sql("SELECT id FROM local.db.eq ORDER BY id").collect().map(_.getLong(0)).toSeq
   require(ids == Seq(2L, 4L, 5L, 6L), s"Spark reads $ids")
@@ -110,4 +142,5 @@ docker run --rm -e TZ=UTC -v "$wh:$wh" -v "$jars:/jars:ro" -v "$scala:/fixture.s
 rm -f "$scala"
 echo "PLIMSOLL_ICEBERG_MOR=$wh/db/mor"
 echo "PLIMSOLL_ICEBERG_EQ=$wh/db/eq"
+echo "PLIMSOLL_ICEBERG_EVOLVED=$wh/db/evolved"
 echo "PLIMSOLL_ICEBERG_DV=$wh/db/dv"
