@@ -3,7 +3,8 @@
 //! Only provably-safe pruning (ADR 0010): a manifest or file is skipped when
 //! its statistics show that *no* row can satisfy the filters (an And/Or
 //! tree, ADR 0050). Anything we cannot evaluate exactly (casts, floats,
-//! decimals, sub-µs literals, missing bounds) keeps the file. Filters are still re-applied
+//! inexact decimal literals, sub-µs literals, missing bounds) keeps the
+//! file. Filters are still re-applied
 //! above the scan, so pruning only ever changes cost, never results.
 
 use std::cmp::Ordering;
@@ -24,6 +25,8 @@ pub(super) enum Prim {
     /// Microseconds since epoch (`timestamp` and `timestamptz`).
     Timestamp,
     String,
+    /// `decimal(p, s)`: unscaled `i128` at scale `s` (ADR 0053).
+    Decimal(i8),
 }
 
 impl Prim {
@@ -35,6 +38,13 @@ impl Prim {
             "date" => Self::Date,
             "timestamp" | "timestamptz" => Self::Timestamp,
             "string" => Self::String,
+            t if t.starts_with("decimal(") => {
+                let (_, scale) = t
+                    .strip_prefix("decimal(")?
+                    .strip_suffix(')')?
+                    .split_once(',')?;
+                Self::Decimal(scale.trim().parse().ok()?)
+            }
             // float/double: Iceberg bounds exclude NaN, DataFusion orders NaN
             // above everything, so `x > 5` matches NaN rows the bounds hide.
             _ => return None,
@@ -50,6 +60,16 @@ impl Prim {
             }
             Self::Long | Self::Timestamp => Datum::Int(i64::from_le_bytes(bytes.try_into().ok()?)),
             Self::String => Datum::Bytes(bytes.to_vec()),
+            // Big-endian two's complement, minimal length (spec).
+            Self::Decimal(_) => {
+                if bytes.is_empty() || bytes.len() > 16 {
+                    return None;
+                }
+                let fill = if bytes[0] & 0x80 != 0 { 0xff } else { 0 };
+                let mut be = [fill; 16];
+                be[16 - bytes.len()..].copy_from_slice(bytes);
+                Datum::Big(i128::from_be_bytes(be))
+            }
         })
     }
 }
@@ -59,6 +79,8 @@ enum Datum {
     Int(i64),
     /// UTF-8 bytes; Iceberg and Arrow both order strings bytewise.
     Bytes(Vec<u8>),
+    /// Unscaled decimal (ADR 0053).
+    Big(i128),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,6 +393,9 @@ fn transformed(p: &Pred, t: Transform) -> Option<(Op, Datum, Prim)> {
         Transform::Truncate(w) => {
             let v = match (&p.value, p.prim) {
                 (Datum::Int(v), Prim::Int | Prim::Long) => Datum::Int(v - v.rem_euclid(w)),
+                // On the unscaled value (spec): truncate[10] of 1.23 (123 at
+                // scale 2) is 1.20.
+                (Datum::Big(v), Prim::Decimal(_)) => Datum::Big(v - v.rem_euclid(i128::from(w))),
                 (Datum::Bytes(b), Prim::String) => {
                     let s = std::str::from_utf8(b).ok()?;
                     let end = s
@@ -384,7 +409,11 @@ fn transformed(p: &Pred, t: Transform) -> Option<(Op, Datum, Prim)> {
             // Non-decreasing: a strict bound can still match inside the
             // same truncated value, unless `v` starts its bucket (`x < 20`
             // with width 10 rules out bucket 20 entirely).
-            let at_start = matches!(&p.value, Datum::Int(x) if x.rem_euclid(w) == 0);
+            let at_start = match &p.value {
+                Datum::Int(x) => x.rem_euclid(w) == 0,
+                Datum::Big(x) => x.rem_euclid(i128::from(w)) == 0,
+                Datum::Bytes(_) => false,
+            };
             let op = match p.op {
                 Op::Lt if at_start => Op::Lt,
                 Op::Lt => Op::LtEq,
@@ -446,6 +475,7 @@ fn bucket(prim: Prim, v: &Datum, n: u32) -> Option<i64> {
             murmur3_32(&x.to_le_bytes())
         }
         (Prim::String, Datum::Bytes(b)) => murmur3_32(b),
+        (Prim::Decimal(_), Datum::Big(x)) => murmur3_32(&min_be_bytes(*x)),
         _ => return None,
     };
     Some(i64::from((hash & 0x7fff_ffff) % n))
@@ -694,8 +724,51 @@ fn literal(prim: Prim, v: &ScalarValue) -> Option<Datum> {
         (Prim::String, S::Utf8(s) | S::LargeUtf8(s) | S::Utf8View(s)) => {
             s.as_ref().map(|s| Datum::Bytes(s.as_bytes().to_vec()))
         }
+        // Rescaled to the column's scale, only when exact (ADR 0053):
+        // 100.5 at scale 2 is 10050; 100.505 at scale 2 is not prunable.
+        (Prim::Decimal(scale), S::Decimal128(Some(x), _, s)) => {
+            rescale(*x, *s, scale).map(Datum::Big)
+        }
+        (Prim::Decimal(scale), S::Int8(_) | S::Int16(_) | S::Int32(_) | S::Int64(_)) => {
+            let x = match v {
+                S::Int8(x) => x.map(i128::from),
+                S::Int16(x) => x.map(i128::from),
+                S::Int32(x) => x.map(i128::from),
+                S::Int64(x) => x.map(i128::from),
+                _ => None,
+            }?;
+            rescale(x, 0, scale).map(Datum::Big)
+        }
         _ => None,
     }
+}
+
+/// `x` (unscaled at `from`) at scale `to`, if representable exactly.
+fn rescale(x: i128, from: i8, to: i8) -> Option<i128> {
+    let diff = i32::from(to) - i32::from(from);
+    let pow = 10i128.checked_pow(diff.unsigned_abs())?;
+    if diff >= 0 {
+        x.checked_mul(pow)
+    } else {
+        (x % pow == 0).then(|| x / pow)
+    }
+}
+
+/// Minimal big-endian two's complement bytes of `x` (Iceberg's decimal
+/// serialization, also what `bucket` hashes).
+fn min_be_bytes(x: i128) -> Vec<u8> {
+    let be = x.to_be_bytes();
+    let mut start = 0;
+    // Drop a leading byte while the next one carries the same sign.
+    while start < 15 {
+        let (b, next) = (be[start], be[start + 1]);
+        if (b == 0 && next & 0x80 == 0) || (b == 0xff && next & 0x80 != 0) {
+            start += 1;
+        } else {
+            break;
+        }
+    }
+    be[start..].to_vec()
 }
 
 #[cfg(test)]
@@ -923,5 +996,35 @@ mod tests {
             col("city"),
             lit("x")
         )));
+    }
+
+    #[test]
+    fn decimals_prune_on_exact_unscaled_values() {
+        // Spec hash example: decimal 14.20 (unscaled 1420) -> -500754589.
+        assert_eq!(min_be_bytes(1420), [0x05, 0x8c]);
+        assert_eq!(murmur3_32(&min_be_bytes(1420)) as i32, -500_754_589);
+        assert_eq!(min_be_bytes(-1), [0xff]);
+        assert_eq!(min_be_bytes(128), [0x00, 0x80]);
+        assert_eq!(min_be_bytes(-129), [0xff, 0x7f]);
+        let p = Prim::from_iceberg("decimal(10, 2)").unwrap();
+        assert_eq!(p, Prim::Decimal(2));
+        assert_eq!(p.decode(&[0xff, 0x7f]), Some(Datum::Big(-129)));
+
+        let mut cols = columns();
+        cols.insert("amount".into(), (9, p));
+        // File holds amount in [10.00, 20.00].
+        let lo = bounds(&[(9, min_be_bytes(1000))]);
+        let hi = bounds(&[(9, min_be_bytes(2000))]);
+        let dec = |x: i128, s: i8| lit(ScalarValue::Decimal128(Some(x), 10, s));
+        let keep = |e: Expr| Pruner::new(&[e], &cols).may_match_file(&lo, &hi, &Counts::default());
+        assert!(!keep(col("amount").gt(dec(2000, 2)))); // > 20.00
+        assert!(keep(col("amount").gt_eq(dec(2000, 2))));
+        assert!(keep(col("amount").lt(dec(99_999, 4)))); // 9.9999: inexact at scale 2
+        assert!(!keep(col("amount").lt(dec(99_900, 4)))); // 9.9900 = 9.99
+        assert!(!keep(col("amount").gt(dec(205, 1)))); // 20.5 -> 2050
+        assert!(!keep(col("amount").eq(lit(21i64)))); // integer literal
+        assert!(keep(col("amount").eq(lit(15i64))));
+        // 10.005 has no exact scale-2 form: not prunable.
+        assert!(keep(col("amount").lt(dec(10_005, 3))));
     }
 }

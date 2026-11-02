@@ -6,10 +6,11 @@
 # (reads_reference_deletion_vectors), schema evolution
 # (reads_an_evolved_spark_table), nested types (reads_nested_spark_types) and
 # name-mapped imports (reads_files_imported_without_field_ids) and bucket/
-# truncate partitions (prunes_spark_bucket_and_truncate_partitions).
+# truncate partitions (prunes_spark_bucket_and_truncate_partitions) and
+# decimals (prunes_spark_decimal_columns).
 #
 #   scripts/spark_mor_fixture.sh <warehouse-dir>
-#   # prints PLIMSOLL_ICEBERG_{MOR,EQ,EVOLVED,NESTED,IMPORTED,BUCKETED,DV}=...
+#   # prints PLIMSOLL_ICEBERG_{MOR,EQ,EVOLVED,NESTED,IMPORTED,BUCKETED,MONEY,DV}=...
 #
 # The warehouse is mounted at the same absolute path inside the container, so
 # the paths Spark records in the metadata are valid on the host.
@@ -173,6 +174,17 @@ try {
   val bucketed = spark.sql("SELECT count(*) FROM local.db.bucketed WHERE id IN (7, 23)").collect()(0).getLong(0)
   require(bucketed == 2, s"Spark reads $bucketed")
 
+  // Decimals (ADR 0053): bounds, bucket (hash of the unscaled bytes) and
+  // truncate (on the unscaled value) partitions over DECIMAL(10, 2).
+  Seq(
+    """CREATE TABLE local.db.money (id BIGINT, amount DECIMAL(10, 2)) USING iceberg
+       PARTITIONED BY (bucket(3, amount), truncate(1000, amount))
+       TBLPROPERTIES ('format-version'='2')""",
+    "INSERT INTO local.db.money SELECT id, CAST(id * 1.25 AS DECIMAL(10, 2)) FROM range(0, 40)"
+  ).foreach(spark.sql)
+  val money = spark.sql("SELECT count(*) FROM local.db.money WHERE amount > 40.00").collect()(0).getLong(0)
+  require(money == 7, s"Spark reads $money")
+
   // The fixture is only useful if the reference engine agrees with it.
   val ids = spark.sql("SELECT id FROM local.db.eq ORDER BY id").collect().map(_.getLong(0)).toSeq
   require(ids == Seq(2L, 4L, 5L, 6L), s"Spark reads $ids")
@@ -196,4 +208,5 @@ echo "PLIMSOLL_ICEBERG_EVOLVED=$wh/db/evolved"
 echo "PLIMSOLL_ICEBERG_NESTED=$wh/db/nested"
 echo "PLIMSOLL_ICEBERG_IMPORTED=$wh/db/imported"
 echo "PLIMSOLL_ICEBERG_BUCKETED=$wh/db/bucketed"
+echo "PLIMSOLL_ICEBERG_MONEY=$wh/db/money"
 echo "PLIMSOLL_ICEBERG_DV=$wh/db/dv"

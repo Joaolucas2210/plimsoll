@@ -60,6 +60,7 @@ are allowed in place.
 | [0050](0050-pruning-predicate-tree.md) | Pruner as a predicate tree | Accepted | 2026-11-02 | Filters become And/Or/Cmp/Null nodes; unknown sub-expressions are `True` (may match), which makes an OR unknown; `IN` = OR of equalities; `NOT` pushed only into `<, <=, >, >=` and null checks; same tree at file and manifest level | 0010, 0048, 0049 |
 | [0051](0051-bucket-truncate-pruning.md) | Bucket and truncate partition pruning | Accepted | 2026-11-02 | `bucket[N]` maps `=`/`IN` through Iceberg's Murmur3 (spec vectors); `truncate[W]` maps `=` and widened ranges; checked per file on its partition tuple (manifests span all buckets) as well as on manifest summaries | 0010, 0050 |
 | [0052](0052-like-prefix-pruning.md) | `LIKE` prefix pruning | Accepted | 2026-11-02 | `LIKE 'p%'` (case-sensitive, not negated) and `starts_with(col, 'p')` become `col >= p AND col < next(p)` with bytewise `next`; the prefix stops at the first wildcard or escape | 0050, 0051 |
+| [0053](0053-decimal-pruning.md) | Decimal pruning | Accepted | 2026-11-02 | `decimal(p, s)` bounds decode as unscaled `i128` (big-endian two's complement); literals rescale to the column scale only when exact; bucket hashes the minimal unscaled bytes (spec vector), truncate works on the unscaled value | 0010, 0051 |
 
 ## Reading order
 

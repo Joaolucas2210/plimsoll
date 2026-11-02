@@ -1301,6 +1301,59 @@ async fn prunes_spark_bucket_and_truncate_partitions() {
     assert_eq!(n.unwrap(), [13]);
 }
 
+/// Spark table with `amount DECIMAL(10, 2)` = id * 1.25, partitioned by
+/// `bucket(3, amount)` and `truncate(1000, amount)` (ADR 0053). Every
+/// amount looked up alone must be found: a wrong decimal hash loses it.
+#[tokio::test]
+#[ignore = "needs PLIMSOLL_ICEBERG_MONEY from scripts/spark_mor_fixture.sh"]
+async fn prunes_spark_decimal_columns() {
+    let Ok(location) = std::env::var("PLIMSOLL_ICEBERG_MONEY") else {
+        return;
+    };
+    let ctx = SessionContext::new();
+    IcebergConnector::try_new("m", &location, &ctx.state())
+        .await
+        .unwrap()
+        .register(&ctx)
+        .unwrap();
+    let scanned = async |sql: &str| {
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let text = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        let files = text
+            .split("files=")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap()
+            .to_owned();
+        let (kept, total) = files.split_once('/').unwrap();
+        (
+            kept.parse::<usize>().unwrap(),
+            total.parse::<usize>().unwrap(),
+        )
+    };
+    for id in 0..40i64 {
+        let amount = format!("{}.{:02}", id * 125 / 100, id * 125 % 100);
+        let sql = format!("SELECT id FROM m WHERE amount = {amount}");
+        assert_eq!(ids(&ctx, &sql).await.unwrap(), [id], "{sql}");
+        let (kept, total) = scanned(&sql).await;
+        assert!(kept < total, "{sql}: {kept}/{total}");
+    }
+    let sql = "SELECT id FROM m WHERE amount > 40.00 ORDER BY id";
+    assert_eq!(ids(&ctx, sql).await.unwrap(), (33..40).collect::<Vec<_>>());
+    let (kept, total) = scanned(sql).await;
+    assert!(kept < total, "{kept}/{total}");
+}
+
 /// Format v3 table written by Spark with merge-on-read deletes, i.e. deletion
 /// vectors in Puffin files (`scripts/spark_mor_fixture.sh`): 100 000 rows,
 /// `DELETE id % 7 = 0`, then `DELETE id < 10` (replaces DVs), then an `UPDATE`.
