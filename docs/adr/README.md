@@ -39,12 +39,13 @@ are allowed in place.
 | [0029](0029-iceberg-refs.md) | Iceberg branches and tags in time travel | Accepted | 2026-10-30 | `"table@<ref>"` resolves through metadata `refs` after snapshot ids and instants; unknown specs fall back to a whole-name lookup | 0028, 0025 |
 | [0030](0030-iceberg-metadata-tables.md) | Iceberg metadata tables | Accepted | 2026-10-30 | `"table$snapshots"`, `"table$history"`, `"table$refs"` built in memory from the per-query `loadTable` metadata; Spark column names; grants apply via the schema | 0028, 0029, 0025 |
 | [0031](0031-query-traces.md) | Query traces over OTLP/HTTP JSON | Accepted | 2026-11-01 | W3C `traceparent` continued or started per `/v1/sql` request and echoed; `trace_id` in the query log; with `OTEL_EXPORTER_OTLP_ENDPOINT`, a `query` span plus one per phase, batched to `/v1/traces` without an OTel SDK | 0019, 0027, 0015, 0004 |
+| [0032](0032-iceberg-file-metadata-tables.md) | Iceberg file metadata tables: `$files`, `$manifests` | Accepted | 2026-11-01 | Manifests read at execution through a streaming partition, one batch per manifest, fetches reserved in the pool; Spark column names; partition as JSON text | 0030, 0012, 0020, 0025 |
 
 ## Reading order
 
 - Invariant first: 0003 (memory, with 0012 and 0018), 0005 (correctness).
 - Shape of the system: 0001, 0002, 0004.
-- Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030.
+- Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032.
 - Federation: 0005 → 0006.
 - Observability: 0013 → 0019 → 0027 → 0031.
 

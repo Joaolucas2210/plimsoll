@@ -88,9 +88,8 @@ check (the same reason ADR 0028 rejected them). Rejected.
 - `summary` is a JSON string, not a `MAP` column. Query it with
   `json`-style string functions or `LIKE`. Upgrade to `MapArray` if users
   need typed map access.
-- Only three tables. `$files`, `$manifests`, `$partitions` and
-  `$all_data_files` need manifest reads under the memory ceiling, and are
-  added when asked for.
+- Only three tables here. `$files` and `$manifests` need manifest reads
+  under the memory ceiling; ADR 0032 adds them.
 - The metadata tables are not listed in `information_schema`, as with the
   `@` variants (ADR 0028).
 - `$` and `@` do not combine (`"t@v1$refs"`). Metadata tables always show

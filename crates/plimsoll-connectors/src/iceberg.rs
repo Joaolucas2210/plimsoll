@@ -49,6 +49,7 @@ use serde_json::Value as Json;
 use crate::{Connector, ConnectorError};
 
 mod deletes;
+mod files;
 pub mod meta;
 mod prune;
 use deletes::{DeleteFile, EqualityDelete};
@@ -177,6 +178,13 @@ impl IcebergConnector {
 
     pub fn snapshot_id(&self) -> Option<i64> {
         self.table.snapshot_id
+    }
+
+    /// `$files` / `$manifests` of the pinned snapshot (ADR 0032): manifests
+    /// are read at execution, one at a time, under the session's pool.
+    /// `None` when `kind` is not one of them.
+    pub fn metadata_table(&self, kind: &str) -> Option<Result<Arc<dyn TableProvider>>> {
+        files::provider(self.table.clone(), kind)
     }
 }
 
@@ -904,8 +912,17 @@ async fn read(
     state: &dyn Session,
     scoped: Option<&ScopedStore>,
 ) -> Result<bytes::Bytes, ConnectorError> {
+    read_env(path, state.runtime_env(), scoped).await
+}
+
+/// [`read`] from execution (a `TaskContext`), where no `Session` exists.
+async fn read_env(
+    path: &str,
+    env: &datafusion::execution::runtime_env::RuntimeEnv,
+    scoped: Option<&ScopedStore>,
+) -> Result<bytes::Bytes, ConnectorError> {
     let url = ListingTableUrl::parse(path)?;
-    let store = state.runtime_env().object_store(store_url(&url, scoped))?;
+    let store = env.object_store(store_url(&url, scoped))?;
     let external = |e: datafusion::object_store::Error| {
         ConnectorError::DataFusion(DataFusionError::External(Box::new(e)))
     };

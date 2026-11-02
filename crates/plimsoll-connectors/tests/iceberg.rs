@@ -463,6 +463,80 @@ async fn read_path_runs_under_the_ceiling() {
     }
 }
 
+/// `$files` / `$manifests` (ADR 0032): live entries only, data and deletes,
+/// read under the ceiling.
+#[tokio::test]
+async fn files_and_manifests_metadata_tables() {
+    let dir = tmp("metafiles");
+    table(&dir, Deletes::Equality, false);
+    for (limit, ok) in [(64 << 20, true), (256, false)] {
+        let pool = Arc::new(CeilingPool::new(limit, 0).unwrap());
+        let ctx = session_context_with_ceiling(pool.clone(), None, SessionConfig::new()).unwrap();
+        let c = IcebergConnector::try_new("t", &dir.display().to_string(), &ctx.state())
+            .await
+            .unwrap();
+        for kind in ["files", "manifests"] {
+            let t = c.metadata_table(kind).unwrap().unwrap();
+            ctx.register_table(format!("t${kind}"), t).unwrap();
+        }
+        assert!(c.metadata_table("partitions").is_none());
+        let files = ctx
+            .sql(
+                "SELECT content, regexp_replace(file_path, '.*/', ''), sequence_number, \
+                 record_count FROM \"t$files\" ORDER BY 2",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let files = match files {
+            Ok(b) => b,
+            Err(e) => {
+                assert!(
+                    !ok && matches!(e.find_root(), DataFusionError::ResourcesExhausted(m) if m.contains("IcebergMetadata")),
+                    "{e}"
+                );
+                assert_eq!(pool.used(), 0, "released after failure");
+                continue;
+            }
+        };
+        assert!(ok, "the tiny pool must refuse the manifest bytes");
+        let text = datafusion::arrow::util::pretty::pretty_format_batches(&files)
+            .unwrap()
+            .to_string();
+        // The status=2 entry (removed.parquet) is not live.
+        assert!(!text.contains("removed"), "{text}");
+        let rows: Vec<Vec<&str>> = text
+            .lines()
+            .filter(|l| l.contains(".parquet"))
+            .map(|l| {
+                l.split('|')
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ["2", "eq-deletes.parquet", "3", "3"],
+                ["0", "late.parquet", "4", "3"],
+                ["0", "live.parquet", "2", "3"],
+            ],
+            "{text}"
+        );
+
+        let manifests = ids(
+            &ctx,
+            "SELECT CAST(content AS BIGINT) FROM \"t$manifests\" ORDER BY sequence_number",
+        )
+        .await
+        .unwrap();
+        assert_eq!(manifests, [0, 1, 0]);
+        assert_eq!(pool.used(), 0, "everything released");
+    }
+}
+
 /// `uv run scripts/iceberg_fixture.py` prints the env for this test; the
 /// location may be local or `s3://` (with `AWS_ENDPOINT` etc. set).
 #[tokio::test]
@@ -912,6 +986,47 @@ async fn time_travels_a_spark_table() {
         "every snapshot has an operation"
     );
     assert!(meta_table("history").contains("| true "));
+    // `$files` / `$manifests` (ADR 0032) of main: Spark's MOR DELETE wrote
+    // position delete files next to untouched data files.
+    let pool = Arc::new(CeilingPool::new(256 << 20, 0).unwrap());
+    let ctx = session_context_with_ceiling(pool.clone(), None, SessionConfig::new()).unwrap();
+    let c = IcebergConnector::from_metadata("t", &path, &meta).unwrap();
+    for kind in ["files", "manifests"] {
+        ctx.register_table(
+            format!("t${kind}"),
+            c.metadata_table(kind).unwrap().unwrap(),
+        )
+        .unwrap();
+    }
+    let per_content = ctx
+        .sql(
+            "SELECT content, count(*), sum(record_count) FROM \"t$files\" \
+             GROUP BY content ORDER BY content",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let text = datafusion::arrow::util::pretty::pretty_format_batches(&per_content)
+        .unwrap()
+        .to_string();
+    // Data rows minus position-deleted rows = main's 32 live rows.
+    assert!(text.contains("| 0       | 3        | 49 "), "{text}");
+    assert!(text.contains("| 1       | 2        | 17 "), "{text}");
+    let manifests = ctx
+        .sql("SELECT content, count(*) FROM \"t$manifests\" GROUP BY content ORDER BY content")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let manifests = datafusion::arrow::util::pretty::pretty_format_batches(&manifests)
+        .unwrap()
+        .to_string();
+    assert!(manifests.contains("| 0       | 2 "), "{manifests}");
+    assert!(manifests.contains("| 1       | 2 "), "{manifests}");
+    assert_eq!(pool.used(), 0);
     // Before the first snapshot there is nothing to read.
     assert!(at(&meta, AsOf::TimestampMs(ts - 1)).is_err());
 }

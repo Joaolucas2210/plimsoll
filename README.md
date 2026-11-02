@@ -95,7 +95,8 @@ curl -s localhost:8080/metrics
 Time travel on catalog tables: `SELECT * FROM bronze."trips@<snapshot-id>"`
 or `bronze."trips@2024-05-01T00:00:00Z"` (ADR 0028), or a branch/tag:
 `bronze."trips@audit"` (ADR 0029). To find ids, instants and refs:
-`bronze."trips$snapshots"`, `"trips$history"`, `"trips$refs"` (ADR 0030).
+`bronze."trips$snapshots"`, `"trips$history"`, `"trips$refs"` (ADR 0030). Files and
+manifests of the current snapshot: `"trips$files"`, `"trips$manifests"` (ADR 0032).
 
 Local experiments without tokens: `PLIMSOLL_AUTH=disabled` (then `user` is
 read from the request body and trusted as sent).

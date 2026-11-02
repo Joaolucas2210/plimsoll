@@ -7,7 +7,8 @@
 //! Time travel (ADR 0028): `bronze."trips@<snapshot-id>"`,
 //! `bronze."trips@2024-05-01T00:00:00Z"` or, by branch/tag (ADR 0029),
 //! `bronze."trips@audit"` reads the table as of that snapshot. The reference stays in its schema, so grants apply unchanged.
-//! `bronze."trips$snapshots"`, `$history` and `$refs` list them (ADR 0030).
+//! `bronze."trips$snapshots"`, `$history` and `$refs` list them (ADR 0030);
+//! `$files` and `$manifests` list the current snapshot's files (ADR 0032).
 
 use std::sync::Arc;
 
@@ -51,9 +52,18 @@ impl CatalogSchema {
     fn provider(
         &self,
         name: &str,
-        (ident, loaded): (TableIdent, LoadedTable),
+        loaded: (TableIdent, LoadedTable),
         metadata: &serde_json::Value,
     ) -> Result<Arc<dyn TableProvider>> {
+        Ok(self.connector(name, loaded, metadata)?.provider())
+    }
+
+    fn connector(
+        &self,
+        name: &str,
+        (ident, loaded): (TableIdent, LoadedTable),
+        metadata: &serde_json::Value,
+    ) -> Result<IcebergConnector> {
         let location = loaded.metadata_location.ok_or_else(|| {
             DataFusionError::Plan(format!("{ident} has no metadata-location (staged table?)"))
         })?;
@@ -65,7 +75,7 @@ impl CatalogSchema {
             metadata,
         )?
         .with_storage_properties(&loaded.storage)?;
-        Ok(connector.provider())
+        Ok(connector)
     }
 }
 
@@ -80,11 +90,19 @@ impl SchemaProvider for CatalogSchema {
         // just loaded, so it is as fresh as a data read. Other suffixes mean
         // `$` is part of the name.
         if let Some((base, kind)) = name.rsplit_once('$') {
-            if let Some((_, loaded)) = self.load(base).await? {
-                if let Some(batch) = iceberg::meta::table(&loaded.metadata, kind) {
+            if let Some(loaded) = self.load(base).await? {
+                if let Some(batch) = iceberg::meta::table(&loaded.1.metadata, kind) {
                     let batch = batch?;
                     let mem = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
                     return Ok(Some(Arc::new(mem)));
+                }
+                // `$files` / `$manifests` read manifests (ADR 0032).
+                if matches!(kind, "files" | "manifests") {
+                    let metadata = loaded.1.metadata.clone();
+                    let connector = self.connector(name, loaded, &metadata)?;
+                    if let Some(t) = connector.metadata_table(kind) {
+                        return t.map(Some);
+                    }
                 }
             }
         }
@@ -364,7 +382,7 @@ mod tests {
         );
         // Unknown kinds fall back to a whole-name lookup (and are missing).
         assert!(
-            ctx.sql("SELECT * FROM silver.\"users$files\"")
+            ctx.sql("SELECT * FROM silver.\"users$nope\"")
                 .await
                 .is_err()
         );
