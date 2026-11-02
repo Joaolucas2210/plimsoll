@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Arrow IPC results: `"format": "arrow"`, same bounded chunk path, mid-stream errors abort the stream (ADR 0037)
 - [x] Memory shares per resource group: `batch=2/64/40%` caps the group's queries together, below the ceiling; per-group used/share gauges (ADR 0036)
 - [x] Streamed results: `"format": "ndjson"`, bounded by the chunks in flight, back-pressure to the scan, disconnect cancels (ADR 0035)
 - [x] Query cancellation: `DELETE /v1/queries/{id}` for owners and operators; queued or running; slot and memory released (ADR 0034)
@@ -69,10 +70,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Arrow IPC results**: `"format": "arrow"` streams
-`application/vnd.apache.arrow.stream` on the same chunk path as NDJSON
-(ADR 0035): typed, columnar and several times smaller, for notebooks and
-analytical clients (pyarrow, polars, DuckDB read it directly).
+**Result cache for repeated dashboard queries**: identical SQL from the
+same principal against unchanged snapshots (Iceberg snapshot ids pin the
+inputs) answered from a bounded cache under the ceiling's cache reserve.
 
 ## Later
 

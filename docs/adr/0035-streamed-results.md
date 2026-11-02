@@ -164,7 +164,7 @@ need resumption.
 
 ## Revisit when
 
-- Analytical clients need typed columnar transfer: Arrow IPC on the same
-  `Chunk` path.
+- Analytical clients need typed columnar transfer: done in ADR 0037, Arrow
+  IPC on the same `Chunk` path.
 - Clients need resumable results: server-side cursors.
 - Wide rows make 1024-row chunks too large: size chunks by bytes.

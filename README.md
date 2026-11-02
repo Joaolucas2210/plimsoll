@@ -137,7 +137,7 @@ Configuration is environment-only; invalid values abort startup.
 
 ### SQL API
 
-`POST /v1/sql` with `{"sql": "...", "user": "...", "resource_group": "..."?, "format": "json"|"ndjson"?}`.
+`POST /v1/sql` with `{"sql": "...", "user": "...", "resource_group": "..."?, "format": "json"|"ndjson"|"arrow"?}`.
 
 - `200` → `{"query_id": 1, "columns": [...], "rows": [[...]]}`
 - `"format": "ndjson"` streams `application/x-ndjson` (ADR 0035): a header
@@ -146,6 +146,11 @@ Configuration is environment-only; invalid values abort startup.
   fails mid-stream. Results of any size stream under the memory ceiling;
   errors before the header keep their HTTP status. Closing the connection
   cancels the query.
+- `"format": "arrow"` streams `application/vnd.apache.arrow.stream` (ADR
+  0037): typed, columnar, read directly by pyarrow (`pa.ipc.open_stream`),
+  polars and DuckDB. The query id is in `x-plimsoll-query-id`. A failure
+  after the first batch aborts the body, so the stream lacks its
+  end-of-stream marker and readers raise instead of returning short data.
 - error → `{"error": {"code": "...", "message": "...", "query_id": 1|null}}`
 
 | Code | HTTP | Meaning |

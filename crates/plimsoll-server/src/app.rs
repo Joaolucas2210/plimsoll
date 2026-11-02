@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -20,7 +20,7 @@ use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::auth::Auth;
-use crate::engine::{Chunk, EngineError, QueryEngine, QueryOutput, Streamed};
+use crate::engine::{Chunk, EngineError, Format, QueryEngine, QueryOutput, Streamed};
 use crate::log::{Level, QueryLog, level_for};
 use crate::metrics::{self, Latency, PoolStatsProvider};
 use crate::trace::{self, TraceContext, Tracer};
@@ -456,6 +456,7 @@ async fn stream_sql(
     shared: Arc<AppState>,
     request: QueryRequest,
     viewer: crate::auth::Viewer,
+    format: Format,
     arrived: Instant,
     log: &mut QueryLog,
 ) -> Response {
@@ -478,7 +479,7 @@ async fn stream_sql(
                         u64::try_from(queued.as_micros()).unwrap_or(u64::MAX),
                         Ordering::Relaxed,
                     );
-                    async move { engine.engine.stream(&sql, viewer, tx).await }
+                    async move { engine.engine.stream(&sql, viewer, format, tx).await }
                 })
                 .await;
             let _ = done_tx.send(result);
@@ -513,7 +514,11 @@ async fn stream_sql(
         arrived,
         outcome: Some(outcome_tx),
     };
-    let head = ndjson_line(&json!({ "query_id": query_id, "columns": columns }));
+    // Arrow carries its schema in the stream; NDJSON gets a header line.
+    let head = match format {
+        Format::Ndjson => ndjson_line(&json!({ "query_id": query_id, "columns": columns })),
+        Format::Arrow => Vec::new(),
+    };
     let receiving = Receiving {
         rx,
         st: shared.clone(),
@@ -562,15 +567,36 @@ async fn stream_sql(
                 Outcome::failed("internal", "stream task ended"),
             ),
         };
+        let failed = outcome
+            .error
+            .as_ref()
+            .map(|(code, m)| format!("{code}: {m}"));
         guard.finish(outcome);
-        ndjson_line(&line)
+        match (format, failed) {
+            (Format::Ndjson, _) => Ok(ndjson_line(&line)),
+            // The writer's end-of-stream marker was the last chunk.
+            (Format::Arrow, None) => Ok(Vec::new()),
+            // Arrow has no error message: abort the body, so the stream ends
+            // without its end-of-stream marker and readers fail loudly
+            // instead of seeing a short, valid-looking result.
+            (Format::Arrow, Some(e)) => Err(std::io::Error::other(e)),
+        }
     });
-    let body = futures::stream::once(std::future::ready(head))
-        .chain(rows)
-        .chain(tail)
-        .map(Ok::<_, std::convert::Infallible>);
+    let body = futures::stream::once(std::future::ready(Ok(head)))
+        .chain(rows.map(Ok))
+        .chain(tail);
+    let content_type = match format {
+        Format::Ndjson => "application/x-ndjson",
+        Format::Arrow => "application/vnd.apache.arrow.stream",
+    };
     let mut response = (
-        [(header::CONTENT_TYPE, "application/x-ndjson")],
+        [
+            (header::CONTENT_TYPE, content_type.to_owned()),
+            (
+                HeaderName::from_static("x-plimsoll-query-id"),
+                query_id.to_string(),
+            ),
+        ],
         axum::body::Body::from_stream(body),
     )
         .into_response();
@@ -675,11 +701,16 @@ async fn run_sql(
     viewer.group = Some(request.resource_group.clone());
     match req.format.as_deref() {
         None | Some("json") => {}
-        Some("ndjson") => return stream_sql(shared, request, viewer, Instant::now(), log).await,
+        Some("ndjson") => {
+            return stream_sql(shared, request, viewer, Format::Ndjson, Instant::now(), log).await;
+        }
+        Some("arrow") => {
+            return stream_sql(shared, request, viewer, Format::Arrow, Instant::now(), log).await;
+        }
         Some(other) => {
             return ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", false).respond(
                 st,
-                format!("unknown format {other:?} (json, ndjson)"),
+                format!("unknown format {other:?} (json, ndjson, arrow)"),
                 None,
             );
         }
@@ -1128,6 +1159,66 @@ mod tests {
         )
         .await;
         assert_eq!(got, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    /// `format: arrow` (ADR 0037): a decodable IPC stream with the query id
+    /// in a header; early errors keep their status; a mid-stream failure
+    /// aborts the body so the stream lacks its end-of-stream marker.
+    #[tokio::test]
+    async fn arrow_results_stream_and_fail_loudly() {
+        use plimsoll_core::datafusion::arrow::ipc::reader::StreamReader;
+        use plimsoll_core::engine::Engine;
+        use plimsoll_core::memory::CeilingPool;
+        let pool = Arc::new(CeilingPool::new(64 << 20, 1 << 20).unwrap());
+        let mut st = Arc::into_inner(default_state()).unwrap();
+        st.engine = Arc::new(crate::engine::CoreEngine(Arc::new(
+            Engine::new(pool.clone(), None).unwrap(),
+        )));
+        let st = Arc::new(st);
+        let arrow = |sql: &str| sql_req(json!({"sql": sql, "user": "ana", "format": "arrow"}));
+
+        let res = router(st.clone())
+            .oneshot(arrow("SELECT value AS v FROM range(5000)"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()[header::CONTENT_TYPE],
+            "application/vnd.apache.arrow.stream"
+        );
+        assert_eq!(res.headers()["x-plimsoll-query-id"], "1");
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let reader = StreamReader::try_new(std::io::Cursor::new(body.to_vec()), None).unwrap();
+        assert_eq!(reader.map(|b| b.unwrap().num_rows()).sum::<usize>(), 5000);
+
+        let (status, body) = call(router(st.clone()), arrow("SELEC")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(error_code(&body), "invalid_query");
+
+        // Division by zero in the second batch: rows already went out.
+        let res = router(st.clone())
+            .oneshot(arrow("SELECT 1 / (value - 9000) AS x FROM range(20000)"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mut body = res.into_body().into_data_stream();
+        let (mut bytes, mut aborted) = (Vec::new(), false);
+        while let Some(chunk) = body.next().await {
+            match chunk {
+                Ok(c) => bytes.extend_from_slice(&c),
+                Err(_) => {
+                    aborted = true;
+                    break;
+                }
+            }
+        }
+        assert!(aborted, "the body ends in an error, not a clean EOF");
+        assert!(
+            !bytes.is_empty(),
+            "some batches were sent before the failure"
+        );
+        assert_eq!(st.admission.load(), (0, 0));
+        assert_eq!(pool.used(), 0);
     }
 
     /// A reader that goes away mid-stream cancels the query: the slot and

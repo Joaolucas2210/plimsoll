@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use plimsoll_connectors::ConnectorError;
 use plimsoll_control::catalog::CatalogError;
+use plimsoll_core::datafusion::arrow::ipc::writer::StreamWriter;
 use plimsoll_core::datafusion::arrow::json::ArrayWriter;
 use plimsoll_core::datafusion::arrow::record_batch::RecordBatch;
 use plimsoll_core::datafusion::error::DataFusionError;
@@ -88,6 +89,15 @@ pub enum Chunk {
     Rows(Vec<u8>, Option<Reservation>),
 }
 
+/// Wire encoding of a streamed result (ADR 0035, 0037).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    /// One JSON array per row, newline-terminated.
+    Ndjson,
+    /// Arrow IPC stream: schema, record batches, end-of-stream marker.
+    Arrow,
+}
+
 /// Rows per streamed chunk. ponytail: fixed; very wide rows make big
 /// chunks (1024 × row size). Size by bytes if that ever matters.
 const CHUNK_ROWS: usize = 1024;
@@ -117,8 +127,12 @@ pub trait QueryEngine: Send + Sync {
         &self,
         sql: &str,
         viewer: Viewer,
+        format: Format,
         tx: tokio::sync::mpsc::Sender<Chunk>,
     ) -> Result<Streamed, EngineError> {
+        if format != Format::Ndjson {
+            return Err(EngineError::Unsupported(format!("{format:?} results")));
+        }
         let out = self.execute(sql, viewer).await?;
         let rows: Vec<Value> = serde_json::from_slice(&out.rows_json)
             .map_err(|e| EngineError::Internal(e.to_string()))?;
@@ -228,6 +242,7 @@ impl QueryEngine for CoreEngine {
         &self,
         sql: &str,
         viewer: Viewer,
+        format: Format,
         tx: tokio::sync::mpsc::Sender<Chunk>,
     ) -> Result<Streamed, EngineError> {
         let started = Instant::now();
@@ -248,6 +263,30 @@ impl QueryEngine for CoreEngine {
         tx.send(Chunk::Header(columns.clone()))
             .await
             .map_err(|_| receiver_gone())?;
+        let internal = |e: &dyn std::fmt::Display| EngineError::Internal(e.to_string());
+        // Arrow: the writer emits the schema message now; its bytes leave
+        // with the first chunk.
+        let mut ipc = match format {
+            Format::Arrow => Some(
+                StreamWriter::try_new(Vec::new(), &query.stream.schema())
+                    .map_err(|e| internal(&e))?,
+            ),
+            Format::Ndjson => None,
+        };
+        let send = async |bytes: Vec<u8>| -> Result<(), EngineError> {
+            // Reserved until the body takes it: the bytes in flight (the
+            // channel plus the chunk being written) stay under the ceiling.
+            let mut memory =
+                self.0
+                    .pool()
+                    .register_in(group.as_ref(), "query-output", ConsumerKind::Output);
+            memory
+                .try_grow(bytes.len())
+                .map_err(|e| EngineError::MemoryLimitExceeded(e.to_string()))?;
+            tx.send(Chunk::Rows(bytes, Some(memory)))
+                .await
+                .map_err(|_| receiver_gone())
+        };
         let (mut rows, mut serialization) = (0u64, Duration::ZERO);
         while let Some(batch) = query.stream.next().await {
             let batch = batch.map_err(|e| classify(&e))?;
@@ -258,28 +297,32 @@ impl QueryEngine for CoreEngine {
                 let slice = batch.slice(offset, CHUNK_ROWS.min(batch.num_rows() - offset));
                 offset += slice.num_rows();
                 let serializing = Instant::now();
-                let mut lines = Vec::new();
-                each_row(&slice, &columns, |row| {
-                    rows += 1;
-                    serde_json::to_writer(&mut lines, &row)
-                        .map_err(|e| EngineError::Internal(e.to_string()))?;
-                    lines.push(b'\n');
-                    Ok(())
-                })?;
+                let bytes = match &mut ipc {
+                    Some(writer) => {
+                        rows += slice.num_rows() as u64;
+                        writer.write(&slice).map_err(|e| internal(&e))?;
+                        std::mem::take(writer.get_mut())
+                    }
+                    None => {
+                        let mut lines = Vec::new();
+                        each_row(&slice, &columns, |row| {
+                            rows += 1;
+                            serde_json::to_writer(&mut lines, &row).map_err(|e| internal(&e))?;
+                            lines.push(b'\n');
+                            Ok(())
+                        })?;
+                        lines
+                    }
+                };
                 serialization += serializing.elapsed();
-                // Reserved until the body takes it: the bytes in flight (the
-                // channel plus the chunk being written) stay under the ceiling.
-                let mut memory =
-                    self.0
-                        .pool()
-                        .register_in(group.as_ref(), "query-output", ConsumerKind::Output);
-                memory
-                    .try_grow(lines.len())
-                    .map_err(|e| EngineError::MemoryLimitExceeded(e.to_string()))?;
-                tx.send(Chunk::Rows(lines, Some(memory)))
-                    .await
-                    .map_err(|_| receiver_gone())?;
+                send(bytes).await?;
             }
+        }
+        // The end-of-stream marker (and, for an empty result, the schema):
+        // a reader that never sees it knows the stream was cut short.
+        if let Some(mut writer) = ipc {
+            writer.finish().map_err(|e| internal(&e))?;
+            send(std::mem::take(writer.get_mut())).await?;
         }
         let planning = query.planning;
         Ok(Streamed {
@@ -525,7 +568,10 @@ mod tests {
             }
             (header, lines, peak)
         });
-        let done = e.stream(sql, Viewer::default(), tx).await.unwrap();
+        let done = e
+            .stream(sql, Viewer::default(), Format::Ndjson, tx)
+            .await
+            .unwrap();
         let (header, lines, peak) = reader.await.unwrap();
         assert_eq!(header.unwrap().len(), 2);
         assert_eq!((done.rows, lines), (200_000, 200_000));
@@ -535,9 +581,51 @@ mod tests {
         // Planning errors surface before any chunk.
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         assert!(matches!(
-            e.stream("SELEC", Viewer::default(), tx).await,
+            e.stream("SELEC", Viewer::default(), Format::Ndjson, tx)
+                .await,
             Err(EngineError::InvalidQuery(_))
         ));
         assert!(rx.recv().await.is_none());
+    }
+
+    /// Arrow IPC: the chunks concatenate into one valid stream (schema,
+    /// batches, end-of-stream), bounded like NDJSON (ADR 0037).
+    #[tokio::test]
+    async fn arrow_stream_decodes_and_is_bounded() {
+        use plimsoll_core::datafusion::arrow::ipc::reader::StreamReader;
+        let pool = Arc::new(CeilingPool::new(1 << 20, 1 << 17).unwrap());
+        let e = Arc::new(CoreEngine(Arc::new(
+            Engine::new(pool.clone(), None).unwrap(),
+        )));
+        let collect = async |sql: &'static str| {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+            let e = e.clone();
+            let run =
+                tokio::spawn(
+                    async move { e.stream(sql, Viewer::default(), Format::Arrow, tx).await },
+                );
+            let mut bytes = Vec::new();
+            while let Some(chunk) = rx.recv().await {
+                if let Chunk::Rows(b, _) = chunk {
+                    bytes.extend(b);
+                }
+            }
+            (run.await.unwrap(), bytes)
+        };
+        let (done, bytes) =
+            collect("SELECT value, repeat('x', 100) AS pad FROM range(200000)").await;
+        assert_eq!(done.unwrap().rows, 200_000);
+        let reader = StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
+        assert_eq!(reader.schema().field(1).name(), "pad");
+        let rows: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+        assert_eq!(rows, 200_000);
+        assert_eq!(pool.used(), 0);
+
+        // Empty result: still a complete stream with the schema.
+        let (done, bytes) = collect("SELECT value FROM range(10) WHERE value > 99").await;
+        assert_eq!(done.unwrap().rows, 0);
+        let reader = StreamReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
+        assert_eq!(reader.schema().fields().len(), 1);
+        assert_eq!(reader.count(), 0);
     }
 }

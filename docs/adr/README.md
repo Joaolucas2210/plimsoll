@@ -44,6 +44,7 @@ are allowed in place.
 | [0034](0034-query-cancellation.md) | Query cancellation | Accepted | 2026-11-01 | `DELETE /v1/queries/{id}`: a per-query `Notify` in the registry races the deadline; cancelling drops the governed future (queue wait or execution); owners and operators only, others get 404; the query answers `409 query_cancelled` | 0013, 0021, 0022, 0026 |
 | [0035](0035-streamed-results.md) | Streamed results (NDJSON) | Accepted | 2026-11-02 | `"format": "ndjson"`: the governed query runs in its own task and sends 1024-row chunks, each reserved until written, through a 2-slot channel; errors before the header keep HTTP statuses; a dropped body cancels the query | 0003, 0012, 0013, 0027, 0034 |
 | [0036](0036-group-memory-shares.md) | Memory shares per resource group | Accepted | 2026-11-02 | `PLIMSOLL_RESOURCE_GROUPS=batch=2/64/40%`: the `CeilingPool` caps a group's consumers together; queries of a capped group run on a `GroupPool` view of the pool in a per-query runtime; uncapped groups untouched | 0003, 0018, 0023, 0035 |
+| [0037](0037-arrow-ipc-results.md) | Arrow IPC results | Accepted | 2026-11-02 | `"format": "arrow"`: Arrow `StreamWriter` on the NDJSON chunk path (1024-row batches, reserved per chunk); query id in `x-plimsoll-query-id`; a mid-stream failure aborts the body so readers see no end-of-stream marker | 0035, 0013, 0012 |
 
 ## Reading order
 
