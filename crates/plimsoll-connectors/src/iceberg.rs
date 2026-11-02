@@ -259,6 +259,8 @@ struct PlanStats {
     equality_files: usize,
     /// Delete files served from the cache (ADR 0018).
     cache_hits: usize,
+    /// Manifest lists and manifests served from the cache (ADR 0039).
+    manifest_cache_hits: usize,
 }
 
 impl IcebergTable {
@@ -384,10 +386,26 @@ impl IcebergTable {
             .register(&state.runtime_env().memory_pool);
         // Raw Avro bytes are reserved while in use; entries are decoded one at
         // a time (never collected), so decoded state stays O(one entry).
-        let load = async |path: &str| -> Result<bytes::Bytes> {
-            let bytes = read(path, state, self.scoped.as_ref()).await?;
-            reservation.try_grow(bytes.len())?;
-            Ok(bytes)
+        // Manifest lists and manifests are immutable files, so their bytes
+        // are cached by path with the delete files (ADR 0039): a repeated
+        // query over the same snapshot plans without object-store reads.
+        // Returns the bytes and how many of them this query reserved (0 on
+        // a hit: the cache accounts for them).
+        let manifest_hits = AtomicUsize::new(0);
+        let load = async |path: &str| -> Result<(bytes::Bytes, usize)> {
+            let (bytes, held) = deletes::cached(
+                state,
+                &format!("manifest/{path}"),
+                &reservation,
+                &manifest_hits,
+                async {
+                    let bytes = read(path, state, self.scoped.as_ref()).await?;
+                    let n = bytes.len();
+                    Ok((bytes, n))
+                },
+            )
+            .await?;
+            Ok(((*bytes).clone(), held))
         };
 
         // Object store round trips dominate planning: manifests and delete
@@ -398,7 +416,7 @@ impl IcebergTable {
 
         // Phase 1a: the manifest list decides which manifests to read.
         let mut manifests = Vec::new();
-        let list_bytes = load(list_path).await?;
+        let (list_bytes, list_held) = load(list_path).await?;
         for manifest in avro_entries(list_path, &list_bytes)? {
             let manifest = manifest?;
             let manifest_path = str_field(&manifest, "manifest_path")
@@ -422,7 +440,7 @@ impl IcebergTable {
             stats.manifests_read += 1;
             manifests.push((manifest_path, is_delete, manifest_seq, spec_id));
         }
-        reservation.shrink(list_bytes.len());
+        reservation.shrink(list_held);
 
         // Phase 1b: data files and delete files that survive pruning, from
         // manifests fetched concurrently and decoded in list order.
@@ -433,13 +451,13 @@ impl IcebergTable {
             .map(|(path, is_delete, seq, spec)| {
                 let load = &load;
                 async move {
-                    let bytes = load(&path).await?;
-                    Ok::<_, DataFusionError>((path, is_delete, seq, spec, bytes))
+                    let (bytes, held) = load(&path).await?;
+                    Ok::<_, DataFusionError>((path, is_delete, seq, spec, bytes, held))
                 }
             })
             .buffered(concurrency);
         while let Some(manifest) = fetched.next().await {
-            let (manifest_path, is_delete, manifest_seq, spec_id, manifest_bytes) = manifest?;
+            let (manifest_path, is_delete, manifest_seq, spec_id, manifest_bytes, held) = manifest?;
             for entry in avro_entries(&manifest_path, &manifest_bytes)? {
                 let entry = entry?;
                 // status 2 = deleted in this snapshot.
@@ -554,7 +572,7 @@ impl IcebergTable {
                     eq: vec![],
                 });
             }
-            reservation.shrink(manifest_bytes.len());
+            reservation.shrink(held);
         }
         drop(fetched);
 
@@ -646,6 +664,7 @@ impl IcebergTable {
         drop(loaded);
         stats.equality_files = sets.len();
         stats.cache_hits = hits.into_inner();
+        stats.manifest_cache_hits = manifest_hits.into_inner();
         Ok((files, sets, stats))
     }
 }
@@ -729,7 +748,7 @@ impl TableProvider for IcebergTable {
         }
         Ok(Arc::new(AccountedExec::new(
             format!(
-                "IcebergScan[{}] snapshot={} manifests={}/{} files={}/{} deletes={} deleted_rows={} equality_deletes={} delete_cache_hits={}",
+                "IcebergScan[{}] snapshot={} manifests={}/{} files={}/{} deletes={} deleted_rows={} equality_deletes={} delete_cache_hits={} manifest_cache_hits={}",
                 self.name,
                 self.snapshot_id
                     .map_or("none".to_owned(), |id| id.to_string()),
@@ -741,6 +760,7 @@ impl TableProvider for IcebergTable {
                 stats.deleted_rows,
                 stats.equality_files,
                 stats.cache_hits,
+                stats.manifest_cache_hits,
             ),
             UnionExec::try_new(plans)?,
         )

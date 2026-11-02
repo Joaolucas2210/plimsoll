@@ -332,11 +332,12 @@ impl<T: Send + Sync + 'static> FileMetadata for Cached<T> {
     }
 }
 
-/// `load`ed value for `key`, or the cached one. Delete files are immutable,
-/// so the path (plus blob range / key types) is a complete key. On a miss
+/// `load`ed value for `key`, or the cached one. Delete files and manifests
+/// are immutable, so the path (plus blob range / key types) is a complete
+/// key. On a miss
 /// the value's bytes are reserved and returned as `held`: the caller shrinks
 /// them once done (the cache, if it kept the value, accounts for it).
-async fn cached<T: Send + Sync + 'static>(
+pub(super) async fn cached<T: Send + Sync + 'static>(
     state: &dyn Session,
     key: &str,
     reservation: &MemoryReservation,

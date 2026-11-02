@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Manifest cache: manifest lists and manifests cached by path in the cache reserve; replanning a snapshot reads nothing (ADR 0039)
 - [x] Result cache: SQL + pinned Iceberg snapshots as key, deterministic plans only, reserved in the pool, opt-in (ADR 0038)
 - [x] Arrow IPC results: `"format": "arrow"`, same bounded chunk path, mid-stream errors abort the stream (ADR 0037)
 - [x] Memory shares per resource group: `batch=2/64/40%` caps the group's queries together, below the ceiling; per-group used/share gauges (ADR 0036)
@@ -71,10 +72,10 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Planning cache for unchanged snapshots**: a result-cache hit still
-re-plans (manifest list, manifests, delete files) to learn the snapshot
-ids. Cache the planned Iceberg file list per `table@snapshot` so repeated
-queries skip manifest I/O as well, under the cache reserve.
+**Iceberg schema evolution by field id**: renamed columns are refused
+today (ADR 0007's name-mapping check). Map Parquet columns to the table
+schema by Iceberg field id (Parquet `field_id`) so renamed and re-added
+columns read correctly instead of failing.
 
 ## Later
 

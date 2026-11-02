@@ -906,6 +906,72 @@ async fn planning_fetches_manifests_concurrently() {
     );
 }
 
+/// Manifest lists and manifests are immutable, so their bytes are cached
+/// by path (ADR 0039): planning the same snapshot again reads nothing.
+#[tokio::test]
+async fn replanning_a_snapshot_reads_no_manifests() {
+    use datafusion::execution::object_store::ObjectStoreUrl;
+    use datafusion::object_store::memory::InMemory;
+    use datafusion::object_store::path::Path as StorePath;
+    use datafusion::object_store::throttle::{ThrottleConfig, ThrottledStore};
+    use datafusion::object_store::{ObjectStoreExt, PutPayload};
+    use std::time::{Duration, Instant};
+
+    let dir = tmp("manifest-cache");
+    many_manifests(&dir, 8);
+    let files = InMemory::new();
+    for entry in std::fs::read_dir(dir.join("metadata")).unwrap() {
+        let path = entry.unwrap().path();
+        let key = StorePath::from_absolute_path(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        files.put(&key, PutPayload::from(bytes)).await.unwrap();
+    }
+    // Under the ceiling with a cache reserve, as the server runs.
+    let pool = Arc::new(
+        CeilingPool::new(64 << 20, 0)
+            .unwrap()
+            .with_cache_reserve(4 << 20)
+            .unwrap(),
+    );
+    let ctx = session_context_with_ceiling(pool.clone(), None, SessionConfig::new()).unwrap();
+    register(&ctx, &dir).await.unwrap();
+    // Registration read the metadata JSON from disk; manifests now come
+    // from a store where every GET costs 50 ms.
+    let slow = ThrottleConfig {
+        wait_get_per_call: Duration::from_millis(50),
+        ..Default::default()
+    };
+    ctx.runtime_env().register_object_store(
+        ObjectStoreUrl::local_filesystem().as_ref(),
+        Arc::new(ThrottledStore::new(Arc::new(files), slow)),
+    );
+    let plan = async || {
+        let started = Instant::now();
+        let physical = ctx
+            .sql("SELECT sum(id) FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let text = datafusion::physical_plan::displayable(physical.as_ref())
+            .indent(true)
+            .to_string();
+        (started.elapsed(), text)
+    };
+    let (cold, text) = plan().await;
+    assert!(text.contains("manifest_cache_hits=0"), "{text}");
+    let (warm, text) = plan().await;
+    // The list and all 8 manifests: no GET at all.
+    assert!(text.contains("manifest_cache_hits=9"), "{text}");
+    assert!(cold >= Duration::from_millis(100), "{cold:?}");
+    assert!(
+        warm < Duration::from_millis(50),
+        "{warm:?} vs cold {cold:?}"
+    );
+    assert_eq!(pool.used(), 0, "cached bytes sit in the cache reserve");
+}
+
 /// Time travel on the Spark MOR table (ADR 0028): the first snapshot is the
 /// plain insert (48 rows, no deletes yet); the second applies `DELETE id % 3
 /// = 0`; by instant, the first snapshot-log entry's time selects the first.
