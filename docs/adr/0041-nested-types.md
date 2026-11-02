@@ -98,8 +98,8 @@ unreadable. Rejected.
   fine (ADR 0040).
 - **Promotions inside nested types** rely on DataFusion's cast, without
   per-child field-id resolution.
-- **No pruning on nested fields.** Bounds on nested primitives exist in
-  manifests but are not used.
+- **No pruning on nested fields** at first; ADR 0048 adds it for struct
+  children.
 
 ## Risks and mitigations
 

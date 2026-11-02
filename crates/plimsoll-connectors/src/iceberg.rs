@@ -359,15 +359,18 @@ impl IcebergTable {
                 Some(list.to_owned())
             }
         };
-        let columns = current["fields"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|f| {
-                let prim = Prim::from_iceberg(f["type"].as_str()?)?;
-                Some((f["name"].as_str()?.to_owned(), (f["id"].as_i64()?, prim)))
-            })
-            .collect();
+        let mut paths = Vec::new();
+        prunable(&current["fields"], "", &mut paths);
+        // A top-level column literally named `s.a` would share a key with
+        // struct child `s.a`: such paths are not pruned at all.
+        let mut columns: HashMap<String, (i64, Prim)> = HashMap::new();
+        let mut clashes = HashSet::new();
+        for (path, field) in paths {
+            if columns.insert(path.clone(), field).is_some() {
+                clashes.insert(path);
+            }
+        }
+        columns.retain(|path, _| !clashes.contains(path));
         let specs = meta["partition-specs"]
             .as_array()
             .into_iter()
@@ -1115,6 +1118,29 @@ fn iceberg_type(path: &str, ty: &Json) -> Result<DataType, ConnectorError> {
             ))
         }
         _ => Err(unsupported(path, format!("type {ty}"))),
+    }
+}
+
+/// Prunable primitives by path: top-level columns (`id`) and primitives
+/// reached through structs only (`s.a`, ADR 0048). Elements of lists and
+/// maps are skipped: their bounds cover any element, not one value.
+fn prunable(fields: &Json, prefix: &str, out: &mut Vec<(String, (i64, Prim))>) {
+    for f in fields.as_array().into_iter().flatten() {
+        let (Some(name), Some(id)) = (f["name"].as_str(), f["id"].as_i64()) else {
+            continue;
+        };
+        let path = format!("{prefix}{name}");
+        match f["type"].as_str() {
+            Some(ty) => {
+                if let Some(prim) = Prim::from_iceberg(ty) {
+                    out.push((path, (id, prim)));
+                }
+            }
+            None if f["type"]["type"] == "struct" => {
+                prunable(&f["type"]["fields"], &format!("{path}."), out);
+            }
+            None => {}
+        }
     }
 }
 

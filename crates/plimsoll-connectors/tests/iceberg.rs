@@ -1090,6 +1090,32 @@ async fn reads_nested_spark_types() {
             .unwrap(),
         [3]
     );
+    // Nested bounds prune (ADR 0048). Spark wrote three files: (1, s.a=1),
+    // (2, s NULL) and (3, s.a=3). The all-NULL file has no bounds for s.a
+    // and is kept (conservative); the others prune on s.a's bounds.
+    assert_eq!(
+        ids(&ctx, "SELECT id FROM n WHERE s['a'] = 3")
+            .await
+            .unwrap(),
+        [3]
+    );
+    for (sql, files) in [
+        ("SELECT id FROM n WHERE s['a'] = 3", "files=2/3"),
+        ("SELECT id FROM n WHERE s['a'] > 100", "files=1/3"),
+        ("SELECT id FROM n WHERE s['a'] >= 1", "files=3/3"),
+    ] {
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let text = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(text.contains(files), "{sql}: {text}");
+    }
     let all = ctx
         .sql("SELECT s FROM n ORDER BY id")
         .await

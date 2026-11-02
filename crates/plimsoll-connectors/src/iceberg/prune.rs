@@ -269,8 +269,16 @@ fn collect(e: &Expr, columns: &HashMap<String, (i64, Prim)>, out: &mut Vec<Pred>
                 _ => return,
             };
             match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(c), Expr::Literal(v, _)) => push(&c.name, op, v, columns, out),
-                (Expr::Literal(v, _), Expr::Column(c)) => push(&c.name, op.flip(), v, columns, out),
+                (e, Expr::Literal(v, _)) => {
+                    if let Some(name) = path(e) {
+                        push(&name, op, v, columns, out);
+                    }
+                }
+                (Expr::Literal(v, _), e) => {
+                    if let Some(name) = path(e) {
+                        push(&name, op.flip(), v, columns, out);
+                    }
+                }
                 _ => {}
             }
         }
@@ -280,14 +288,37 @@ fn collect(e: &Expr, columns: &HashMap<String, (i64, Prim)>, out: &mut Vec<Pred>
             low,
             high,
         }) => {
-            if let (Expr::Column(c), Expr::Literal(lo, _), Expr::Literal(hi, _)) =
-                (expr.as_ref(), low.as_ref(), high.as_ref())
+            if let (Some(name), Expr::Literal(lo, _), Expr::Literal(hi, _)) =
+                (path(expr), low.as_ref(), high.as_ref())
             {
-                push(&c.name, Op::GtEq, lo, columns, out);
-                push(&c.name, Op::LtEq, hi, columns, out);
+                push(&name, Op::GtEq, lo, columns, out);
+                push(&name, Op::LtEq, hi, columns, out);
             }
         }
         _ => {}
+    }
+}
+
+/// `col` -> `"col"`, `col['a']['b']` (`get_field`) -> `"col.a.b"`: the keys
+/// of the prunable-column map, struct children included (ADR 0048).
+fn path(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Column(c) => Some(c.name.clone()),
+        Expr::ScalarFunction(f) if f.func.name() == "get_field" => {
+            let [inner, keys @ ..] = f.args.as_slice() else {
+                return None;
+            };
+            let mut out = path(inner)?;
+            for key in keys {
+                let Expr::Literal(ScalarValue::Utf8(Some(k)), _) = key else {
+                    return None;
+                };
+                out.push('.');
+                out.push_str(k);
+            }
+            Some(out)
+        }
+        _ => None,
     }
 }
 
@@ -442,5 +473,18 @@ mod tests {
         let keep_m = |e: Expr| Pruner::new(&[e], &columns()).may_match_manifest(&month_spec, &m);
         assert!(keep_m(col("ts").eq(at_day(19_700))));
         assert!(!keep_m(col("ts").gt_eq(at_day(19_723)))); // day 19_723 = 2024-01-01
+    }
+
+    #[test]
+    fn struct_children_are_paths() {
+        use datafusion::functions::core::expr_fn::get_field;
+        use datafusion::prelude::col;
+        assert_eq!(path(&col("id")).as_deref(), Some("id"));
+        assert_eq!(path(&get_field(col("s"), "a")).as_deref(), Some("s.a"));
+        assert_eq!(
+            path(&get_field(get_field(col("s"), "t"), "b")).as_deref(),
+            Some("s.t.b")
+        );
+        assert_eq!(path(&(col("a") + col("b"))), None);
     }
 }
