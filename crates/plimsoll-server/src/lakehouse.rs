@@ -100,7 +100,7 @@ impl SchemaProvider for CatalogSchema {
                     return Ok(Some(Arc::new(mem)));
                 }
                 // `$files` / `$manifests` read manifests (ADR 0032).
-                if matches!(kind, "files" | "manifests") {
+                if matches!(kind, "files" | "manifests" | "partitions") {
                     let metadata = loaded.1.metadata.clone();
                     let connector = self.connector(name, loaded, &metadata)?;
                     if let Some(t) = connector.metadata_table(kind) {

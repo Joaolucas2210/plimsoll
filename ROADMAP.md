@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Iceberg `$partitions`: per (spec, partition) data rows/files/bytes and delete rows/files, folded from `$files` under the ceiling (ADR 0047)
 - [x] Audit trail: `reads` (table, columns read, row filter) on every query log line, from the optimized plan (ADR 0046)
 - [x] Row filters per principal: a predicate under every scan of the table, cache-keyed, metadata tables denied (ADR 0045)
 - [x] Column-level deny: per principal, on the columns each optimized scan reads (filters included), time travel and `$files` partitions covered (ADR 0044)
@@ -79,10 +80,10 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Iceberg `$partitions` and partition-level `$files` stats**: per-partition
-row counts, file counts and sizes from manifests (ADR 0032 skipped it as a
-`GROUP BY` over `$files`); also use nested-field bounds for pruning
-(ADR 0041's revisit item).
+**Pruning on nested fields**: manifests carry bounds for primitive
+children of structs (`s.a`), but the pruner only knows top-level columns
+(ADR 0041). Extend `Pruner` to `get_field` predicates so filters on nested
+fields skip files.
 
 ## Later
 

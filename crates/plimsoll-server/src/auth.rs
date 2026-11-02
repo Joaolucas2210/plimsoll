@@ -399,7 +399,10 @@ impl TableAccess for Viewer {
         };
         // `users$files` shows partition values, which may be a denied
         // column's (a table partitioned by it): withhold them (ADR 0032).
-        if let Some(base) = name.strip_suffix("$files") {
+        if let Some(base) = name
+            .strip_suffix("$files")
+            .or_else(|| name.strip_suffix("$partitions"))
+        {
             let prefix = format!("{}.{base}.", table.schema);
             if columns.contains(&"partition") && denied.iter().any(|c| c.starts_with(&prefix)) {
                 return deny(format!("{}.{name}.partition (column)", table.schema));

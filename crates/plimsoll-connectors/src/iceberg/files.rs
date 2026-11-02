@@ -10,6 +10,7 @@
 //!
 //! Column names follow Spark's metadata tables.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use apache_avro::types::Value as Avro;
@@ -18,7 +19,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::TableProvider;
 use datafusion::catalog::streaming::StreamingTable;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::memory_pool::MemoryConsumer;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream;
@@ -31,6 +32,8 @@ use super::{IcebergTable, avro_entries, field, invalid, long_field, read_env, st
 enum Kind {
     Files,
     Manifests,
+    /// `$files` folded per (spec, partition) (ADR 0047).
+    Partitions,
 }
 
 #[derive(Debug)]
@@ -47,6 +50,7 @@ pub(super) fn provider(
     let (kind, schema) = match kind {
         "files" => (Kind::Files, files_schema()),
         "manifests" => (Kind::Manifests, manifests_schema()),
+        "partitions" => (Kind::Partitions, partitions_schema()),
         _ => return None,
     };
     let scan = Arc::new(ManifestScan {
@@ -67,6 +71,21 @@ fn files_schema() -> SchemaRef {
         Field::new("record_count", DataType::Int64, true),
         Field::new("file_size_in_bytes", DataType::Int64, true),
         Field::new("sequence_number", DataType::Int64, true),
+    ]))
+}
+
+fn partitions_schema() -> SchemaRef {
+    let long = |n: &str| Field::new(n, DataType::Int64, false);
+    Arc::new(Schema::new(vec![
+        Field::new("partition", DataType::Utf8, true),
+        Field::new("spec_id", DataType::Int32, true),
+        long("record_count"),
+        long("file_count"),
+        long("total_data_file_size_in_bytes"),
+        long("position_delete_record_count"),
+        long("position_delete_file_count"),
+        long("equality_delete_record_count"),
+        long("equality_delete_file_count"),
     ]))
 }
 
@@ -153,13 +172,15 @@ async fn listing(
                 .execution
                 .meta_fetch_concurrency,
         );
-        Ok(stream::iter(manifests)
+        let files = files_schema();
+        let totals = reservation.clone();
+        let fetched = stream::iter(manifests)
             .map(move |m| {
                 let (table, env, reservation, schema) = (
                     table.clone(),
                     env.clone(),
                     reservation.clone(),
-                    schema.clone(),
+                    files.clone(),
                 );
                 async move {
                     let bytes = read_env(&m.path, &env, table.scoped.as_ref()).await?;
@@ -170,8 +191,108 @@ async fn listing(
                 }
             })
             .buffered(concurrency)
-            .boxed())
+            .boxed();
+        if kind == Kind::Partitions {
+            return Ok(stream::once(partitions(fetched, schema, totals)).boxed());
+        }
+        Ok(fetched)
     }
+}
+
+/// Per-partition totals, as Spark's `partitions` metadata table: data rows,
+/// files and bytes, and delete files and rows by kind.
+#[derive(Default)]
+struct PartitionTotals {
+    records: i64,
+    files: i64,
+    bytes: i64,
+    pos_records: i64,
+    pos_files: i64,
+    eq_records: i64,
+    eq_files: i64,
+}
+
+/// Folds `$files` batches into one row per (spec, partition). Memory is
+/// O(partitions), each reserved as it first appears.
+async fn partitions(
+    mut files: BoxStream<'static, Result<RecordBatch>>,
+    schema: SchemaRef,
+    reservation: Arc<MemoryReservation>,
+) -> Result<RecordBatch> {
+    use datafusion::arrow::array::{Array, AsArray};
+    use datafusion::arrow::datatypes::{Int32Type, Int64Type};
+    let mut totals: BTreeMap<(Option<i32>, Option<String>), PartitionTotals> = BTreeMap::new();
+    while let Some(batch) = files.next().await {
+        let batch = batch?;
+        let content = batch.column(0).as_primitive::<Int32Type>();
+        let spec = batch.column(3).as_primitive::<Int32Type>();
+        let partition = batch.column(4).as_string::<i32>();
+        let records = batch.column(5).as_primitive::<Int64Type>();
+        let bytes = batch.column(6).as_primitive::<Int64Type>();
+        for i in 0..batch.num_rows() {
+            let key = (
+                spec.is_valid(i).then(|| spec.value(i)),
+                partition.is_valid(i).then(|| partition.value(i).to_owned()),
+            );
+            let t = match totals.get_mut(&key) {
+                Some(t) => t,
+                None => {
+                    reservation.try_grow(
+                        std::mem::size_of::<PartitionTotals>()
+                            + 64
+                            + key.1.as_ref().map_or(0, String::len),
+                    )?;
+                    totals.entry(key).or_default()
+                }
+            };
+            let n = if records.is_valid(i) {
+                records.value(i)
+            } else {
+                0
+            };
+            match content.value(i) {
+                0 => {
+                    t.records += n;
+                    t.files += 1;
+                    t.bytes += if bytes.is_valid(i) { bytes.value(i) } else { 0 };
+                }
+                1 => {
+                    t.pos_records += n;
+                    t.pos_files += 1;
+                }
+                _ => {
+                    t.eq_records += n;
+                    t.eq_files += 1;
+                }
+            }
+        }
+    }
+    let rows = totals.len();
+    let col = |f: fn(&PartitionTotals) -> i64| -> ArrayRef {
+        Arc::new(Int64Array::from(totals.values().map(f).collect::<Vec<_>>()))
+    };
+    let out = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                totals.keys().map(|(_, p)| p.clone()).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int32Array::from(
+                totals.keys().map(|(s, _)| *s).collect::<Vec<_>>(),
+            )),
+            col(|t| t.records),
+            col(|t| t.files),
+            col(|t| t.bytes),
+            col(|t| t.pos_records),
+            col(|t| t.pos_files),
+            col(|t| t.eq_records),
+            col(|t| t.eq_files),
+        ],
+    )?;
+    // The batch now holds the totals; the map's reservation is released.
+    reservation.free();
+    debug_assert_eq!(out.num_rows(), rows);
+    Ok(out)
 }
 
 fn manifests_batch(list_path: &str, entries: &[Avro], schema: SchemaRef) -> Result<RecordBatch> {

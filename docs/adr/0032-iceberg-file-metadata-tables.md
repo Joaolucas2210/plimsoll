@@ -106,8 +106,7 @@ hottest code path.
 **Negative (accepted debt)**
 - **`partition` is JSON text, not a struct.** A struct needs each spec's
   result types, and specs evolve. Grouping and filtering work as strings.
-- **No `$partitions`.** It is a `GROUP BY partition` over `$files`, so it
-  was skipped until it is asked for (YAGNI).
+- **`$partitions` came later** (ADR 0047), as a fold over this stream.
 - **Some Spark columns are omitted:**
   - column-level stats (`column_sizes`, `lower_bounds`, …);
   - `key_metadata`;

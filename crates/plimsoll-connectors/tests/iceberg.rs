@@ -730,11 +730,11 @@ async fn files_and_manifests_metadata_tables() {
         let c = IcebergConnector::try_new("t", &dir.display().to_string(), &ctx.state())
             .await
             .unwrap();
-        for kind in ["files", "manifests"] {
+        for kind in ["files", "manifests", "partitions"] {
             let t = c.metadata_table(kind).unwrap().unwrap();
             ctx.register_table(format!("t${kind}"), t).unwrap();
         }
-        assert!(c.metadata_table("partitions").is_none());
+        assert!(c.metadata_table("all_files").is_none());
         let files = ctx
             .sql(
                 "SELECT content, regexp_replace(file_path, '.*/', ''), sequence_number, \
@@ -788,6 +788,22 @@ async fn files_and_manifests_metadata_tables() {
         .await
         .unwrap();
         assert_eq!(manifests, [0, 1, 0]);
+        // `$partitions` (ADR 0047): one unpartitioned row, data and delete
+        // totals kept apart.
+        let mut p = Vec::new();
+        for c in [
+            "record_count",
+            "file_count",
+            "equality_delete_file_count",
+            "position_delete_file_count",
+        ] {
+            p.extend(
+                ids(&ctx, &format!("SELECT {c} FROM \"t$partitions\""))
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(p, [6, 2, 1, 0]);
         assert_eq!(pool.used(), 0, "everything released");
     }
 }
@@ -1477,13 +1493,28 @@ async fn time_travels_a_spark_table() {
     let pool = Arc::new(CeilingPool::new(256 << 20, 0).unwrap());
     let ctx = session_context_with_ceiling(pool.clone(), None, SessionConfig::new()).unwrap();
     let c = IcebergConnector::from_metadata("t", &path, &meta).unwrap();
-    for kind in ["files", "manifests"] {
+    for kind in ["files", "manifests", "partitions"] {
         ctx.register_table(
             format!("t${kind}"),
             c.metadata_table(kind).unwrap().unwrap(),
         )
         .unwrap();
     }
+    // `$partitions` (ADR 0047) totals agree with `$files`: 49 data rows in
+    // 3 files, 17 position-deleted rows, over Spark's daily partitions.
+    let mut totals = Vec::new();
+    for c in ["record_count", "file_count", "position_delete_record_count"] {
+        let q = format!("SELECT sum({c}) FROM \"t$partitions\"");
+        totals.extend(ids(&ctx, &q).await.unwrap());
+    }
+    assert_eq!(totals, [49, 3, 17]);
+    let parts = ids(
+        &ctx,
+        "SELECT CAST(count(*) AS BIGINT) FROM \"t$partitions\"",
+    )
+    .await
+    .unwrap();
+    assert!(parts[0] >= 2, "Spark's daily partitions: {parts:?}");
     let per_content = ctx
         .sql(
             "SELECT content, count(*), sum(record_count) FROM \"t$files\" \

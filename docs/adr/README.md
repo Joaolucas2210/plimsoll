@@ -54,6 +54,7 @@ are allowed in place.
 | [0044](0044-column-deny.md) | Column-level deny | Accepted | 2026-11-02 | `PLIMSOLL_AUTH_COLUMN_DENY=user=schema.table.column\|...`; checked on the optimized plan's scans (projected + pushed-filter columns) before execution and before the result cache; `@` time-travel names map to the base table; `$files` partition values withheld | 0024, 0025, 0028, 0032, 0038 |
 | [0045](0045-row-filters.md) | Row filters per principal | Accepted | 2026-11-02 | `PLIMSOLL_AUTH_ROW_FILTERS` JSON; the engine wraps every scan of a filtered table in a `Filter` before optimization (joins, subqueries, time travel); result-cache key includes applied filters; `$` metadata tables of filtered tables denied; bad predicates are 500s that do not echo the filter | 0025, 0038, 0044 |
 | [0046](0046-audit-trail.md) | Audit trail of data reads | Accepted | 2026-11-02 | Every scan of the optimized plan is recorded (table, columns read incl. pushed-filter columns, row filter applied) and emitted as `reads` on the `query` log line; values never logged | 0027, 0043, 0044, 0045 |
+| [0047](0047-iceberg-partitions-table.md) | Iceberg `$partitions` | Accepted | 2026-11-02 | Folds the `$files` stream per (spec, partition) into Spark's columns; O(partitions) reserved; column deny withholds `partition`, row filters deny it like any `$` table | 0032, 0044, 0045 |
 
 ## Reading order
 
