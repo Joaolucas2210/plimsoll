@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Column-level deny: per principal, on the columns each optimized scan reads (filters included), time travel and `$files` partitions covered (ADR 0044)
 - [x] Query parameters: `"params"` bind `$n` as typed values, cast to the inferred type, part of the result-cache key (ADR 0043)
 - [x] Name mapping: files without field ids (add_files imports) resolve through `schema.name-mapping.default`, aliases included (ADR 0042)
 - [x] Nested types: struct, list, map; struct fields added later read as NULL; nested renames refused; validated on Spark (ADR 0041)
@@ -76,10 +77,10 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Column-level grants**: grants are per schema (ADR 0025). Let operators
-deny columns per principal (`PLIMSOLL_AUTH_COLUMN_DENY=ana=gold.users.email`),
-checked on the columns each scan actually reads, so PII columns can be
-withheld without separate tables.
+**Row filters per principal**: `PLIMSOLL_AUTH_ROW_FILTERS=ana=gold.orders:region = 'eu'`
+injected as a filter on every scan of the table for that principal, below
+any user predicate, so tenants see only their rows (ADR 0025/0044 grant
+model extended to rows).
 
 ## Later
 

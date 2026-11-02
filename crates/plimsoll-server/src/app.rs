@@ -1221,6 +1221,66 @@ mod tests {
         assert_eq!(got, StatusCode::BAD_REQUEST, "{body}");
     }
 
+    /// Column grants (ADR 0044) on the real engine: what a scan reads after
+    /// projection pushdown decides, filters and subqueries included.
+    #[tokio::test]
+    async fn denied_columns_are_withheld_wherever_they_are_read() {
+        use plimsoll_core::engine::Engine;
+        use plimsoll_core::memory::CeilingPool;
+        let engine =
+            Engine::new(Arc::new(CeilingPool::new(64 << 20, 1 << 20).unwrap()), None).unwrap();
+        engine
+            .context()
+            .sql("CREATE TABLE gold.users AS SELECT * FROM (VALUES (1, 'a@x', 'ana'), (2, 'b@x', 'bob')) AS t(id, email, name)")
+            .await
+            .unwrap();
+        let mut st = Arc::into_inner(default_state()).unwrap();
+        st.engine = Arc::new(crate::engine::CoreEngine(Arc::new(engine)));
+        let tokens = format!(
+            "ana:sha256:{},bob:sha256:{}",
+            crate::auth::tests::hex("ta"),
+            crate::auth::tests::hex("tb")
+        );
+        st.auth = Auth::from_lookup(
+            &|k| match k {
+                "PLIMSOLL_AUTH_TOKENS" => Some(tokens.clone()),
+                "PLIMSOLL_AUTH_COLUMN_DENY" => Some("ana=gold.users.email".into()),
+                _ => None,
+            },
+            &|g| g == "default",
+        )
+        .unwrap();
+        let st = Arc::new(st);
+        let run = async |token: &str, sql: &str| {
+            let req = Request::post("/v1/sql")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(json!({ "sql": sql }).to_string()))
+                .unwrap();
+            call(router(st.clone()), req).await
+        };
+        for sql in [
+            "SELECT id, name FROM gold.users",
+            "SELECT count(*) FROM gold.users",
+            "SELECT upper(name) FROM gold.users WHERE id > 1",
+        ] {
+            let (status, body) = run("ta", sql).await;
+            assert_eq!(status, StatusCode::OK, "{sql}: {body}");
+        }
+        for sql in [
+            "SELECT * FROM gold.users",
+            "SELECT id FROM gold.users WHERE email = 'a@x'",
+            "SELECT length(email) FROM gold.users",
+            "SELECT id FROM gold.users WHERE id IN (SELECT id FROM gold.users WHERE email LIKE 'a%')",
+        ] {
+            let (status, body) = run("ta", sql).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{sql}: {body}");
+            assert!(body.contains("gold.users.email (column)"), "{body}");
+        }
+        let (status, body) = run("tb", "SELECT * FROM gold.users").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
     /// `params` (ADR 0043): bound as values in every format; non-scalar
     /// params are a 400; the SQL text in the registry has no values.
     #[tokio::test]

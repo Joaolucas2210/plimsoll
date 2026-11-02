@@ -65,6 +65,13 @@ pub trait TableAccess: Send + Sync + 'static {
     fn resource_group(&self) -> Option<&str> {
         None
     }
+
+    /// Whether the caller may read `columns` of `table` (ADR 0044). Called
+    /// with the columns each scan of the *optimized* plan reads, filter
+    /// columns included, so unused columns of a table never deny a query.
+    fn check_columns(&self, _table: &ResolvedTableReference, _columns: &[&str]) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The caller may not read `table`. Returned (wrapped in
@@ -261,7 +268,40 @@ impl Engine {
             .as_ref()
             .filter(|_| result_cache::deterministic(&plan));
         let plan = preevaluate_scalar_subqueries(&state, plan).await?;
-        let physical = state.create_physical_plan(&plan).await?;
+        // Optimized once, here, so column grants see what each scan really
+        // reads (projection pushdown) before anything executes (ADR 0044).
+        let plan = state.optimize(&plan)?;
+        if let Some(access) = access {
+            let options = state.config_options();
+            let (catalog, schema) = (
+                &options.catalog.default_catalog,
+                &options.catalog.default_schema,
+            );
+            plan.apply_with_subqueries(|node| {
+                if let LogicalPlan::TableScan(scan) = node {
+                    let mut columns: Vec<&str> = scan
+                        .projected_schema
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().as_str())
+                        .collect();
+                    // Pushed-down filters may read columns the projection
+                    // dropped: `WHERE email = ...` reveals email too.
+                    for filter in &scan.filters {
+                        for c in filter.column_refs() {
+                            columns.push(c.name.as_str());
+                        }
+                    }
+                    let table = scan.table_name.clone().resolve(catalog, schema);
+                    access.check_columns(&table, &columns)?;
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+        }
+        let physical = state
+            .query_planner()
+            .create_physical_plan(&plan, &state)
+            .await?;
         // Grants were checked above: a hit is only served to a principal
         // allowed to read every input.
         // Parameters are part of the statement: same SQL, other values,

@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 use ring::digest::{SHA256, digest};
 
@@ -28,6 +29,9 @@ use plimsoll_core::engine::{AccessDenied, TableAccess};
 
 use crate::config::ConfigError;
 
+// ponytail: one `Auth` per process, built at boot; boxing `Tokens` would
+// only move the size, not save any.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, PartialEq, Eq)]
 pub enum Auth {
     /// Development only: `user` is taken from the request body as sent.
@@ -41,6 +45,8 @@ pub enum Auth {
         /// Principal -> readable schemas (`*` = all). `None`: not
         /// configured, every principal reads every schema.
         grants: Option<HashMap<String, HashSet<String>>>,
+        /// Principal -> `schema.table.column`s it may not read (ADR 0044).
+        column_deny: HashMap<String, Arc<HashSet<String>>>,
     },
 }
 
@@ -79,6 +85,7 @@ const TOKENS: &str = "PLIMSOLL_AUTH_TOKENS";
 const OPERATORS: &str = "PLIMSOLL_AUTH_OPERATORS";
 const GROUPS: &str = "PLIMSOLL_AUTH_GROUPS";
 const GRANTS: &str = "PLIMSOLL_AUTH_GRANTS";
+const COLUMN_DENY: &str = "PLIMSOLL_AUTH_COLUMN_DENY";
 
 impl Auth {
     /// `has_group`: whether a resource group exists (bindings are checked
@@ -95,7 +102,7 @@ impl Auth {
         match lookup(MODE).as_deref().map(str::trim) {
             None | Some("required") => {}
             Some("disabled") => {
-                for var in [OPERATORS, GROUPS, GRANTS] {
+                for var in [OPERATORS, GROUPS, GRANTS, COLUMN_DENY] {
                     if lookup(var).is_some_and(|o| !o.trim().is_empty()) {
                         return Err(err(var, "", "needs PLIMSOLL_AUTH=required"));
                     }
@@ -191,11 +198,44 @@ impl Auth {
                 Some(grants)
             }
         };
+        let mut column_deny = HashMap::new();
+        for entry in lookup(COLUMN_DENY)
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+        {
+            if entry.is_empty() {
+                continue;
+            }
+            let shape = "expected `user=schema.table.column|...` entries";
+            let (user, list) = entry
+                .split_once('=')
+                .ok_or_else(|| err(COLUMN_DENY, entry, shape))?;
+            let user = user.trim();
+            if !tokens.values().any(|u| u == user) {
+                return Err(err(COLUMN_DENY, user, "not a user in PLIMSOLL_AUTH_TOKENS"));
+            }
+            let mut columns = HashSet::new();
+            for column in list.split('|').map(str::trim).filter(|c| !c.is_empty()) {
+                // A typo here would leave the column readable: fail instead.
+                if column.split('.').count() != 3 || column.split('.').any(str::is_empty) {
+                    return Err(err(COLUMN_DENY, column, shape));
+                }
+                columns.insert(column.to_owned());
+            }
+            if column_deny
+                .insert(user.to_owned(), Arc::new(columns))
+                .is_some()
+            {
+                return Err(err(COLUMN_DENY, user, "user listed twice"));
+            }
+        }
         Ok(Self::Tokens {
             tokens,
             operators,
             groups,
             grants,
+            column_deny,
         })
     }
 
@@ -227,7 +267,10 @@ impl Auth {
     /// (operators: all) and the schemas it may read.
     pub fn viewer(&self, principal: &str) -> Viewer {
         let Self::Tokens {
-            operators, grants, ..
+            operators,
+            grants,
+            column_deny,
+            ..
         } = self
         else {
             // Development: everything.
@@ -235,6 +278,7 @@ impl Auth {
                 only: None,
                 schemas: None,
                 group: None,
+                denied_columns: None,
             };
         };
         Viewer {
@@ -243,6 +287,7 @@ impl Auth {
                 .as_ref()
                 .map(|g| g.get(principal).cloned().unwrap_or_default()),
             group: None,
+            denied_columns: column_deny.get(principal).cloned(),
         }
     }
 
@@ -276,11 +321,42 @@ pub struct Viewer {
     pub schemas: Option<HashSet<String>>,
     /// The resource group the query runs in (memory share, ADR 0036).
     pub group: Option<String>,
+    /// `schema.table.column`s this principal may not read (ADR 0044).
+    pub denied_columns: Option<Arc<HashSet<String>>>,
 }
 
 impl TableAccess for Viewer {
     fn resource_group(&self) -> Option<&str> {
         self.group.as_deref()
+    }
+
+    fn check_columns(&self, table: &ResolvedTableReference, columns: &[&str]) -> DfResult<()> {
+        let Some(denied) = &self.denied_columns else {
+            return Ok(());
+        };
+        // `users@123` and `users@audit` are the same table's data (ADR 0028).
+        let name = table.table.split('@').next().unwrap_or_default();
+        let deny = |what: String| {
+            Err(DataFusionError::External(Box::new(AccessDenied {
+                table: format!("{}.{what}", table.catalog),
+            })))
+        };
+        // `users$files` shows partition values, which may be a denied
+        // column's (a table partitioned by it): withhold them (ADR 0032).
+        if let Some(base) = name.strip_suffix("$files") {
+            let prefix = format!("{}.{base}.", table.schema);
+            if columns.contains(&"partition") && denied.iter().any(|c| c.starts_with(&prefix)) {
+                return deny(format!("{}.{name}.partition (column)", table.schema));
+            }
+            return Ok(());
+        }
+        for column in columns {
+            let qualified = format!("{}.{name}.{column}", table.schema);
+            if denied.contains(&qualified) {
+                return deny(format!("{qualified} (column)"));
+            }
+        }
+        Ok(())
     }
 
     fn check(&self, table: &ResolvedTableReference) -> DfResult<()> {
@@ -321,7 +397,7 @@ fn parse_digest(hex: &str) -> Option<[u8; 32]> {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub fn hex(token: &str) -> String {
@@ -450,5 +526,61 @@ mod tests {
         assert_eq!(a.principal(Some("Bearer ")), Err(AuthError::Missing));
         assert_eq!(a.principal(None), Err(AuthError::Missing));
         assert_eq!(Auth::Disabled.principal(None), Ok(None));
+    }
+
+    #[test]
+    fn column_deny_is_parsed_and_checked_per_principal() {
+        let lookup = |extra: &'static str| {
+            move |k: &str| match k {
+                "PLIMSOLL_AUTH_TOKENS" => {
+                    Some(format!("ana:sha256:{},bob:sha256:{}", hex("ta"), hex("tb")))
+                }
+                "PLIMSOLL_AUTH_COLUMN_DENY" => Some(extra.to_owned()),
+                _ => None,
+            }
+        };
+        let auth =
+            Auth::from_lookup(&lookup("ana=gold.users.email|gold.users.ssn"), &|_| true).unwrap();
+        let table = |t: &str| ResolvedTableReference {
+            catalog: "datafusion".into(),
+            schema: "gold".into(),
+            table: t.into(),
+        };
+        let ana = auth.viewer("ana");
+        assert!(ana.check_columns(&table("users"), &["id", "name"]).is_ok());
+        let err = ana
+            .check_columns(&table("users"), &["id", "email"])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("gold.users.email (column)"),
+            "{err}"
+        );
+        // Time travel reads the same data; other tables are unaffected.
+        assert!(ana.check_columns(&table("users@123"), &["ssn"]).is_err());
+        assert!(ana.check_columns(&table("orders"), &["email"]).is_ok());
+        // Metadata tables: file paths are fine, partition values are not.
+        assert!(
+            ana.check_columns(&table("users$files"), &["file_path"])
+                .is_ok()
+        );
+        assert!(
+            ana.check_columns(&table("users$files"), &["partition"])
+                .is_err()
+        );
+        assert!(
+            auth.viewer("bob")
+                .check_columns(&table("users"), &["email"])
+                .is_ok()
+        );
+
+        for bad in [
+            "ana=gold.users",
+            "ana=email",
+            "carol=gold.users.email",
+            "ana=a..b",
+        ] {
+            let e = Auth::from_lookup(&lookup(bad), &|_| true).unwrap_err();
+            assert_eq!(e.var, "PLIMSOLL_AUTH_COLUMN_DENY", "{bad}");
+        }
     }
 }

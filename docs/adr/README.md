@@ -51,6 +51,7 @@ are allowed in place.
 | [0041](0041-nested-types.md) | Nested types | Accepted | 2026-11-02 | Iceberg `struct` / `list` / `map` map recursively to Arrow; the scan adapter compares nested types ignoring names and uses DataFusion's struct-aware cast (fields added later are NULL); histories that renamed, moved or re-added a nested child are refused | 0005, 0007, 0040 |
 | [0042](0042-name-mapping.md) | Iceberg name mapping | Accepted | 2026-11-02 | Files without Parquet field ids get ids from `schema.name-mapping.default` (top level, aliases included); tables with a mapping always adapt by id; equality-delete keys use it too; ambiguous mappings are invalid metadata | 0040, 0041, 0016 |
 | [0043](0043-query-parameters.md) | Query parameters | Accepted | 2026-11-02 | `"params"` JSON scalars bind `$n` via DataFusion placeholders, each cast to its inferred type; exact arity; non-scalars 400; values stay out of the SQL text, logs and registry; included in the result-cache key | 0024, 0027, 0038 |
+| [0044](0044-column-deny.md) | Column-level deny | Accepted | 2026-11-02 | `PLIMSOLL_AUTH_COLUMN_DENY=user=schema.table.column\|...`; checked on the optimized plan's scans (projected + pushed-filter columns) before execution and before the result cache; `@` time-travel names map to the base table; `$files` partition values withheld | 0024, 0025, 0028, 0032, 0038 |
 
 ## Reading order
 
