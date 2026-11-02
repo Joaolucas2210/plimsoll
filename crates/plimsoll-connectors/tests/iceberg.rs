@@ -1212,6 +1212,86 @@ async fn reads_files_imported_without_field_ids() {
     assert_eq!(pool.used(), 0);
 }
 
+/// Spark table partitioned by `bucket(4, id)` and `truncate(1, code)`
+/// (ADR 0051), 40 rows, code = 'a'|'b'|'c' + id. Spark places every row;
+/// Plimsoll must compute the same bucket, or pruning would drop the row.
+#[tokio::test]
+#[ignore = "needs PLIMSOLL_ICEBERG_BUCKETED from scripts/spark_mor_fixture.sh"]
+async fn prunes_spark_bucket_and_truncate_partitions() {
+    let Ok(location) = std::env::var("PLIMSOLL_ICEBERG_BUCKETED") else {
+        return;
+    };
+    let ctx = SessionContext::new();
+    IcebergConnector::try_new("b", &location, &ctx.state())
+        .await
+        .unwrap()
+        .register(&ctx)
+        .unwrap();
+    let scanned = async |sql: &str| {
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let text = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        let files = text
+            .split("files=")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap()
+            .to_owned();
+        let (kept, total) = files.split_once('/').unwrap();
+        (
+            kept.parse::<usize>().unwrap(),
+            total.parse::<usize>().unwrap(),
+        )
+    };
+    // Every id, alone: found, and only its bucket's files read.
+    let (_, total) = scanned("SELECT id FROM b").await;
+    assert!(total >= 4, "{total} files");
+    for id in 0..40i64 {
+        let sql = format!("SELECT id FROM b WHERE id = {id}");
+        assert_eq!(ids(&ctx, &sql).await.unwrap(), [id], "{sql}");
+        let (kept, _) = scanned(&sql).await;
+        assert!(kept < total, "{sql}: {kept}/{total}");
+    }
+    assert_eq!(
+        ids(&ctx, "SELECT id FROM b WHERE id IN (7, 23) ORDER BY id")
+            .await
+            .unwrap(),
+        [7, 23]
+    );
+    // truncate(1, code): only the 'b' partitions; ranges too.
+    let b = ids(
+        &ctx,
+        "SELECT CAST(count(*) AS BIGINT) FROM b WHERE code = 'b10'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(b, [1]);
+    let (kept, _) = scanned("SELECT id FROM b WHERE code = 'b10'").await;
+    let (b_files, _) = scanned("SELECT id FROM b WHERE code >= 'b' AND code < 'c'").await;
+    assert!(
+        kept <= b_files && b_files < total,
+        "{kept} {b_files} {total}"
+    );
+    assert_eq!(
+        ids(
+            &ctx,
+            "SELECT CAST(count(*) AS BIGINT) FROM b WHERE code >= 'b' AND code < 'c'"
+        )
+        .await
+        .unwrap(),
+        [13]
+    );
+}
+
 /// Format v3 table written by Spark with merge-on-read deletes, i.e. deletion
 /// vectors in Puffin files (`scripts/spark_mor_fixture.sh`): 100 000 rows,
 /// `DELETE id % 7 = 0`, then `DELETE id < 10` (replaces DVs), then an `UPDATE`.

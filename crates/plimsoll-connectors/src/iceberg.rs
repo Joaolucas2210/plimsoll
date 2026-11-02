@@ -608,14 +608,17 @@ impl IcebergTable {
                 }
                 stats.files += 1;
                 if !pruner.is_empty()
-                    && !pruner.may_match_file(
+                    && !(pruner.may_match_partition(
+                        self.specs.get(&spec_id).map_or(&[][..], Vec::as_slice),
+                        field(file, "partition"),
+                    ) && pruner.may_match_file(
                         &bound_map(file, "lower_bounds"),
                         &bound_map(file, "upper_bounds"),
                         &prune::Counts {
                             values: count_map(file, "value_counts"),
                             nulls: count_map(file, "null_value_counts"),
                         },
-                    )
+                    ))
                 {
                     continue;
                 }

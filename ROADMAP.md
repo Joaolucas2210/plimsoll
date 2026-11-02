@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Bucket and truncate partition pruning, per file on partition tuples (Iceberg Murmur3, spec vectors) (ADR 0051)
 - [x] Pruner as a predicate tree: OR, IN lists, exact NOT, at file and manifest level (ADR 0050)
 - [x] Null-count pruning: all-NULL columns match no comparison; `IS NULL` / `IS NOT NULL` prune on counts (ADR 0049)
 - [x] Pruning on nested struct fields (`s['a']` uses `s.a` bounds) (ADR 0048)
@@ -83,11 +84,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Bucket and truncate partition pruning**: `bucket[N]` and `truncate[W]`
-partitions are skipped by the manifest pruner today (only identity and
-temporal transforms). Equality and IN on the source column map exactly
-to a bucket (Murmur3, per the Iceberg spec) or a truncated value, so
-manifests and files of other buckets can be skipped.
+**`LIKE 'prefix%'` pruning**: a string prefix is a range
+(`>= 'prefix'` and `< 'prefiy'`), so `code LIKE 'b%'` can prune on column
+bounds and identity/truncate partitions like the range it is.
 
 ## Later
 

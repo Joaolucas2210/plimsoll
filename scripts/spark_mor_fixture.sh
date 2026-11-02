@@ -5,10 +5,11 @@
 # (reads_reference_equality_deletes), v3 deletion vectors
 # (reads_reference_deletion_vectors), schema evolution
 # (reads_an_evolved_spark_table), nested types (reads_nested_spark_types) and
-# name-mapped imports (reads_files_imported_without_field_ids).
+# name-mapped imports (reads_files_imported_without_field_ids) and bucket/
+# truncate partitions (prunes_spark_bucket_and_truncate_partitions).
 #
 #   scripts/spark_mor_fixture.sh <warehouse-dir>
-#   # prints PLIMSOLL_ICEBERG_{MOR,EQ,EVOLVED,NESTED,IMPORTED,DV}=...
+#   # prints PLIMSOLL_ICEBERG_{MOR,EQ,EVOLVED,NESTED,IMPORTED,BUCKETED,DV}=...
 #
 # The warehouse is mounted at the same absolute path inside the container, so
 # the paths Spark records in the metadata are valid on the host.
@@ -160,6 +161,18 @@ try {
     .collect().map(_.toString).mkString(";")
   require(imported == "[0,t0];[1,t1];[2,t2];[3,t3];[4,t4];[10,native]", s"Spark reads $imported")
 
+  // Bucket and truncate partitions (ADR 0051): Spark's own Murmur3 places
+  // each id; a wrong hash in Plimsoll would prune the right file away.
+  Seq(
+    """CREATE TABLE local.db.bucketed (id BIGINT, code STRING) USING iceberg
+       PARTITIONED BY (bucket(4, id), truncate(1, code))
+       TBLPROPERTIES ('format-version'='2')""",
+    """INSERT INTO local.db.bucketed SELECT id,
+       concat(substr('abc', CAST(id % 3 AS INT) + 1, 1), CAST(id AS STRING)) FROM range(0, 40)"""
+  ).foreach(spark.sql)
+  val bucketed = spark.sql("SELECT count(*) FROM local.db.bucketed WHERE id IN (7, 23)").collect()(0).getLong(0)
+  require(bucketed == 2, s"Spark reads $bucketed")
+
   // The fixture is only useful if the reference engine agrees with it.
   val ids = spark.sql("SELECT id FROM local.db.eq ORDER BY id").collect().map(_.getLong(0)).toSeq
   require(ids == Seq(2L, 4L, 5L, 6L), s"Spark reads $ids")
@@ -182,4 +195,5 @@ echo "PLIMSOLL_ICEBERG_EQ=$wh/db/eq"
 echo "PLIMSOLL_ICEBERG_EVOLVED=$wh/db/evolved"
 echo "PLIMSOLL_ICEBERG_NESTED=$wh/db/nested"
 echo "PLIMSOLL_ICEBERG_IMPORTED=$wh/db/imported"
+echo "PLIMSOLL_ICEBERG_BUCKETED=$wh/db/bucketed"
 echo "PLIMSOLL_ICEBERG_DV=$wh/db/dv"

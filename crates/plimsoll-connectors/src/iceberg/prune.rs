@@ -1,9 +1,9 @@
 //! Scan planning: skip manifests and data files that cannot match.
 //!
 //! Only provably-safe pruning (ADR 0010): a manifest or file is skipped when
-//! its bounds show that *no* row can satisfy one of the AND-ed predicates.
-//! Anything we cannot evaluate exactly (OR, casts, floats, decimals, sub-µs
-//! literals, missing bounds) keeps the file. Filters are still re-applied
+//! its statistics show that *no* row can satisfy the filters (an And/Or
+//! tree, ADR 0050). Anything we cannot evaluate exactly (casts, floats,
+//! decimals, sub-µs literals, missing bounds) keeps the file. Filters are still re-applied
 //! above the scan, so pruning only ever changes cost, never results.
 
 use std::cmp::Ordering;
@@ -112,6 +112,10 @@ enum Transform {
     Month,
     Day,
     Hour,
+    /// `bucket[N]`: Murmur3 hash mod N; only equality maps (ADR 0051).
+    Bucket(u32),
+    /// `truncate[W]`: monotonic, so ranges map too (ADR 0051).
+    Truncate(i64),
 }
 
 /// Lower/upper bound of one partition field across a manifest (raw bytes).
@@ -137,7 +141,22 @@ pub(super) fn partition_spec(fields: &serde_json::Value) -> Vec<Option<Partition
                 "month" => Transform::Month,
                 "day" => Transform::Day,
                 "hour" => Transform::Hour,
-                _ => return None,
+                t => {
+                    let arg = |name: &str| {
+                        t.strip_prefix(name)?
+                            .strip_prefix('[')?
+                            .strip_suffix(']')?
+                            .trim()
+                            .parse::<i64>()
+                            .ok()
+                            .filter(|n| *n > 0)
+                    };
+                    if let Some(n) = arg("bucket") {
+                        Transform::Bucket(u32::try_from(n).ok()?)
+                    } else {
+                        Transform::Truncate(arg("truncate")?)
+                    }
+                }
             };
             Some(PartitionField {
                 source_id: f["source-id"].as_i64()?,
@@ -214,22 +233,27 @@ impl Node {
         }
     }
 
-    fn manifest(&self, spec: &[Option<PartitionField>], summaries: &[Summary]) -> bool {
+    /// Against partition values: `bounds(i, prim)` is the (lower, upper)
+    /// of partition field `i` (a manifest's summary, or one file's value).
+    fn partition(
+        &self,
+        spec: &[Option<PartitionField>],
+        bounds: &dyn Fn(usize, Prim) -> (Option<Datum>, Option<Datum>),
+    ) -> bool {
         match self {
             Node::True | Node::Null(..) => true,
-            Node::Cmp(p) => spec.iter().zip(summaries).all(|(field, (lo, hi))| {
+            Node::Cmp(p) => spec.iter().enumerate().all(|(i, field)| {
                 let Some(field) = field.as_ref().filter(|f| f.source_id == p.field_id) else {
                     return true;
                 };
                 let Some((op, v, prim)) = transformed(p, field.transform) else {
                     return true;
                 };
-                let lo = lo.as_deref().and_then(|b| prim.decode(b));
-                let hi = hi.as_deref().and_then(|b| prim.decode(b));
+                let (lo, hi) = bounds(i, prim);
                 op.may_match(lo.as_ref(), hi.as_ref(), &v)
             }),
-            Node::And(n) => n.iter().all(|n| n.manifest(spec, summaries)),
-            Node::Or(n) => n.iter().any(|n| n.manifest(spec, summaries)),
+            Node::And(n) => n.iter().all(|n| n.partition(spec, bounds)),
+            Node::Or(n) => n.iter().any(|n| n.partition(spec, bounds)),
         }
     }
 }
@@ -264,8 +288,54 @@ impl Pruner {
         spec: &[Option<PartitionField>],
         summaries: &[Summary],
     ) -> bool {
-        self.root.manifest(spec, summaries)
+        self.root
+            .partition(spec, &|i, prim| match summaries.get(i) {
+                Some((lo, hi)) => (
+                    lo.as_deref().and_then(|b| prim.decode(b)),
+                    hi.as_deref().and_then(|b| prim.decode(b)),
+                ),
+                None => (None, None),
+            })
     }
+
+    /// File-level, on the file's partition tuple (ADR 0051): what lets
+    /// `bucket` partitions prune, since one manifest spans every bucket.
+    pub(super) fn may_match_partition(
+        &self,
+        spec: &[Option<PartitionField>],
+        partition: Option<&apache_avro::types::Value>,
+    ) -> bool {
+        let values = partition_values(partition);
+        self.root.partition(spec, &|i, _| {
+            let v = values.get(i).cloned().flatten();
+            (v.clone(), v)
+        })
+    }
+}
+
+/// A data file's partition record as datums, in spec order. Unknown or
+/// NULL values are `None` (no pruning on them).
+fn partition_values(partition: Option<&apache_avro::types::Value>) -> Vec<Option<Datum>> {
+    use apache_avro::types::Value as A;
+    let Some(A::Record(fields)) = partition else {
+        return Vec::new();
+    };
+    fields
+        .iter()
+        .map(|(_, v)| {
+            let v = match v {
+                A::Union(_, inner) => inner.as_ref(),
+                v => v,
+            };
+            match v {
+                A::Int(x) | A::Date(x) => Some(Datum::Int(i64::from(*x))),
+                A::Long(x) | A::TimestampMicros(x) => Some(Datum::Int(*x)),
+                A::Boolean(b) => Some(Datum::Int(i64::from(*b))),
+                A::String(s) => Some(Datum::Bytes(s.as_bytes().to_vec())),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Per-column counts of a data file (`value_counts` includes nulls).
@@ -289,8 +359,41 @@ impl Counts {
 /// `col <op> v` on the source column -> `T(col) <op'> T(v)` on the partition
 /// value. For a non-decreasing T, strict bounds become inclusive.
 fn transformed(p: &Pred, t: Transform) -> Option<(Op, Datum, Prim)> {
-    if t == Transform::Identity {
-        return Some((p.op, p.value.clone(), p.prim));
+    match t {
+        Transform::Identity => return Some((p.op, p.value.clone(), p.prim)),
+        // A hash keeps no order: only `=` (and so `IN`) maps.
+        Transform::Bucket(n) => {
+            if p.op != Op::Eq {
+                return None;
+            }
+            return Some((Op::Eq, Datum::Int(bucket(p.prim, &p.value, n)?), Prim::Int));
+        }
+        Transform::Truncate(w) => {
+            let v = match (&p.value, p.prim) {
+                (Datum::Int(v), Prim::Int | Prim::Long) => Datum::Int(v - v.rem_euclid(w)),
+                (Datum::Bytes(b), Prim::String) => {
+                    let s = std::str::from_utf8(b).ok()?;
+                    let end = s
+                        .char_indices()
+                        .nth(usize::try_from(w).ok()?)
+                        .map_or(s.len(), |(i, _)| i);
+                    Datum::Bytes(b[..end].to_vec())
+                }
+                _ => return None,
+            };
+            // Non-decreasing: a strict bound can still match inside the
+            // same truncated value, unless `v` starts its bucket (`x < 20`
+            // with width 10 rules out bucket 20 entirely).
+            let at_start = matches!(&p.value, Datum::Int(x) if x.rem_euclid(w) == 0);
+            let op = match p.op {
+                Op::Lt if at_start => Op::Lt,
+                Op::Lt => Op::LtEq,
+                Op::Gt => Op::GtEq,
+                op => op,
+            };
+            return Some((op, v, p.prim));
+        }
+        _ => {}
     }
     let Datum::Int(v) = p.value else { return None };
     const DAY_US: i64 = 86_400_000_000;
@@ -331,6 +434,48 @@ fn transformed(p: &Pred, t: Transform) -> Option<(Op, Datum, Prim)> {
     };
     // Temporal partition values are serialized as `int`.
     Some((op, Datum::Int(tv), Prim::Int))
+}
+
+/// Iceberg's bucket function: 32-bit Murmur3 (x86, seed 0) of the value's
+/// hash bytes, sign bit cleared, mod `n`. Ints, dates and timestamps hash
+/// as 8-byte little-endian longs; strings as UTF-8 (spec, "Bucket
+/// transform details").
+fn bucket(prim: Prim, v: &Datum, n: u32) -> Option<i64> {
+    let hash = match (prim, v) {
+        (Prim::Int | Prim::Long | Prim::Date | Prim::Timestamp, Datum::Int(x)) => {
+            murmur3_32(&x.to_le_bytes())
+        }
+        (Prim::String, Datum::Bytes(b)) => murmur3_32(b),
+        _ => return None,
+    };
+    Some(i64::from((hash & 0x7fff_ffff) % n))
+}
+
+fn murmur3_32(data: &[u8]) -> u32 {
+    const C1: u32 = 0xcc9e_2d51;
+    const C2: u32 = 0x1b87_3593;
+    let mix = |k: u32| k.wrapping_mul(C1).rotate_left(15).wrapping_mul(C2);
+    let mut h = 0u32;
+    let chunks = data.chunks_exact(4);
+    let tail = chunks.remainder();
+    for c in chunks {
+        h ^= mix(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        h = h.rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64);
+    }
+    if !tail.is_empty() {
+        let k = tail
+            .iter()
+            .enumerate()
+            .fold(0u32, |k, (i, b)| k | (u32::from(*b) << (8 * i)));
+        h ^= mix(k);
+    }
+    // Lengths beyond u32 do not occur for scalar values.
+    h ^= data.len() as u32;
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^ (h >> 16)
 }
 
 fn node(e: &Expr, columns: &HashMap<String, (i64, Prim)>) -> Node {
@@ -646,5 +791,57 @@ mod tests {
         assert!(keep(col("id").is_not_null(), &counts(3)));
         assert!(keep(col("id").is_null(), &Counts::default()));
         assert!(keep(col("id").eq(lit(5i64)), &Counts::default()));
+    }
+
+    /// The Iceberg spec's hash examples (Appendix B), bit for bit.
+    #[test]
+    fn murmur3_matches_the_iceberg_spec() {
+        let long = |v: i64| murmur3_32(&v.to_le_bytes()) as i32;
+        assert_eq!(long(34), 2_017_239_379); // int and long 34
+        assert_eq!(long(17_486), -653_330_422); // date 2017-11-16
+        assert_eq!(long(1_510_871_468_000_000), -2_047_944_441); // timestamp 2017-11-16T22:31:08
+        assert_eq!(murmur3_32(b"iceberg") as i32, 1_210_000_089);
+        assert_eq!(murmur3_32(&[0, 1, 2, 3]) as i32, -188_683_207); // binary
+    }
+
+    #[test]
+    fn bucket_and_truncate_partitions_prune_per_file() {
+        use apache_avro::types::Value as A;
+        let spec = partition_spec(&serde_json::json!([
+            {"source-id": 1, "field-id": 1000, "name": "id_bucket", "transform": "bucket[4]"},
+            {"source-id": 2, "field-id": 1001, "name": "city_trunc", "transform": "truncate[2]"},
+            {"source-id": 4, "field-id": 1002, "name": "score_trunc", "transform": "truncate[10]"},
+        ]));
+        let b = |id: i64| bucket(Prim::Long, &Datum::Int(id), 4).unwrap() as i32;
+        let file = |bucket: i32, city: &str, score: i64| {
+            A::Record(vec![
+                ("id_bucket".into(), A::Int(bucket)),
+                (
+                    "city_trunc".into(),
+                    A::Union(1, Box::new(A::String(city.into()))),
+                ),
+                ("score_trunc".into(), A::Long(score)),
+            ])
+        };
+        let keep =
+            |e: Expr, f: &A| Pruner::new(&[e], &columns()).may_match_partition(&spec, Some(f));
+        let f = file(b(7), "li", 20);
+        // bucket: = and IN map; ranges do not.
+        assert!(keep(col("id").eq(lit(7i64)), &f));
+        let other = (0..100).find(|i| b(*i) != b(7)).unwrap();
+        assert!(!keep(col("id").eq(lit(other)), &f));
+        assert!(keep(
+            col("id").in_list(vec![lit(other), lit(7i64)], false),
+            &f
+        ));
+        assert!(keep(col("id").gt(lit(1_000i64)), &f));
+        // truncate: equality and (widened) ranges.
+        assert!(keep(col("city").eq(lit("lisbon")), &f));
+        assert!(!keep(col("city").eq(lit("porto")), &f));
+        assert!(!keep(col("city").lt(lit("la")), &f));
+        assert!(keep(col("score").gt_eq(lit(25i64)), &f)); // 25 -> 20
+        assert!(!keep(col("score").gt_eq(lit(30i64)), &f));
+        assert!(keep(col("score").lt(lit(21i64)), &f));
+        assert!(!keep(col("score").lt(lit(20i64)), &f)); // 20 starts the bucket
     }
 }
