@@ -47,6 +47,9 @@ pub enum Auth {
         grants: Option<HashMap<String, HashSet<String>>>,
         /// Principal -> `schema.table.column`s it may not read (ADR 0044).
         column_deny: HashMap<String, Arc<HashSet<String>>>,
+        /// Principal -> `schema.table` -> SQL predicate its rows must
+        /// satisfy (ADR 0045).
+        row_filters: HashMap<String, Arc<HashMap<String, String>>>,
     },
 }
 
@@ -86,6 +89,7 @@ const OPERATORS: &str = "PLIMSOLL_AUTH_OPERATORS";
 const GROUPS: &str = "PLIMSOLL_AUTH_GROUPS";
 const GRANTS: &str = "PLIMSOLL_AUTH_GRANTS";
 const COLUMN_DENY: &str = "PLIMSOLL_AUTH_COLUMN_DENY";
+const ROW_FILTERS: &str = "PLIMSOLL_AUTH_ROW_FILTERS";
 
 impl Auth {
     /// `has_group`: whether a resource group exists (bindings are checked
@@ -102,7 +106,7 @@ impl Auth {
         match lookup(MODE).as_deref().map(str::trim) {
             None | Some("required") => {}
             Some("disabled") => {
-                for var in [OPERATORS, GROUPS, GRANTS, COLUMN_DENY] {
+                for var in [OPERATORS, GROUPS, GRANTS, COLUMN_DENY, ROW_FILTERS] {
                     if lookup(var).is_some_and(|o| !o.trim().is_empty()) {
                         return Err(err(var, "", "needs PLIMSOLL_AUTH=required"));
                     }
@@ -230,12 +234,50 @@ impl Auth {
                 return Err(err(COLUMN_DENY, user, "user listed twice"));
             }
         }
+        let mut row_filters = HashMap::new();
+        if let Some(raw) = lookup(ROW_FILTERS).filter(|r| !r.trim().is_empty()) {
+            let shape = r#"expected {"user": {"schema.table": "<SQL predicate>"}}"#;
+            let parsed: HashMap<String, HashMap<String, String>> =
+                serde_json::from_str(&raw).map_err(|_| err(ROW_FILTERS, "", shape))?;
+            for (user, tables) in parsed {
+                if !tokens.values().any(|u| *u == user) {
+                    return Err(err(
+                        ROW_FILTERS,
+                        &user,
+                        "not a user in PLIMSOLL_AUTH_TOKENS",
+                    ));
+                }
+                for (table, predicate) in &tables {
+                    if table.split('.').count() != 2 || table.split('.').any(str::is_empty) {
+                        return Err(err(ROW_FILTERS, table, "tables are `schema.table`"));
+                    }
+                    // Syntax now; columns are checked against the table at
+                    // query time (a wrong one is an internal error).
+                    let dialect =
+                        plimsoll_core::datafusion::sql::sqlparser::dialect::GenericDialect {};
+                    let parses =
+                        plimsoll_core::datafusion::sql::sqlparser::parser::Parser::new(&dialect)
+                            .try_with_sql(predicate)
+                            .and_then(|mut p| p.parse_expr())
+                            .is_ok();
+                    if !parses {
+                        return Err(err(
+                            ROW_FILTERS,
+                            table,
+                            "the predicate is not a SQL expression",
+                        ));
+                    }
+                }
+                row_filters.insert(user, Arc::new(tables));
+            }
+        }
         Ok(Self::Tokens {
             tokens,
             operators,
             groups,
             grants,
             column_deny,
+            row_filters,
         })
     }
 
@@ -270,6 +312,7 @@ impl Auth {
             operators,
             grants,
             column_deny,
+            row_filters,
             ..
         } = self
         else {
@@ -279,6 +322,7 @@ impl Auth {
                 schemas: None,
                 group: None,
                 denied_columns: None,
+                row_filters: None,
             };
         };
         Viewer {
@@ -288,6 +332,7 @@ impl Auth {
                 .map(|g| g.get(principal).cloned().unwrap_or_default()),
             group: None,
             denied_columns: column_deny.get(principal).cloned(),
+            row_filters: row_filters.get(principal).cloned(),
         }
     }
 
@@ -323,11 +368,22 @@ pub struct Viewer {
     pub group: Option<String>,
     /// `schema.table.column`s this principal may not read (ADR 0044).
     pub denied_columns: Option<Arc<HashSet<String>>>,
+    /// `schema.table` -> predicate on every row it reads (ADR 0045).
+    pub row_filters: Option<Arc<HashMap<String, String>>>,
 }
 
 impl TableAccess for Viewer {
     fn resource_group(&self) -> Option<&str> {
         self.group.as_deref()
+    }
+
+    fn row_filter(&self, table: &ResolvedTableReference) -> Option<String> {
+        // Time travel reads the same table (ADR 0028).
+        let name = table.table.split('@').next().unwrap_or_default();
+        self.row_filters
+            .as_ref()?
+            .get(&format!("{}.{name}", table.schema))
+            .cloned()
     }
 
     fn check_columns(&self, table: &ResolvedTableReference, columns: &[&str]) -> DfResult<()> {
@@ -360,6 +416,17 @@ impl TableAccess for Viewer {
     }
 
     fn check(&self, table: &ResolvedTableReference) -> DfResult<()> {
+        // `orders$files` / `$snapshots` describe every tenant's data (file
+        // paths, partition values, row counts): not for row-filtered
+        // principals (ADR 0045).
+        if let (Some(filters), Some((base, _))) = (&self.row_filters, table.table.split_once('$')) {
+            let base = base.split('@').next().unwrap_or_default();
+            if filters.contains_key(&format!("{}.{base}", table.schema)) {
+                return Err(DataFusionError::External(Box::new(AccessDenied {
+                    table: format!("{table} (metadata of a row-filtered table)"),
+                })));
+            }
+        }
         let Some(schemas) = &self.schemas else {
             return Ok(());
         };
@@ -581,6 +648,45 @@ pub(crate) mod tests {
         ] {
             let e = Auth::from_lookup(&lookup(bad), &|_| true).unwrap_err();
             assert_eq!(e.var, "PLIMSOLL_AUTH_COLUMN_DENY", "{bad}");
+        }
+    }
+
+    #[test]
+    fn row_filters_are_validated_and_cover_time_travel_and_metadata() {
+        let lookup = |filters: &'static str| {
+            move |k: &str| match k {
+                "PLIMSOLL_AUTH_TOKENS" => Some(format!("ana:sha256:{}", hex("ta"))),
+                "PLIMSOLL_AUTH_ROW_FILTERS" => Some(filters.to_owned()),
+                _ => None,
+            }
+        };
+        let auth = Auth::from_lookup(
+            &lookup(r#"{"ana": {"gold.orders": "region = 'eu' AND NOT deleted"}}"#),
+            &|_| true,
+        )
+        .unwrap();
+        let t = |name: &str| ResolvedTableReference {
+            catalog: "datafusion".into(),
+            schema: "gold".into(),
+            table: name.into(),
+        };
+        let ana = auth.viewer("ana");
+        assert_eq!(
+            ana.row_filter(&t("orders@123")).as_deref(),
+            Some("region = 'eu' AND NOT deleted")
+        );
+        assert_eq!(ana.row_filter(&t("users")), None);
+        assert!(ana.check(&t("orders$files")).is_err());
+        assert!(ana.check(&t("orders$snapshots")).is_err());
+        assert!(ana.check(&t("users$files")).is_ok());
+        for bad in [
+            "not json",
+            r#"{"carol": {"gold.orders": "true"}}"#,
+            r#"{"ana": {"orders": "true"}}"#,
+            r#"{"ana": {"gold.orders": "region = "}}"#,
+        ] {
+            let e = Auth::from_lookup(&lookup(bad), &|_| true).unwrap_err();
+            assert_eq!(e.var, "PLIMSOLL_AUTH_ROW_FILTERS", "{bad}");
         }
     }
 }

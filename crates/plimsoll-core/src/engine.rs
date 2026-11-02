@@ -13,13 +13,13 @@ use std::time::{Duration, Instant};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::MemorySchemaProvider;
 use datafusion::common::ResolvedTableReference;
-use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
 use datafusion::common::{ScalarValue, plan_err};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::SQLOptions;
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::logical_expr::{Filter, LogicalPlan};
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use futures::StreamExt;
@@ -71,6 +71,12 @@ pub trait TableAccess: Send + Sync + 'static {
     /// columns included, so unused columns of a table never deny a query.
     fn check_columns(&self, _table: &ResolvedTableReference, _columns: &[&str]) -> Result<()> {
         Ok(())
+    }
+
+    /// A SQL predicate every row the caller reads from `table` must
+    /// satisfy (ADR 0045), e.g. `region = 'eu'`.
+    fn row_filter(&self, _table: &ResolvedTableReference) -> Option<String> {
+        None
     }
 }
 
@@ -262,6 +268,44 @@ impl Engine {
                 Ok(TreeNodeRecursion::Continue)
             })?;
         }
+        // Row filters (ADR 0045): a Filter right above every scan of a
+        // filtered table, before optimization, so the planner treats it like
+        // any predicate and nothing above the scan sees other rows.
+        let mut applied = Vec::new();
+        let plan = match access {
+            None => plan,
+            Some(access) => {
+                let options = state.config_options();
+                let (catalog, schema) = (
+                    options.catalog.default_catalog.clone(),
+                    options.catalog.default_schema.clone(),
+                );
+                plan.transform_up_with_subqueries(|node| {
+                    let LogicalPlan::TableScan(scan) = &node else {
+                        return Ok(Transformed::no(node));
+                    };
+                    let table = scan.table_name.clone().resolve(&catalog, &schema);
+                    let Some(filter) = access.row_filter(&table) else {
+                        return Ok(Transformed::no(node));
+                    };
+                    // An operator's mistake, not the caller's: an internal
+                    // error, and the filter text is not echoed to the caller.
+                    let predicate = state
+                        .create_logical_expr(&filter, scan.projected_schema.as_ref())
+                        .map_err(|_| {
+                            DataFusionError::Execution(format!(
+                                "the row filter configured for {table} is invalid"
+                            ))
+                        })?;
+                    applied.push(format!("{table}:{filter}"));
+                    Ok(Transformed::yes(LogicalPlan::Filter(Filter::try_new(
+                        predicate,
+                        Arc::new(node),
+                    )?)))
+                })?
+                .data
+            }
+        };
         // Before optimization and subquery pre-evaluation (ADR 0038).
         let cache = self
             .result_cache
@@ -306,10 +350,12 @@ impl Engine {
         // allowed to read every input.
         // Parameters are part of the statement: same SQL, other values,
         // other result.
-        let statement = if params.is_empty() {
+        // So are row filters (ADR 0045): two principals' filtered answers
+        // to the same SQL must never share an entry.
+        let statement = if params.is_empty() && applied.is_empty() {
             sql.to_owned()
         } else {
-            format!("{sql}\u{0}{params:?}")
+            format!("{sql}\u{0}{params:?}\u{0}{}", applied.join("\u{0}"))
         };
         let key = cache.and_then(|_| result_cache::key(&statement, &physical));
         let stream = match (cache, key) {

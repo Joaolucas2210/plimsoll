@@ -1281,6 +1281,97 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
     }
 
+    /// Row filters (ADR 0045) on the real engine: every scan of the table
+    /// is filtered for the principal, joins and subqueries included.
+    #[tokio::test]
+    async fn row_filters_confine_principals_to_their_rows() {
+        use plimsoll_core::engine::Engine;
+        use plimsoll_core::memory::CeilingPool;
+        let engine =
+            Engine::new(Arc::new(CeilingPool::new(64 << 20, 1 << 20).unwrap()), None).unwrap();
+        engine
+            .context()
+            .sql("CREATE TABLE gold.orders AS SELECT * FROM (VALUES (1, 'eu', 10), (2, 'eu', 20), (3, 'us', 400)) AS t(id, region, amount)")
+            .await
+            .unwrap();
+        let mut st = Arc::into_inner(default_state()).unwrap();
+        st.engine = Arc::new(crate::engine::CoreEngine(Arc::new(engine)));
+        let tokens = format!(
+            "ana:sha256:{},bob:sha256:{},eve:sha256:{}",
+            crate::auth::tests::hex("ta"),
+            crate::auth::tests::hex("tb"),
+            crate::auth::tests::hex("te")
+        );
+        st.auth = Auth::from_lookup(
+            &|k| match k {
+                "PLIMSOLL_AUTH_TOKENS" => Some(tokens.clone()),
+                "PLIMSOLL_AUTH_ROW_FILTERS" => Some(
+                    r#"{"ana": {"gold.orders": "region = 'eu'"}, "eve": {"gold.orders": "nope = 1"}}"#
+                        .into(),
+                ),
+                _ => None,
+            },
+            &|g| g == "default",
+        )
+        .unwrap();
+        let st = Arc::new(st);
+        let run = async |token: &str, sql: &str| {
+            let req = Request::post("/v1/sql")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(json!({ "sql": sql }).to_string()))
+                .unwrap();
+            let (status, body) = call(router(st.clone()), req).await;
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            (status, v)
+        };
+        for (sql, ana, bob) in [
+            (
+                "SELECT count(*) FROM gold.orders",
+                json!([[2]]),
+                json!([[3]]),
+            ),
+            (
+                "SELECT sum(amount) FROM gold.orders",
+                json!([[30]]),
+                json!([[430]]),
+            ),
+            // The user's own predicate cannot widen the filter.
+            (
+                "SELECT count(*) FROM gold.orders WHERE region = 'us' OR true",
+                json!([[2]]),
+                json!([[3]]),
+            ),
+            (
+                "SELECT count(*) FROM gold.orders a JOIN gold.orders b ON a.id <> b.id",
+                json!([[2]]),
+                json!([[6]]),
+            ),
+            (
+                "SELECT count(*) FROM (SELECT 1) WHERE EXISTS (SELECT 1 FROM gold.orders WHERE region = 'us')",
+                json!([[0]]),
+                json!([[1]]),
+            ),
+        ] {
+            let (status, v) = run("ta", sql).await;
+            assert_eq!(
+                (status, &v["rows"]),
+                (StatusCode::OK, &ana),
+                "ana: {sql}: {v}"
+            );
+            let (status, v) = run("tb", sql).await;
+            assert_eq!(
+                (status, &v["rows"]),
+                (StatusCode::OK, &bob),
+                "bob: {sql}: {v}"
+            );
+        }
+        // A broken filter is the operator's problem: 500, predicate not echoed.
+        let (status, v) = run("te", "SELECT count(*) FROM gold.orders").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+        assert!(!v.to_string().contains("nope"), "{v}");
+    }
+
     /// `params` (ADR 0043): bound as values in every format; non-scalar
     /// params are a 400; the SQL text in the registry has no values.
     #[tokio::test]

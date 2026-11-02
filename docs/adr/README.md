@@ -52,6 +52,7 @@ are allowed in place.
 | [0042](0042-name-mapping.md) | Iceberg name mapping | Accepted | 2026-11-02 | Files without Parquet field ids get ids from `schema.name-mapping.default` (top level, aliases included); tables with a mapping always adapt by id; equality-delete keys use it too; ambiguous mappings are invalid metadata | 0040, 0041, 0016 |
 | [0043](0043-query-parameters.md) | Query parameters | Accepted | 2026-11-02 | `"params"` JSON scalars bind `$n` via DataFusion placeholders, each cast to its inferred type; exact arity; non-scalars 400; values stay out of the SQL text, logs and registry; included in the result-cache key | 0024, 0027, 0038 |
 | [0044](0044-column-deny.md) | Column-level deny | Accepted | 2026-11-02 | `PLIMSOLL_AUTH_COLUMN_DENY=user=schema.table.column\|...`; checked on the optimized plan's scans (projected + pushed-filter columns) before execution and before the result cache; `@` time-travel names map to the base table; `$files` partition values withheld | 0024, 0025, 0028, 0032, 0038 |
+| [0045](0045-row-filters.md) | Row filters per principal | Accepted | 2026-11-02 | `PLIMSOLL_AUTH_ROW_FILTERS` JSON; the engine wraps every scan of a filtered table in a `Filter` before optimization (joins, subqueries, time travel); result-cache key includes applied filters; `$` metadata tables of filtered tables denied; bad predicates are 500s that do not echo the filter | 0025, 0038, 0044 |
 
 ## Reading order
 

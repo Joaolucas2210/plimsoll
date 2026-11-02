@@ -473,4 +473,43 @@ mod tests {
         assert_eq!((s.entries, s.bytes), (0, 0));
         assert_eq!(pool.used(), 0);
     }
+
+    /// Two principals with different row filters (ADR 0045) asking the same
+    /// SQL over the same snapshot never share a cache entry.
+    #[tokio::test]
+    async fn row_filtered_answers_are_cached_per_filter() {
+        struct Rows(Option<&'static str>);
+        impl crate::engine::TableAccess for Rows {
+            fn check(
+                &self,
+                _: &datafusion::common::ResolvedTableReference,
+            ) -> datafusion::error::Result<()> {
+                Ok(())
+            }
+            fn row_filter(&self, _: &datafusion::common::ResolvedTableReference) -> Option<String> {
+                self.0.map(str::to_owned)
+            }
+        }
+        let (e, _t, _) = engine(1 << 20);
+        let total = async |filter| {
+            let r = e
+                .sql_with("SELECT sum(v) FROM t", &[], Arc::new(Rows(filter)))
+                .await
+                .unwrap();
+            r.batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(total(None).await, 6);
+        assert_eq!(total(Some("v > 1")).await, 5);
+        assert_eq!(total(Some("v > 2")).await, 3);
+        // Each again: hits, still separate.
+        assert_eq!(total(Some("v > 1")).await, 5);
+        assert_eq!(total(None).await, 6);
+        let s = e.result_cache_stats().unwrap();
+        assert_eq!((s.entries, s.hits), (3, 2));
+    }
 }
