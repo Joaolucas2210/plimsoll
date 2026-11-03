@@ -120,6 +120,22 @@ pub struct Fragment {
     /// Shuffle map (ADR 0064): hash-partition the aggregated fragment
     /// into `partitions` buckets, keep them, and return bucket `index`.
     pub bucket: Option<Bucket>,
+    /// Join the fragment's rows (the probe side) with the build side sent
+    /// alongside (ADR 0066).
+    pub broadcast: Option<Broadcast>,
+}
+
+/// A broadcast hash join on a worker: the build side (attached to the
+/// request) joined with the fragment, build side on the left, as the
+/// coordinator's `CollectLeft` join planned it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Broadcast {
+    pub join_type: String,
+    /// Build-side columns, paired with the fragment's `probe_keys`.
+    pub build_keys: Vec<String>,
+    pub probe_keys: Vec<String>,
+    /// Output columns kept, by position in build ++ probe.
+    pub projection: Option<Vec<usize>>,
 }
 
 /// Which bucket of which shuffle map a reducing worker asks for.
@@ -189,6 +205,19 @@ fn names(v: &Json, key: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
+fn projection(v: &Json, key: &str) -> Result<Option<Vec<usize>>, String> {
+    match v {
+        Json::Null => Ok(None),
+        p => p
+            .as_array()
+            .ok_or(format!("`{key}` must be an array"))?
+            .iter()
+            .map(|i| count(i, key))
+            .collect::<Result<_, _>>()
+            .map(Some),
+    }
+}
+
 fn count(v: &Json, key: &str) -> Result<usize, String> {
     v.as_u64()
         .and_then(|n| usize::try_from(n).ok())
@@ -225,16 +254,7 @@ impl Reduce {
                 right: maps_from_json(&j["right"], "reduce.join.right")?,
                 left_keys: names(&j["left_keys"], "reduce.join.left_keys")?,
                 right_keys: names(&j["right_keys"], "reduce.join.right_keys")?,
-                projection: match &j["projection"] {
-                    Json::Null => None,
-                    p => Some(
-                        p.as_array()
-                            .ok_or("`reduce.join.projection` must be an array")?
-                            .iter()
-                            .map(|i| count(i, "reduce.join.projection[]"))
-                            .collect::<Result<_, _>>()?,
-                    ),
-                },
+                projection: projection(&j["projection"], "reduce.join.projection")?,
             }),
         };
         if join.is_none() && maps.iter().any(|(_, f)| f.aggregate.is_none()) {
@@ -297,6 +317,12 @@ impl Fragment {
             "bucket": self.bucket.as_ref().map(|b| json!({
                 "shuffle": b.shuffle, "map": b.map, "partitions": b.partitions, "index": b.index, "keys": b.keys,
             })),
+            "broadcast": self.broadcast.as_ref().map(|b| json!({
+                "join_type": b.join_type,
+                "build_keys": b.build_keys,
+                "probe_keys": b.probe_keys,
+                "projection": b.projection,
+            })),
             "aggregate": self.aggregate.as_ref().map(|a| json!({
                 "group_by": a.group_by,
                 "aggregates": a.aggregates.iter().map(|(f, c)| json!({"fn": f, "column": c})).collect::<Vec<_>>(),
@@ -307,13 +333,14 @@ impl Fragment {
     pub fn from_json(v: &Json) -> Result<Self, String> {
         // A field this worker does not know could change the answer (a
         // filter it would skip): refuse it rather than ignore it.
-        const KNOWN: [&str; 7] = [
+        const KNOWN: [&str; 8] = [
             "metadata_location",
             "snapshot_id",
             "files",
             "columns",
             "filters",
             "bucket",
+            "broadcast",
             "aggregate",
         ];
         if let Some(unknown) = v
@@ -349,6 +376,18 @@ impl Fragment {
             filters: match &v["filters"] {
                 Json::Null => Vec::new(),
                 _ => strings("filters")?,
+            },
+            broadcast: match &v["broadcast"] {
+                Json::Null => None,
+                b => Some(Broadcast {
+                    join_type: b["join_type"]
+                        .as_str()
+                        .ok_or("`broadcast.join_type` is required")?
+                        .to_owned(),
+                    build_keys: names(&b["build_keys"], "broadcast.build_keys")?,
+                    probe_keys: names(&b["probe_keys"], "broadcast.probe_keys")?,
+                    projection: projection(&b["projection"], "broadcast.projection")?,
+                }),
             },
             bucket: match &v["bucket"] {
                 Json::Null => None,
@@ -467,6 +506,7 @@ impl RemoteScanExec {
                     aggregate: None,
                     filters: Vec::new(),
                     bucket: None,
+                    broadcast: None,
                 },
             })
             .collect();
@@ -634,29 +674,187 @@ impl ExecutionPlan for RemoteScanExec {
         ctx: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let tag = ctx.session_config().get_extension::<QueryTag>();
-        let schema = self.schema.clone();
-        let Some(assigned) = self.fragments.get(partition).cloned() else {
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema.clone(),
+            self.fragment_stream(partition, tag, None),
+        )))
+    }
+}
+
+impl RemoteScanExec {
+    /// Fragment `partition` on its owner, then one other healthy worker
+    /// (ADR 0060), with `attachment` after its JSON (ADR 0066).
+    fn fragment_stream(
+        &self,
+        partition: usize,
+        tag: Option<Arc<QueryTag>>,
+        attachment: Option<Bytes>,
+    ) -> BoxStream<'static, Result<RecordBatch>> {
+        let Some(assigned) = self.fragments.get(partition) else {
             // No files at all: an empty partition.
-            return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                schema,
-                stream::empty(),
-            )));
+            return stream::empty().boxed();
         };
-        // The owner first, then one other healthy worker (ADR 0060).
         let n = self.urls.len();
-        let body = assigned.fragment.to_json();
+        let mut body = assigned.fragment.to_json().to_string().into_bytes();
+        if let Some(attachment) = attachment {
+            body.push(b'\n');
+            body.extend_from_slice(&attachment);
+        }
         let targets = (0..n.min(2))
             .map(|i| self.urls[(assigned.worker + i) % n].clone())
             .collect();
+        with_retry(
+            self.workers.clone(),
+            targets,
+            Bytes::from(body),
+            tag,
+            self.schema.clone(),
+        )
+    }
+
+    /// The same fragments, each joined on its worker with a build side
+    /// sent alongside (ADR 0066), returning `schema`.
+    fn broadcast(&self, spec: Broadcast, schema: SchemaRef) -> Self {
+        let mut out = self.with_schema(schema);
+        for a in &mut out.fragments {
+            a.fragment.broadcast = Some(spec.clone());
+        }
+        out
+    }
+}
+
+/// A `CollectLeft` hash join whose probe side is a remote scan (ADR
+/// 0066). The build side (the child) runs here once, as DataFusion would
+/// collect it anyway; it is sent as Arrow IPC with every probe fragment,
+/// and each worker joins its fragment against it. One partition per
+/// fragment.
+#[derive(Debug)]
+pub struct RemoteBroadcastExec {
+    build: Arc<dyn ExecutionPlan>,
+    probe: Arc<RemoteScanExec>,
+    join_type: String,
+    /// The build side as IPC, and its memory, shared by all partitions.
+    shipped: Arc<tokio::sync::OnceCell<Result<Shipped, String>>>,
+}
+
+type Shipped = (
+    Bytes,
+    Arc<datafusion::execution::memory_pool::MemoryReservation>,
+);
+
+impl RemoteBroadcastExec {
+    fn new(build: Arc<dyn ExecutionPlan>, probe: Arc<RemoteScanExec>, join_type: String) -> Self {
+        Self {
+            build,
+            probe,
+            join_type,
+            shipped: Arc::default(),
+        }
+    }
+}
+
+impl DisplayAs for RemoteBroadcastExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "RemoteBroadcastExec: {} join fragments={}",
+            self.join_type,
+            self.probe.fragments.len()
+        )?;
+        if let Some(a) = self
+            .probe
+            .fragments
+            .first()
+            .filter(|a| !a.fragment.filters.is_empty())
+        {
+            write!(f, " filters={:?}", a.fragment.filters)?;
+        }
+        Ok(())
+    }
+}
+
+impl ExecutionPlan for RemoteBroadcastExec {
+    fn name(&self) -> &str {
+        "RemoteBroadcastExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.probe.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.build]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> Result<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let Some(build) = children.pop() else {
+            return Err(DataFusionError::Internal(
+                "broadcast join needs its build side".into(),
+            ));
+        };
+        Ok(Arc::new(Self::new(
+            build,
+            self.probe.clone(),
+            self.join_type.clone(),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        ctx: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let tag = ctx.session_config().get_extension::<QueryTag>();
+        let (build, shipped, probe) =
+            (self.build.clone(), self.shipped.clone(), self.probe.clone());
+        let body = stream::once(async move {
+            let (bytes, _) = shipped
+                .get_or_init(|| async move {
+                    let fail = |e: DataFusionError| e.to_string();
+                    let schema = build.schema();
+                    let batches = datafusion::physical_plan::collect(build, ctx.clone())
+                        .await
+                        .map_err(fail)?;
+                    let mut writer =
+                        datafusion::arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &schema)
+                            .map_err(|e| e.to_string())?;
+                    for b in &batches {
+                        writer.write(b).map_err(|e| e.to_string())?;
+                    }
+                    writer.finish().map_err(|e| e.to_string())?;
+                    let bytes = writer.into_inner().map_err(|e| e.to_string())?;
+                    // Held as long as the plan: the build side is sent
+                    // once per fragment.
+                    let memory =
+                        datafusion::execution::memory_pool::MemoryConsumer::new("broadcast-build")
+                            .register(ctx.memory_pool());
+                    memory.try_grow(bytes.len()).map_err(fail)?;
+                    Ok((Bytes::from(bytes), Arc::new(memory)))
+                })
+                .await
+                .clone()
+                .map_err(|e| DataFusionError::External(e.into()))?;
+            Ok::<_, DataFusionError>(probe.fragment_stream(partition, tag, Some(bytes)))
+        })
+        .flat_map(|r| match r {
+            Ok(s) => s,
+            Err(e) => stream::iter([Err(e)]).boxed(),
+        });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema.clone(),
-            with_retry(
-                self.workers.clone(),
-                targets,
-                Arc::new(body.to_string()),
-                tag,
-                schema,
-            ),
+            self.probe.schema.clone(),
+            body,
         )))
     }
 }
@@ -776,7 +974,7 @@ impl ExecutionPlan for RemoteReduceExec {
             with_retry(
                 self.workers.clone(),
                 vec![url.clone()],
-                Arc::new(reduce.to_json().to_string()),
+                Bytes::from(reduce.to_json().to_string()),
                 tag,
                 schema,
             ),
@@ -922,12 +1120,18 @@ fn shuffle(
     free: bool,
     config: &ConfigOptions,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    if free {
+    // Remote results arrive in no particular order: a node whose output
+    // ordering something above may rely on (a join keeping its sorted
+    // probe side for a merge) is never replaced.
+    if free && plan.properties().output_ordering().is_none() {
         if let Some(shuffled) = shuffle_final(&plan, config)? {
             return Ok(shuffled);
         }
         if let Some(shuffled) = shuffle_join(&plan) {
             return Ok(shuffled);
+        }
+        if let Some(broadcast) = broadcast_join(&plan, config)? {
+            return Ok(broadcast);
         }
     }
     // Children stay free below nodes that take any partitioning (they
@@ -1035,6 +1239,80 @@ fn shuffle_join(node: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>>
     )))
 }
 
+/// A `CollectLeft` equi-join whose probe side (right) is a plain remote
+/// scan, as a broadcast (ADR 0066): only join types driven by the probe
+/// side, whose output per probe row does not depend on other probe rows
+/// (inner, right, right semi, right anti). A left or full join would emit
+/// unmatched build rows once per worker.
+fn broadcast_join(
+    node: &Arc<dyn ExecutionPlan>,
+    config: &ConfigOptions,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    use datafusion::common::{JoinType, NullEquality};
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+    let Some(join) = node.as_ref().downcast_ref::<HashJoinExec>() else {
+        return Ok(None);
+    };
+    if *join.partition_mode() != PartitionMode::CollectLeft
+        || join.filter().is_some()
+        || join.null_equality() != NullEquality::NullEqualsNothing
+        || !matches!(
+            join.join_type(),
+            JoinType::Inner | JoinType::Right | JoinType::RightSemi | JoinType::RightAnti
+        )
+    {
+        return Ok(None);
+    }
+    let Some(r) = remote_under(join.right()) else {
+        return Ok(None);
+    };
+    let Some(probe) = r.as_ref().downcast_ref::<RemoteScanExec>() else {
+        return Ok(None);
+    };
+    if probe.fragments.is_empty()
+        || probe
+            .fragments
+            .iter()
+            .any(|a| a.fragment.aggregate.is_some())
+    {
+        return Ok(None);
+    }
+    let (ls, rs) = (join.left().schema(), join.right().schema());
+    let (mut build_keys, mut probe_keys) = (Vec::new(), Vec::new());
+    for (a, b) in join.on() {
+        let (Some(a), Some(b)) = (
+            a.as_ref().downcast_ref::<Column>(),
+            b.as_ref().downcast_ref::<Column>(),
+        ) else {
+            return Ok(None);
+        };
+        if ls.field(a.index()).data_type() != rs.field(b.index()).data_type() {
+            return Ok(None);
+        }
+        build_keys.push(a.name().to_owned());
+        probe_keys.push(b.name().to_owned());
+    }
+    let spec = Broadcast {
+        join_type: join.join_type().to_string(),
+        build_keys,
+        probe_keys,
+        projection: join.projection.as_ref().map(|p| p.to_vec()),
+    };
+    // The build side is collected whole, so nothing in it depends on
+    // its partitioning: it may shuffle too.
+    let build = shuffle(join.left().clone(), true, config)?;
+    let probe = Arc::new(probe.broadcast(spec, join.schema()));
+    Ok(Some(Arc::new(AccountedExec::new(
+        "RemoteBroadcast",
+        Arc::new(RemoteBroadcastExec::new(
+            build,
+            probe,
+            join.join_type().to_string(),
+        )),
+    ))))
+}
+
 fn shuffle_final(
     node: &Arc<dyn ExecutionPlan>,
     config: &ConfigOptions,
@@ -1111,14 +1389,14 @@ fn worker_error(message: String, retryable: bool) -> DataFusionError {
 fn with_retry(
     workers: Arc<Workers>,
     targets: Vec<String>,
-    body: Arc<String>,
+    body: Bytes,
     tag: Option<Arc<QueryTag>>,
     schema: SchemaRef,
 ) -> BoxStream<'static, Result<RecordBatch>> {
     struct Run {
         workers: Arc<Workers>,
         targets: VecDeque<String>,
-        body: Arc<String>,
+        body: Bytes,
         tag: Option<Arc<QueryTag>>,
         schema: SchemaRef,
         current: Option<BoxStream<'static, Result<RecordBatch>>>,
@@ -1197,7 +1475,7 @@ fn with_retry(
 async fn open(
     workers: Arc<Workers>,
     url: String,
-    body: Arc<String>,
+    body: Bytes,
     tag: Option<Arc<QueryTag>>,
 ) -> Result<BoxStream<'static, Result<Bytes>>> {
     let mut request = workers
@@ -1225,7 +1503,7 @@ async fn open(
         }
     }
     let response = request
-        .body(body.as_ref().clone())
+        .body(body)
         .send()
         .await
         .map_err(|e| worker_error(format!("worker {url}: {e}"), true))?;
@@ -1261,7 +1539,7 @@ pub async fn fetch_bucket(
     let mut body = open(
         workers,
         url.clone(),
-        Arc::new(fragment.to_json().to_string()),
+        Bytes::from(fragment.to_json().to_string()),
         tag,
     )
     .await?;
@@ -1275,11 +1553,26 @@ pub async fn fetch_bucket(
             false,
         ));
     }
+    read_ipc(bytes)
+}
+
+/// A whole Arrow IPC stream: its schema and batches.
+pub fn read_ipc(bytes: impl AsRef<[u8]>) -> Result<(SchemaRef, Vec<RecordBatch>)> {
     let reader =
         datafusion::arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)?;
     let schema = reader.schema();
     let batches = reader.collect::<Result<Vec<_>, _>>()?;
     Ok((schema, batches))
+}
+
+/// A task body: the JSON, then, after one newline, an optional Arrow IPC
+/// attachment (a broadcast join's build side, ADR 0066). Serialized JSON
+/// holds no raw newline, so the first one splits them.
+pub fn split_body(body: &[u8]) -> (&[u8], &[u8]) {
+    match body.iter().position(|b| *b == b'\n') {
+        Some(i) => (&body[..i], &body[i + 1..]),
+        None => (body, &[]),
+    }
 }
 
 /// Arrow IPC's end-of-stream marker: continuation, then a zero length.
@@ -1403,6 +1696,12 @@ mod tests {
                 index: 0,
                 keys: vec![0],
             }),
+            broadcast: Some(Broadcast {
+                join_type: "RightSemi".into(),
+                build_keys: vec!["k".into()],
+                probe_keys: vec!["id".into()],
+                projection: None,
+            }),
         };
         assert_eq!(Fragment::from_json(&f.to_json()).unwrap(), f);
         assert!(Fragment::from_json(&json!({"files": []})).is_err());
@@ -1439,6 +1738,8 @@ mod tests {
             Task::from_json(&joined.to_json()).unwrap(),
             Task::Reduce(joined)
         );
+        assert_eq!(split_body(b"{}\n\x01\x02"), (&b"{}"[..], &b"\x01\x02"[..]));
+        assert_eq!(split_body(b"{}"), (&b"{}"[..], &b""[..]));
         // Without a join, every map must aggregate.
         r.maps[0].1.aggregate = None;
         assert!(Task::from_json(&r.to_json()).is_err());

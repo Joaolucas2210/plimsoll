@@ -254,9 +254,12 @@ async fn distributed_scans_match_local_ones() {
             format!(
                 "SELECT id FROM {t} WHERE id IN (SELECT id FROM {t} WHERE id % 3 = 0) ORDER BY id"
             ),
+            // (Unordered: with ORDER BY, DataFusion may sort the probe
+            // side below the join and keep its order, which a shuffle
+            // could not; such joins stay as planned.)
             format!(
-                "SELECT id FROM {t} a WHERE NOT EXISTS \
-                 (SELECT 1 FROM {t} b WHERE b.id = a.id AND b.id > 5) ORDER BY id"
+                "SELECT count(*), sum(id) FROM {t} a WHERE NOT EXISTS \
+                 (SELECT 1 FROM {t} b WHERE b.id = a.id AND b.id > 5)"
             ),
         ] {
             joins_match(&sql).await;
@@ -275,6 +278,65 @@ async fn distributed_scans_match_local_ones() {
         ))
         .await;
     }
+    // Broadcast joins (ADR 0066): with DataFusion's default thresholds a
+    // fixture-sized build side is collected, and sent to the workers with
+    // each probe fragment.
+    let collect_left = |on: bool| {
+        let state = coordinator.context().state_ref();
+        let mut state = state.write();
+        let optimizer = &mut state.config_mut().options_mut().optimizer;
+        let (bytes, rows) = if on { (1 << 20, 128 * 1024) } else { (0, 0) };
+        optimizer.hash_join_single_partition_threshold = bytes;
+        optimizer.hash_join_single_partition_threshold_rows = rows;
+    };
+    collect_left(true);
+    for (name, _) in &tables {
+        let t = name.to_lowercase();
+        for (sql, broadcast) in [
+            (
+                format!(
+                    "SELECT a.id, b.id AS b FROM {t} a JOIN {t} b ON a.id = b.id ORDER BY a.id"
+                ),
+                true,
+            ),
+            (
+                format!(
+                    "SELECT count(*), sum(a.id) FROM {t} a \
+                     JOIN (SELECT id FROM {t} WHERE id < 5) b ON a.id = b.id"
+                ),
+                true,
+            ),
+            // DataFusion sorts the probe side below the join for the ORDER
+            // BY; that order would not survive the workers.
+            (
+                format!(
+                    "SELECT a.id FROM {t} a JOIN (SELECT id FROM {t} WHERE id < 5) b \
+                     ON a.id = b.id WHERE a.id % 2 = 0 ORDER BY a.id"
+                ),
+                false,
+            ),
+            // Driven by the build side: each worker would emit build rows.
+            (
+                format!(
+                    "SELECT id FROM {t} WHERE id IN (SELECT id FROM {t} WHERE id % 3 = 0) ORDER BY id"
+                ),
+                false,
+            ),
+            (
+                format!(
+                    "SELECT x.id, y.id AS y FROM {t} x RIGHT JOIN (SELECT id FROM {t} WHERE id > 3) y \
+                     ON x.id = y.id ORDER BY y"
+                ),
+                false,
+            ),
+        ] {
+            let (want, _) = run(&local, &sql).await;
+            let (got, plan) = run(&coordinator, &sql).await;
+            assert_eq!(plan.contains("RemoteBroadcast"), broadcast, "{sql}: {plan}");
+            assert_eq!(got, want, "{sql}");
+        }
+    }
+    collect_left(false);
     // Grouped by the join key: the final aggregation may rely on the
     // join's partitioning, so the join must then stay as planned.
     let (a, _) = &tables[0];

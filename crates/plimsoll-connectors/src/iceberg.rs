@@ -1053,14 +1053,25 @@ impl TableProvider for IcebergTable {
             self.name,
             self.snapshot_id.map_or("none".to_owned(), |id| id.to_string())
         ));
-        Ok(Arc::new(match exact_rows {
+        // Otherwise the manifests' record counts are an upper bound (rows
+        // may be deleted or filtered): inexact, but enough for DataFusion
+        // to pick the smaller join side and collect small ones (ADR 0066).
+        let rows = exact_rows.map(Precision::Exact).or_else(|| {
+            files
+                .iter()
+                .map(|f| f.rows)
+                .sum::<Option<u64>>()
+                .and_then(|n| usize::try_from(n).ok())
+                .map(Precision::Inexact)
+        });
+        Ok(Arc::new(match rows {
             Some(rows) => {
                 let schema = match projection {
                     Some(p) => Arc::new(self.schema.project(p)?),
                     None => self.schema.clone(),
                 };
                 let mut statistics = Statistics::new_unknown(&schema);
-                statistics.num_rows = Precision::Exact(rows);
+                statistics.num_rows = rows;
                 scan.with_statistics(statistics)
             }
             None => scan,

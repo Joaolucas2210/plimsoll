@@ -141,9 +141,11 @@ pub trait QueryEngine: Send + Sync {
 
     /// A worker's scan fragment (ADR 0058), as a stream. Default: not a
     /// worker.
+    /// `build` is the build side sent with a broadcast join (ADR 0066).
     async fn fragment(
         &self,
         _fragment: Fragment,
+        _build: Option<Build>,
     ) -> Result<SendableRecordBatchStream, EngineError> {
         Err(EngineError::Unsupported("scan fragments".into()))
     }
@@ -223,6 +225,62 @@ fn each_row(
 }
 
 pub struct CoreEngine(pub Arc<Engine>);
+
+/// A broadcast join's build side: schema and batches.
+pub type Build = (
+    plimsoll_core::datafusion::arrow::datatypes::SchemaRef,
+    Vec<RecordBatch>,
+);
+
+/// `build` (left, qualified `b`) joined with the fragment's rows `probe`
+/// (right, `p`) as the coordinator's `CollectLeft` join (ADR 0066).
+fn broadcast_join(
+    ctx: &plimsoll_core::datafusion::prelude::SessionContext,
+    spec: &plimsoll_connectors::remote::Broadcast,
+    schema: plimsoll_core::datafusion::arrow::datatypes::SchemaRef,
+    batches: Vec<RecordBatch>,
+    probe: plimsoll_core::datafusion::prelude::DataFrame,
+) -> Result<plimsoll_core::datafusion::prelude::DataFrame, EngineError> {
+    use plimsoll_core::datafusion::common::{Column, JoinType};
+    use plimsoll_core::datafusion::datasource::MemTable;
+    use plimsoll_core::datafusion::prelude::Expr;
+    let fail = |e: DataFusionError| classify(&e);
+    let build = MemTable::try_new(schema, vec![batches])
+        .and_then(|t| ctx.read_table(Arc::new(t)))
+        .and_then(|df| df.alias("b"))
+        .map_err(fail)?;
+    let on = spec.build_keys.iter().zip(&spec.probe_keys).map(|(a, b)| {
+        Expr::Column(Column::new(Some("b"), a)).eq(Expr::Column(Column::new(Some("p"), b)))
+    });
+    let join_type: JoinType = spec.join_type.parse().map_err(fail)?;
+    let df = build
+        .join_on(probe.alias("p").map_err(fail)?, join_type, on)
+        .map_err(fail)?;
+    project(df, spec.projection.as_deref())
+}
+
+/// `df` with only the columns at `projection`, if any (a join's own
+/// output projection).
+fn project(
+    df: plimsoll_core::datafusion::prelude::DataFrame,
+    projection: Option<&[usize]>,
+) -> Result<plimsoll_core::datafusion::prelude::DataFrame, EngineError> {
+    let Some(p) = projection else {
+        return Ok(df);
+    };
+    let columns = df.schema().columns();
+    let kept = p
+        .iter()
+        .map(|&i| {
+            columns
+                .get(i)
+                .cloned()
+                .map(plimsoll_core::datafusion::prelude::Expr::Column)
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| EngineError::InvalidQuery("join projection out of range".into()))?;
+    df.select(kept).map_err(|e| classify(&e))
+}
 
 /// Bucket `r.partition` of every one of `maps` (numbered from `offset`
 /// among the shuffle's maps, hashed by `keys`), fetched concurrently, as
@@ -394,7 +452,11 @@ impl CoreEngine {
 
 #[async_trait]
 impl QueryEngine for CoreEngine {
-    async fn fragment(&self, f: Fragment) -> Result<SendableRecordBatchStream, EngineError> {
+    async fn fragment(
+        &self,
+        f: Fragment,
+        build: Option<Build>,
+    ) -> Result<SendableRecordBatchStream, EngineError> {
         let fail = |e: DataFusionError| classify(&e);
         let state = self.0.context().state();
         let connector = IcebergConnector::fragment(
@@ -456,6 +518,14 @@ impl QueryEngine for CoreEngine {
             df = df.aggregate(groups, aggregates).map_err(fail)?;
         } else {
             df = df.select(f.columns.iter().map(ident)).map_err(fail)?;
+        }
+        if let Some(b) = &f.broadcast {
+            let Some((schema, batches)) = build else {
+                return Err(EngineError::InvalidQuery(
+                    "a broadcast join needs its build side attached".into(),
+                ));
+            };
+            df = broadcast_join(&ctx, b, schema, batches, df)?;
         }
         match f.bucket {
             Some(bucket) => self.map_bucket(df, bucket).await,
@@ -542,20 +612,7 @@ impl QueryEngine for CoreEngine {
                 });
                 let join_type: JoinType = j.join_type.parse().map_err(fail)?;
                 let df = l.join_on(rt, join_type, on).map_err(fail)?;
-                match &j.projection {
-                    None => df,
-                    Some(p) => {
-                        let columns = df.schema().columns();
-                        let kept = p
-                            .iter()
-                            .map(|&i| columns.get(i).cloned().map(Expr::Column))
-                            .collect::<Option<Vec<_>>>()
-                            .ok_or_else(|| {
-                                EngineError::InvalidQuery("join projection out of range".into())
-                            })?;
-                        df.select(kept).map_err(fail)?
-                    }
-                }
+                project(df, j.projection.as_deref())?
             }
             _ => {
                 let Some(spec) = r.maps.first().and_then(|(_, f)| f.aggregate.clone()) else {

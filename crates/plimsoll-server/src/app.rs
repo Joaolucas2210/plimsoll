@@ -364,10 +364,21 @@ async fn fragment(
             None,
         );
     }
-    let parsed = serde_json::from_slice(&body)
-        .map_err(|e| e.to_string())
-        .and_then(|v| plimsoll_connectors::remote::Task::from_json(&v));
-    let task = match parsed {
+    // The JSON task, then an optional Arrow IPC attachment: a broadcast
+    // join's build side (ADR 0066).
+    let (json, attachment) = plimsoll_connectors::remote::split_body(&body);
+    let build = Some(attachment)
+        .filter(|a| !a.is_empty())
+        .map(plimsoll_connectors::remote::read_ipc)
+        .transpose()
+        .map_err(|e| format!("broadcast build side: {e}"));
+    let parsed = build.and_then(|build| {
+        serde_json::from_slice(json)
+            .map_err(|e| e.to_string())
+            .and_then(|v| plimsoll_connectors::remote::Task::from_json(&v))
+            .map(|task| (task, build))
+    });
+    let (task, build) = match parsed {
         Ok(f) => f,
         Err(e) => {
             return ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", false)
@@ -433,7 +444,7 @@ async fn fragment(
         _slot: slot,
     };
     let run = match task {
-        Task::Scan(f) => st.engine.fragment(f).await,
+        Task::Scan(f) => st.engine.fragment(f, build).await,
         Task::Reduce(r) => {
             // Peers see the query as this worker saw it.
             let tag = query_id.map(|query_id| {
