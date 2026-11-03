@@ -62,6 +62,8 @@ pub use create::create_request;
 pub mod expire;
 mod merge;
 mod prune;
+mod remote_write;
+pub(crate) use remote_write::push_write;
 pub mod write;
 use deletes::{DeleteFile, EqualityDelete};
 use prune::{PartitionField, Prim, Pruner, Summary};
@@ -172,6 +174,23 @@ impl IcebergConnector {
         table.only_files = Some(Arc::new(files));
         connector.table = Arc::new(table);
         Ok(connector)
+    }
+
+    /// A worker's part of a distributed write (ADR 0091): `rows` written
+    /// as data files of the table at `metadata_path` (its current schema
+    /// and partition spec), not committed. Each file as the coordinator
+    /// commits it.
+    pub async fn write_files(
+        metadata_path: &str,
+        rows: datafusion::execution::SendableRecordBatchStream,
+        state: &dyn Session,
+    ) -> Result<Vec<Json>, ConnectorError> {
+        let raw = read(metadata_path, state, None).await?;
+        let meta: Json = serde_json::from_slice(&raw).map_err(|e| invalid(metadata_path, e))?;
+        let connector = Self::from_metadata("write", metadata_path, &meta)?;
+        let sink = connector.table.file_writer()?;
+        let written = sink.write_rows(rows, &state.task_ctx()).await?;
+        Ok(written.iter().map(write::Written::to_json).collect())
     }
 
     /// From metadata already in hand, e.g. a REST catalog `loadTable`
@@ -1662,14 +1681,42 @@ impl IcebergTable {
     /// The sink a write commits through, or why this table takes none
     /// (ADR 0075).
     fn writable(&self, verb: &str) -> Result<write::IcebergSink> {
+        let Some(committer) = &self.committer else {
+            return Err(DataFusionError::Plan(format!(
+                "cannot {verb} {}: only tables served by a REST catalog accept writes",
+                self.name
+            )));
+        };
+        self.sink(verb, committer.clone())
+    }
+
+    /// A sink that writes files but never commits: a worker's, whose files
+    /// the coordinator commits (ADR 0091).
+    fn file_writer(&self) -> Result<write::IcebergSink> {
+        #[derive(Debug)]
+        struct NoCommit;
+        #[async_trait::async_trait]
+        impl write::Committer for NoCommit {
+            async fn current(&self) -> std::result::Result<Json, String> {
+                Err("workers do not commit".into())
+            }
+            async fn commit(
+                &self,
+                _: Vec<Json>,
+                _: Vec<Json>,
+            ) -> std::result::Result<(), write::CommitError> {
+                Err(write::CommitError::Failed("workers do not commit".into()))
+            }
+        }
+        self.sink("write files for", Arc::new(NoCommit))
+    }
+
+    fn sink(&self, verb: &str, committer: Arc<dyn write::Committer>) -> Result<write::IcebergSink> {
         let refuse = |why: &str| {
             Err(DataFusionError::Plan(format!(
                 "cannot {verb} {}: {why}",
                 self.name
             )))
-        };
-        let Some(committer) = &self.committer else {
-            return refuse("only tables served by a REST catalog accept writes");
         };
         if self.name.contains('@') {
             return refuse("a snapshot or branch reference is read-only");
@@ -1686,11 +1733,12 @@ impl IcebergTable {
             schema: layout.arrow(),
             location: location.trim_end_matches('/').to_owned(),
             scoped: self.scoped.clone(),
-            committer: committer.clone(),
+            committer,
             schema_id: self.schema_id,
             layout,
             base: self.snapshot_id,
             staged: None,
+            metadata_path: self.metadata_path.clone(),
         })
     }
 

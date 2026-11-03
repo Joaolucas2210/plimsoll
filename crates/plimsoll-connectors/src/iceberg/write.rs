@@ -213,6 +213,7 @@ fn current_schema(meta: &Json) -> Option<&Json> {
 }
 
 /// The `INSERT INTO` sink of one Iceberg table.
+#[derive(Clone)]
 pub(super) struct IcebergSink {
     pub(super) name: String,
     /// The table's Arrow schema with Parquet field ids: what is written.
@@ -231,6 +232,9 @@ pub(super) struct IcebergSink {
     /// A staged create's metadata (`CREATE TABLE … AS SELECT`, ADR
     /// 0090): the commit creates the table with its first snapshot.
     pub(super) staged: Option<Json>,
+    /// The metadata file the table was loaded from: what workers open to
+    /// write files for it (ADR 0091).
+    pub(super) metadata_path: String,
 }
 
 impl IcebergSink {
@@ -302,6 +306,113 @@ pub(super) struct Written {
     /// The partition spec `partition` is in: the default spec for new
     /// data, the data file's own for its position deletes (ADR 0085).
     spec: i64,
+}
+
+impl Written {
+    pub(super) fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    /// As a worker reports it to the coordinator (ADR 0091). Column types
+    /// are not sent: the coordinator's layout has them by field id.
+    pub(super) fn to_json(&self) -> Json {
+        let datum = |d: &Option<Datum>| match d {
+            None => Json::Null,
+            Some(Datum::Int(v)) => json!({"i": v}),
+            Some(Datum::Big(v)) => json!({"d": v.to_string()}),
+            Some(Datum::Bytes(b)) => json!({"b": b}),
+        };
+        json!({
+            "path": self.path,
+            "rows": self.rows,
+            "bytes": self.bytes,
+            "partition": self.partition.iter().map(datum).collect::<Vec<_>>(),
+            "stats": self.stats.iter().map(|(id, _, s)| json!([id, s.values, s.nulls, datum(&s.lower), datum(&s.upper)])).collect::<Vec<_>>(),
+            "spec": self.spec,
+        })
+    }
+}
+
+impl IcebergSink {
+    /// A data file a worker wrote for this table (see [`Written::to_json`]).
+    pub(super) fn written_from_json(&self, v: &Json) -> std::result::Result<Written, String> {
+        let datum = |d: &Json| -> std::result::Result<Option<Datum>, String> {
+            Ok(match d {
+                Json::Null => None,
+                d if d["i"].is_i64() => d["i"].as_i64().map(Datum::Int),
+                d if d["d"].is_string() => Some(Datum::Big(
+                    d["d"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .parse()
+                        .map_err(|_| "bad decimal")?,
+                )),
+                d => Some(Datum::Bytes(
+                    d["b"]
+                        .as_array()
+                        .ok_or("bad datum")?
+                        .iter()
+                        .map(|b| {
+                            b.as_u64()
+                                .and_then(|b| u8::try_from(b).ok())
+                                .ok_or("bad byte")
+                        })
+                        .collect::<std::result::Result<_, _>>()?,
+                )),
+            })
+        };
+        let prims: HashMap<i64, Option<Prim>> = self.layout.columns.iter().copied().collect();
+        let stats = v["stats"]
+            .as_array()
+            .ok_or("stats")?
+            .iter()
+            .map(|s| {
+                let id = s[0].as_i64().ok_or("stat id")?;
+                Ok((
+                    id,
+                    prims.get(&id).copied().flatten(),
+                    ColumnStats {
+                        values: s[1].as_u64().ok_or("values")?,
+                        nulls: s[2].as_u64().ok_or("nulls")?,
+                        lower: datum(&s[3])?,
+                        upper: datum(&s[4])?,
+                    },
+                ))
+            })
+            .collect::<std::result::Result<_, String>>()?;
+        Ok(Written {
+            path: v["path"].as_str().ok_or("path")?.to_owned(),
+            rows: v["rows"].as_u64().ok_or("rows")?,
+            bytes: v["bytes"].as_u64().ok_or("bytes")?,
+            partition: v["partition"]
+                .as_array()
+                .ok_or("partition")?
+                .iter()
+                .map(datum)
+                .collect::<std::result::Result<_, _>>()?,
+            stats,
+            referenced: None,
+            content: 0,
+            spec: v["spec"].as_i64().ok_or("spec")?,
+        })
+    }
+
+    /// Commits data files written elsewhere (on workers, ADR 0091) as one
+    /// append.
+    pub(super) async fn commit_files(
+        &self,
+        files: &[Written],
+        env: &datafusion::execution::runtime_env::RuntimeEnv,
+    ) -> Result<()> {
+        self.commit(files, Change::Append, None, env).await
+    }
+
+    /// Whether files for this table may be written on workers: they open
+    /// it by its metadata file, with their own storage credentials (vended
+    /// ones are not sent, ADR 0058), and never for a staged create.
+    pub(super) fn workers_may_write(&self) -> bool {
+        self.scoped.is_none() && self.staged.is_none() && !self.metadata_path.is_empty()
+    }
 }
 
 /// What a commit adds.
@@ -2353,7 +2464,45 @@ mod tests {
             layout,
             base: None,
             staged: None,
+            metadata_path: String::new(),
         };
+        // A worker's file report survives the trip to the coordinator
+        // (ADR 0091): partition values, counts and bounds of every kind.
+        let file = Written {
+            path: "file:///t/data/a.parquet".into(),
+            rows: 3,
+            bytes: 10,
+            partition: vec![Some(Datum::Bytes(b"a".to_vec())), None],
+            stats: vec![
+                (
+                    1,
+                    Some(Prim::Long),
+                    ColumnStats {
+                        values: 3,
+                        nulls: 0,
+                        lower: Some(Datum::Int(-1)),
+                        upper: Some(Datum::Int(9)),
+                    },
+                ),
+                (
+                    2,
+                    Some(Prim::String),
+                    ColumnStats {
+                        values: 3,
+                        nulls: 1,
+                        lower: Some(Datum::Bytes(b"a".to_vec())),
+                        upper: Some(Datum::Big(12_345)),
+                    },
+                ),
+            ],
+            referenced: None,
+            content: 0,
+            spec: 0,
+        };
+        let back = sink.written_from_json(&file.to_json()).unwrap();
+        assert_eq!(back.to_json(), file.to_json());
+        assert_eq!(back.stats[0].1, Some(Prim::Long), "types from the layout");
+        assert!(sink.written_from_json(&json!({"path": "x"})).is_err());
         let groups = sink.split(&batch).unwrap();
         // ("a", bucket(1)) twice, then ("b", ...), then (NULL, ...).
         let sizes: Vec<usize> = groups.iter().map(|(_, b)| b.num_rows()).collect();

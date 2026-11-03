@@ -208,6 +208,9 @@ pub struct Fragment {
     /// Join the fragment's rows (the probe side) with the build side sent
     /// alongside (ADR 0066).
     pub broadcast: Option<Broadcast>,
+    /// Write the rows as data files of the table at this metadata file,
+    /// and return the files written (ADR 0091), one JSON per row.
+    pub write: Option<String>,
 }
 
 /// A broadcast hash join on a worker: the build side (attached to the
@@ -426,6 +429,7 @@ impl Fragment {
                 "probe_keys": b.probe_keys,
                 "projection": b.projection,
             })),
+            "write": self.write,
             "aggregate": self.aggregate.as_ref().map(|a| json!({
                 "group_by": a.group_by,
                 "aggregates": a.aggregates.iter().map(|(f, c)| json!({"fn": f, "column": c})).collect::<Vec<_>>(),
@@ -436,7 +440,8 @@ impl Fragment {
     pub fn from_json(v: &Json) -> Result<Self, String> {
         // A field this worker does not know could change the answer (a
         // filter it would skip): refuse it rather than ignore it.
-        const KNOWN: [&str; 8] = [
+        const KNOWN: [&str; 9] = [
+            "write",
             "metadata_location",
             "snapshot_id",
             "files",
@@ -476,6 +481,7 @@ impl Fragment {
             snapshot_id: v["snapshot_id"].as_i64(),
             files: strings("files")?,
             columns: strings("columns")?,
+            write: v["write"].as_str().map(str::to_owned),
             filters: match &v["filters"] {
                 Json::Null => Vec::new(),
                 _ => strings("filters")?,
@@ -611,6 +617,7 @@ impl RemoteScanExec {
                     filters: Vec::new(),
                     bucket: None,
                     broadcast: None,
+                    write: None,
                 },
             })
             .collect();
@@ -697,6 +704,43 @@ impl RemoteScanExec {
             fragments: self.fragments.clone(),
             properties,
         }
+    }
+
+    /// The same fragments, each writing its rows as data files of the
+    /// table at `target` instead of returning them (ADR 0091), with
+    /// `columns` in the target's order. `None` for fragments that do not
+    /// return plain rows (aggregated, joined or shuffled).
+    pub(crate) fn writing(&self, target: &str, columns: Vec<String>) -> Option<Self> {
+        if self.fragments.iter().any(|a| {
+            a.fragment.aggregate.is_some()
+                || a.fragment.broadcast.is_some()
+                || a.fragment.bucket.is_some()
+        }) {
+            return None;
+        }
+        let mut out = self.with_schema(written_schema());
+        for a in &mut out.fragments {
+            a.fragment.write = Some(target.to_owned());
+            a.fragment.columns = columns.clone();
+        }
+        Some(out)
+    }
+
+    /// The columns each fragment returns, by name.
+    pub(crate) fn columns(&self) -> Vec<String> {
+        self.fragments
+            .first()
+            .map(|a| a.fragment.columns.clone())
+            .unwrap_or_default()
+    }
+
+    /// Fragment `partition`'s output (see [`Self::fragment_stream`]).
+    pub(crate) fn partition_stream(
+        &self,
+        partition: usize,
+        tag: Option<Arc<QueryTag>>,
+    ) -> BoxStream<'static, Result<RecordBatch>> {
+        self.fragment_stream(partition, tag, None)
     }
 
     /// Fragments, i.e. shuffle partitions when shuffled.
@@ -1167,8 +1211,18 @@ impl PhysicalOptimizerRule for PartialAggregatePushdown {
         // Shuffles first (they consume the partial aggregations they
         // replace), then partial pushdown where no shuffle applies.
         let plan = shuffle(plan, true, config)?;
+        let plan = plan
+            .transform_down(|node| {
+                Ok(match push_partial(&node, config)? {
+                    Some(pushed) => Transformed::yes(pushed),
+                    None => Transformed::no(node),
+                })
+            })
+            .data()?;
+        // Writes of rows that come straight from workers are written
+        // there (ADR 0091).
         plan.transform_down(|node| {
-            Ok(match push_partial(&node, config)? {
+            Ok(match crate::iceberg::push_write(&node) {
                 Some(pushed) => Transformed::yes(pushed),
                 None => Transformed::no(node),
             })
@@ -1258,10 +1312,16 @@ fn partial_remote(
     Ok(Some(remote.with_aggregate(spec, agg.schema())))
 }
 
+/// What a writing fragment returns (ADR 0091): one data file per row.
+pub fn written_schema() -> SchemaRef {
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    Arc::new(Schema::new(vec![Field::new("file", DataType::Utf8, false)]))
+}
+
 /// The [`RemoteScanExec`] under `input`, reached through pass-through
 /// nodes only (the optimizer may put a repartition on either side of the
 /// scan's accounting), so its rows are `input`'s rows.
-fn remote_under(input: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+pub(crate) fn remote_under(input: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
     let pass = |mut p: Arc<dyn ExecutionPlan>| loop {
         if !matches!(p.name(), "RepartitionExec" | "CoalesceBatchesExec") {
             return Some(p);
@@ -1891,6 +1951,7 @@ mod tests {
                 probe_keys: vec!["id".into()],
                 projection: None,
             }),
+            write: Some("s3://b/u/metadata/v1.metadata.json".into()),
         };
         assert_eq!(Fragment::from_json(&f.to_json()).unwrap(), f);
         assert!(Fragment::from_json(&json!({"files": []})).is_err());

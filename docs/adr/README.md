@@ -98,6 +98,7 @@ are allowed in place.
 | [0088](0088-nested-field-evolution.md) | Nested field evolution | Accepted | 2026-11-03 | Nested columns whose file type differs are rebuilt by `NestedById`: struct children by field id (name without ids), lists and maps recursively, promotions cast, missing children NULL; the ADR 0041 refusal is gone; `ALTER TABLE … ADD | RENAME | DROP COLUMN a.b` (Spark syntax, small parser) edits struct paths with fresh ids | 0041, 0040, 0087, 0084 |
 | [0089](0089-drop-table.md) | `DROP TABLE` under its own grant | Accepted | 2026-11-03 | `DROP TABLE [IF EXISTS] ns.t [PURGE]`, one table, no cascade; `check_drop` denies by default and `PLIMSOLL_AUTH_DROP_GRANTS` grants it per schema (a write grant does not); REST `dropTable` with `purgeRequested` only for `PURGE`, the catalog deleting the files | 0083, 0084, 0075, 0025 |
 | [0090](0090-create-table-as-select.md) | `CREATE TABLE … AS SELECT` in one commit | Accepted | 2026-11-03 | The query runs through the governed read path; the catalog stages the table (`stage-create`), the partitioned writer writes the rows under the staged location, and one `updateTable` with `assert-create` carries the creation updates and the first snapshot; a failed query leaves no table | 0083, 0075, 0076, 0025 |
+| [0091](0091-writes-on-workers.md) | Data files written on workers | Accepted | 2026-11-03 | `DataSinkExec(IcebergSink)` over a remote scan (only pass-through nodes and a column-picking, lossless-cast projection between) becomes `RemoteWriteExec`: fragments carry the target's metadata file, workers write the files and report them as JSON, the coordinator commits one append; CTAS, shuffled rows and row-level writes stay on the coordinator | 0058, 0062, 0063, 0075, 0060 |
 
 ## Reading order
 
@@ -105,8 +106,8 @@ are allowed in place.
 - Shape of the system: 0001, 0002, 0004.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
 - Federation: 0005 → 0006.
-- Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074.
-- Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084 → 0085 → 0086 → 0087 → 0088 → 0089 → 0090.
+- Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074 → 0091.
+- Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084 → 0085 → 0086 → 0087 → 0088 → 0089 → 0090 → 0091.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046.
 

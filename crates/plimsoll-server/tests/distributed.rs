@@ -702,3 +702,88 @@ async fn fragments_retry_once_before_the_first_batch() {
     let (rows, a, b) = run(Fake::Ok).await;
     assert_eq!((rows.unwrap(), a, b), (1, 1, 0));
 }
+
+/// Data files written on workers (ADR 0091): an `INSERT … SELECT` from a
+/// remote scan writes its files on the workers, the coordinator commits
+/// them in one append, and the table holds exactly the selected rows.
+#[tokio::test]
+#[ignore = "needs PLIMSOLL_CATALOG_URI (iceberg-rest-fixture) and its warehouse's storage"]
+async fn writes_on_workers_through_the_rest_catalog() {
+    use plimsoll_control::catalog::{Catalog, CatalogConfig, Namespace, TableIdent};
+    use plimsoll_control::rest::RestCatalog;
+    let Some(cfg) = CatalogConfig::from_lookup(|k| std::env::var(k).ok()).unwrap() else {
+        return;
+    };
+    let catalog: Arc<dyn Catalog> = Arc::new(RestCatalog::connect(cfg).await.unwrap());
+    let coordinator = Engine::new(
+        Arc::new(CeilingPool::new(256 << 20, 8 << 20).unwrap()),
+        None,
+    )
+    .unwrap();
+    plimsoll_server::lakehouse::register(coordinator.context(), catalog.clone())
+        .await
+        .unwrap();
+    coordinate(
+        &coordinator,
+        Workers::new(vec![worker().await, worker().await], TOKEN.into()).unwrap(),
+    );
+    let text = async |sql: &str| {
+        pretty_format_batches(&coordinator.sql(sql).await.unwrap().batches)
+            .unwrap()
+            .to_string()
+    };
+    let id = std::process::id();
+    let (src, dst) = (
+        format!("bronze.dw_src_{id:x}"),
+        format!("bronze.dw_dst_{id:x}"),
+    );
+    text(&format!(
+        "CREATE TABLE {src} (id INT NOT NULL, region VARCHAR, v DOUBLE)"
+    ))
+    .await;
+    // Four appends: four files, for two workers.
+    for i in 1..=4 {
+        text(&format!(
+            "INSERT INTO {src} SELECT CAST(value AS INT) + {i} * 1000, \
+             CASE WHEN value % 2 = 0 THEN 'eu' ELSE 'us' END, value * 1.5 \
+             FROM generate_series(1, 200)"
+        ))
+        .await;
+    }
+    text(&format!(
+        "CREATE TABLE {dst} (region VARCHAR, id BIGINT NOT NULL, v DOUBLE) PARTITION BY (region)"
+    ))
+    .await;
+    // Reordered and widened columns, a filter: all done on the workers.
+    let insert = format!("INSERT INTO {dst} SELECT region, id, v FROM {src} WHERE v > 100");
+    let plan = text(&format!("EXPLAIN {insert}")).await;
+    assert!(
+        plan.contains("RemoteWriteExec") && plan.contains("fragments=2"),
+        "{plan}"
+    );
+    assert!(text(&insert).await.contains("| 536   |"));
+    let check = "SELECT count(*) AS n, sum(id) AS s, min(v) AS m FROM";
+    let (got, want) = (
+        text(&format!("{check} {dst}")).await,
+        text(&format!("{check} {src} WHERE v > 100")).await,
+    );
+    assert_eq!(got, want);
+    let name = dst.trim_start_matches("bronze.");
+    let meta = catalog
+        .load_table(&TableIdent::new(Namespace::new(&["bronze"]), name))
+        .await
+        .unwrap()
+        .metadata;
+    let snapshots = meta["snapshots"].as_array().unwrap();
+    assert_eq!(snapshots.len(), 1, "one commit");
+    assert_eq!(snapshots[0]["summary"]["operation"], "append");
+    // An aggregate's rows are not a fragment's: written here, as before.
+    let plan = text(&format!(
+        "EXPLAIN INSERT INTO {dst} SELECT region, max(id), 0.0 FROM {src} GROUP BY region"
+    ))
+    .await;
+    assert!(!plan.contains("RemoteWriteExec"), "{plan}");
+    for t in [src, dst] {
+        text(&format!("DROP TABLE {t} PURGE")).await;
+    }
+}

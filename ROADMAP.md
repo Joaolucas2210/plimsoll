@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Data files written on workers: `INSERT … SELECT` over a remote scan writes its files where the rows are; workers report the files and the coordinator commits one append (ADR 0091)
 - [x] `CREATE TABLE … AS SELECT` in one commit: staged create, rows written, `assert-create` commit carrying table and first snapshot; the query is governed like any read (ADR 0090)
 - [x] `DROP TABLE [IF EXISTS] … [PURGE]` under its own grant (`PLIMSOLL_AUTH_DROP_GRANTS`), through the catalog's `dropTable` (ADR 0089)
 - [x] Nested field evolution: nested fields resolve by id in the scan (renamed, moved and re-added fields read right); `ALTER TABLE … ADD | RENAME | DROP COLUMN a.b` in Spark's syntax (ADR 0088)
@@ -123,16 +124,16 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Data files written on workers** — `INSERT … SELECT` and CTAS whose
-query is distributed write their files where the rows are (each worker
-returns its written files), and the coordinator commits them in one
-snapshot, so large writes are not bound by one node.
+**CTAS and post-shuffle writes on workers** — `CREATE TABLE … AS
+SELECT` writes into the staged location on workers, and writes of
+aggregated or joined rows are written by the reducers, so every large
+write scales with the workers (ADR 0091 covers `INSERT` over scans).
 
 ## Missing
 
 **Lakehouse writes** (the largest gap)
 - Appends to v3; decimal partition values; data
-  files written on workers (above); vectorized partition transforms.
+  files written on workers for CTAS and after shuffles (above); vectorized partition transforms.
 - `MERGE` beyond the pool (spilled source); deletion vectors for v3
   tables.
 - Maintenance: a per-table lease for several coordinators, per-step

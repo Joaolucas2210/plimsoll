@@ -860,6 +860,30 @@ impl QueryEngine for CoreEngine {
             };
             df = broadcast_join(&ctx, b, schema, batches, df)?;
         }
+        // A distributed write (ADR 0091): the rows become data files of the
+        // target table here; the files written go back, one JSON per row,
+        // for the coordinator to commit.
+        if let Some(target) = &f.write {
+            use plimsoll_core::datafusion::arrow::array::StringArray;
+            use plimsoll_core::datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+            let state = ctx.state();
+            let rows = df.execute_stream().await.map_err(fail)?;
+            let files = IcebergConnector::write_files(target, rows, &state)
+                .await
+                .map_err(|e| fail(e.into()))?;
+            let schema = plimsoll_connectors::remote::written_schema();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from(
+                    files.iter().map(|f| f.to_string()).collect::<Vec<_>>(),
+                ))],
+            )
+            .map_err(|e| fail(e.into()))?;
+            return Ok(Running::from(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::iter([Ok(batch)]),
+            )) as SendableRecordBatchStream));
+        }
         match f.bucket {
             Some(bucket) => self
                 .map_bucket(df, bucket, deadline)
@@ -1418,6 +1442,7 @@ mod tests {
                 only: false,
             }),
             broadcast: None,
+            write: None,
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         for id in ["rel-a", "rel-a~m1r0"] {
