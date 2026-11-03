@@ -88,8 +88,52 @@ impl CatalogSchema {
             &location,
             metadata,
         )?
-        .with_storage_properties(&loaded.storage)?;
+        .with_storage_properties(&loaded.storage)?
+        // `INSERT INTO` commits back through this catalog (ADR 0075).
+        .with_committer(Arc::new(CatalogCommitter {
+            catalog: self.catalog.clone(),
+            ident,
+        }));
         Ok(connector)
+    }
+}
+
+/// Commits an Iceberg append as a REST `updateTable` (ADR 0075).
+struct CatalogCommitter {
+    catalog: Arc<dyn Catalog>,
+    ident: TableIdent,
+}
+
+impl std::fmt::Debug for CatalogCommitter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CatalogCommitter({})", self.ident)
+    }
+}
+
+#[async_trait]
+impl iceberg::write::Committer for CatalogCommitter {
+    async fn current(&self) -> std::result::Result<serde_json::Value, String> {
+        self.catalog
+            .load_table(&self.ident)
+            .await
+            .map(|t| t.metadata)
+            .map_err(|e| e.to_string())
+    }
+
+    async fn commit(
+        &self,
+        requirements: Vec<serde_json::Value>,
+        updates: Vec<serde_json::Value>,
+    ) -> std::result::Result<(), iceberg::write::CommitError> {
+        match self
+            .catalog
+            .update_table(&self.ident, requirements, updates)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(CatalogError::CommitConflict(m)) => Err(iceberg::write::CommitError::Conflict(m)),
+            Err(e) => Err(iceberg::write::CommitError::Failed(e.to_string())),
+        }
     }
 }
 
@@ -286,6 +330,112 @@ mod tests {
     /// Live: REST catalog + S3 that enforces credentials. The process env has
     /// *wrong* AWS keys; `PLIMSOLL_TEST_VENDED=key:secret` are valid ones that
     /// a vending catalog (simulated here) hands out with `loadTable`.
+    /// `INSERT INTO` through a real REST catalog (ADR 0075): data files
+    /// on the table's storage, a snapshot committed by the catalog, read
+    /// back by a fresh `loadTable`. Uses its own table, so the shared
+    /// fixtures stay as other live tests expect them.
+    #[tokio::test]
+    #[ignore = "needs PLIMSOLL_CATALOG_URI (iceberg-rest-fixture) and its warehouse's storage"]
+    async fn appends_through_the_rest_catalog() {
+        use plimsoll_control::catalog::CatalogConfig;
+        use plimsoll_control::rest::RestCatalog;
+        use plimsoll_core::datafusion::arrow::util::pretty::pretty_format_batches;
+        use plimsoll_core::engine::Engine;
+        use plimsoll_core::memory::CeilingPool;
+
+        let Some(cfg) = CatalogConfig::from_lookup(|k| std::env::var(k).ok()).unwrap() else {
+            return;
+        };
+        let name = format!("appends_{:x}", std::process::id());
+        let http = reqwest::Client::new();
+        let base = format!("{}/v1/namespaces/bronze/tables", cfg.uri);
+        let created = http
+            .post(&base)
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "name": name,
+                    "schema": {"type": "struct", "schema-id": 0, "fields": [
+                        {"id": 1, "name": "id", "required": true, "type": "long"},
+                        {"id": 2, "name": "name", "required": false, "type": "string"},
+                    ]},
+                    "properties": {"format-version": "2"},
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            created.status().is_success(),
+            "{}",
+            created.text().await.unwrap()
+        );
+
+        let catalog: Arc<dyn Catalog> = Arc::new(RestCatalog::connect(cfg).await.unwrap());
+        let pool = Arc::new(CeilingPool::new(256 << 20, 32 << 20).unwrap());
+        let engine = Engine::new(pool, None).unwrap();
+        register(engine.context(), catalog.clone()).await.unwrap();
+        let text = async |sql: &str| {
+            pretty_format_batches(&engine.sql(sql).await.unwrap().batches)
+                .unwrap()
+                .to_string()
+        };
+        let t = format!("bronze.{name}");
+        // An empty table, then two appends: the second carries the first
+        // snapshot's manifest over.
+        assert!(
+            text(&format!("INSERT INTO {t} VALUES (1, 'a'), (2, NULL)"))
+                .await
+                .contains("| 2 ")
+        );
+        assert!(
+            text(&format!("INSERT INTO {t} SELECT id + 10, name FROM {t}"))
+                .await
+                .contains("| 2 ")
+        );
+        let all = text(&format!("SELECT id, name FROM {t} ORDER BY id")).await;
+        for row in [
+            "| 1  | a    |",
+            "| 2  |      |",
+            "| 11 | a    |",
+            "| 12 |      |",
+        ] {
+            assert!(all.contains(row), "{all}");
+        }
+        // The catalog committed both, parent to child.
+        let meta = catalog
+            .load_table(&TableIdent::new(Namespace::new(&["bronze"]), &name))
+            .await
+            .unwrap()
+            .metadata;
+        let snapshots = meta["snapshots"].as_array().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(
+            snapshots[1]["parent-snapshot-id"],
+            snapshots[0]["snapshot-id"]
+        );
+        assert_eq!(snapshots[1]["summary"]["engine-name"], "plimsoll");
+        assert_eq!(meta["last-sequence-number"], 2);
+        // A NULL into a required column fails, and commits nothing.
+        assert!(
+            engine
+                .sql(&format!("INSERT INTO {t} VALUES (NULL, 'x')"))
+                .await
+                .is_err()
+        );
+        // Partitioned tables are refused before anything is written.
+        let err = engine
+            .sql("INSERT INTO bronze.events SELECT * FROM bronze.events")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("partitioned"), "{err}");
+        let _ = http
+            .delete(format!("{base}/{name}?purgeRequested=true"))
+            .send()
+            .await;
+    }
+
     #[tokio::test]
     #[ignore = "needs PLIMSOLL_CATALOG_URI, an S3 warehouse and PLIMSOLL_TEST_VENDED"]
     async fn reads_with_catalog_vended_credentials() {

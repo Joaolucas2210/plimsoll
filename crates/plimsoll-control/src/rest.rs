@@ -270,6 +270,69 @@ impl Catalog for RestCatalog {
             storage,
         })
     }
+
+    async fn update_table(
+        &self,
+        ident: &TableIdent,
+        requirements: Vec<Value>,
+        updates: Vec<Value>,
+    ) -> Result<LoadedTable, CatalogError> {
+        let url = format!(
+            "{}/namespaces/{}/tables/{}",
+            self.base,
+            self.namespace_path(&ident.namespace),
+            encode(&ident.name)
+        );
+        let body =
+            serde_json::json!({"requirements": requirements, "updates": updates}).to_string();
+        let mut retried = false;
+        let (status, mut body) = loop {
+            let token = self.token.read().await.clone();
+            let resp = self
+                .authorized(
+                    self.http
+                        .post(&url)
+                        .header("content-type", "application/json")
+                        .body(body.clone()),
+                    token.as_deref(),
+                )
+                .send()
+                .await
+                .map_err(|e| CatalogError::Http(e.to_string()))?;
+            let status = resp.status();
+            if status == StatusCode::UNAUTHORIZED
+                && !retried
+                && matches!(self.cfg.auth, CatalogAuth::ClientCredentials { .. })
+            {
+                retried = true;
+                self.refresh_token().await?;
+                continue;
+            }
+            break (status, json_value(resp).await?);
+        };
+        match status {
+            s if s.is_success() => {
+                let metadata = body["metadata"].take();
+                Ok(LoadedTable {
+                    ident: ident.clone(),
+                    metadata_location: body["metadata-location"].as_str().map(str::to_owned),
+                    metadata,
+                    storage: Default::default(),
+                })
+            }
+            // CommitFailedException: a requirement failed.
+            StatusCode::CONFLICT => Err(CatalogError::CommitConflict(error_message(&body))),
+            StatusCode::NOT_FOUND => Err(CatalogError::TableNotFound(ident.clone())),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(CatalogError::Auth(format!(
+                "{status}: {}",
+                error_message(&body)
+            ))),
+            s => Err(CatalogError::Status {
+                status: s.as_u16(),
+                message: error_message(&body),
+            }),
+        }
+    }
 }
 
 /// `config` overlaid with the `storage-credentials` entry whose `prefix` is

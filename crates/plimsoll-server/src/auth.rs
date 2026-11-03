@@ -15,6 +15,9 @@
 //! their default; unlisted principals get `default` only (ADR 0023).
 //! `PLIMSOLL_AUTH_GRANTS=ana=gold|silver,etl=*` lists the schemas each
 //! principal may read; once set, unlisted principals read no data (ADR 0025).
+//! `PLIMSOLL_AUTH_WRITE_GRANTS=etl=bronze|silver` lists the schemas each
+//! principal may `INSERT INTO`; unlisted principals write nothing, and
+//! unset means no writes at all (ADR 0075).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -45,6 +48,8 @@ pub enum Auth {
         /// Principal -> readable schemas (`*` = all). `None`: not
         /// configured, every principal reads every schema.
         grants: Option<HashMap<String, HashSet<String>>>,
+        /// Principal -> schemas it may `INSERT INTO` (ADR 0075).
+        write_grants: HashMap<String, HashSet<String>>,
         /// Principal -> `schema.table.column`s it may not read (ADR 0044).
         column_deny: HashMap<String, Arc<HashSet<String>>>,
         /// Principal -> `schema.table` -> SQL predicate its rows must
@@ -88,6 +93,7 @@ const TOKENS: &str = "PLIMSOLL_AUTH_TOKENS";
 const OPERATORS: &str = "PLIMSOLL_AUTH_OPERATORS";
 const GROUPS: &str = "PLIMSOLL_AUTH_GROUPS";
 const GRANTS: &str = "PLIMSOLL_AUTH_GRANTS";
+const WRITE_GRANTS: &str = "PLIMSOLL_AUTH_WRITE_GRANTS";
 const COLUMN_DENY: &str = "PLIMSOLL_AUTH_COLUMN_DENY";
 const ROW_FILTERS: &str = "PLIMSOLL_AUTH_ROW_FILTERS";
 
@@ -106,7 +112,14 @@ impl Auth {
         match lookup(MODE).as_deref().map(str::trim) {
             None | Some("required") => {}
             Some("disabled") => {
-                for var in [OPERATORS, GROUPS, GRANTS, COLUMN_DENY, ROW_FILTERS] {
+                for var in [
+                    OPERATORS,
+                    GROUPS,
+                    GRANTS,
+                    WRITE_GRANTS,
+                    COLUMN_DENY,
+                    ROW_FILTERS,
+                ] {
                     if lookup(var).is_some_and(|o| !o.trim().is_empty()) {
                         return Err(err(var, "", "needs PLIMSOLL_AUTH=required"));
                     }
@@ -178,30 +191,34 @@ impl Auth {
                 return Err(err(GROUPS, user, "user bound twice"));
             }
         }
-        let grants = match lookup(GRANTS) {
-            None => None,
-            Some(raw) => {
-                let mut grants = HashMap::new();
-                for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-                    let (user, list) = entry.split_once('=').ok_or_else(|| {
-                        err(GRANTS, entry, "expected `user=schema|schema` entries")
-                    })?;
-                    let user = user.trim();
-                    if !tokens.values().any(|u| u == user) {
-                        return Err(err(GRANTS, user, "not a user in PLIMSOLL_AUTH_TOKENS"));
-                    }
-                    let schemas: HashSet<String> = list
-                        .split('|')
-                        .map(|s| s.trim().to_owned())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    if grants.insert(user.to_owned(), schemas).is_some() {
-                        return Err(err(GRANTS, user, "user granted twice"));
-                    }
+        // `user=schema|schema` lists: readable (ADR 0025) and writable
+        // (ADR 0075) schemas.
+        let schema_grants = |var: &'static str| -> Result<_, ConfigError> {
+            let Some(raw) = lookup(var) else {
+                return Ok(None);
+            };
+            let mut grants = HashMap::new();
+            for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+                let (user, list) = entry
+                    .split_once('=')
+                    .ok_or_else(|| err(var, entry, "expected `user=schema|schema` entries"))?;
+                let user = user.trim();
+                if !tokens.values().any(|u| u == user) {
+                    return Err(err(var, user, "not a user in PLIMSOLL_AUTH_TOKENS"));
                 }
-                Some(grants)
+                let schemas: HashSet<String> = list
+                    .split('|')
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if grants.insert(user.to_owned(), schemas).is_some() {
+                    return Err(err(var, user, "user granted twice"));
+                }
             }
+            Ok(Some(grants))
         };
+        let grants = schema_grants(GRANTS)?;
+        let write_grants = schema_grants(WRITE_GRANTS)?.unwrap_or_default();
         let mut column_deny = HashMap::new();
         for entry in lookup(COLUMN_DENY)
             .unwrap_or_default()
@@ -276,6 +293,7 @@ impl Auth {
             operators,
             groups,
             grants,
+            write_grants,
             column_deny,
             row_filters,
         })
@@ -311,6 +329,7 @@ impl Auth {
         let Self::Tokens {
             operators,
             grants,
+            write_grants,
             column_deny,
             row_filters,
             ..
@@ -320,6 +339,7 @@ impl Auth {
             return Viewer {
                 only: None,
                 schemas: None,
+                writable: Some(["*".to_owned()].into()),
                 group: None,
                 denied_columns: None,
                 row_filters: None,
@@ -331,6 +351,7 @@ impl Auth {
             schemas: grants
                 .as_ref()
                 .map(|g| g.get(principal).cloned().unwrap_or_default()),
+            writable: write_grants.get(principal).cloned(),
             group: None,
             denied_columns: column_deny.get(principal).cloned(),
             row_filters: row_filters.get(principal).cloned(),
@@ -366,6 +387,8 @@ pub struct Viewer {
     pub only: Option<String>,
     /// Readable schemas (`*` = all). `None`: grants not configured.
     pub schemas: Option<HashSet<String>>,
+    /// Schemas it may `INSERT INTO` (`*` = all). `None`: none (ADR 0075).
+    pub writable: Option<HashSet<String>>,
     /// The resource group the query runs in (memory share, ADR 0036).
     pub group: Option<String>,
     /// `schema.table.column`s this principal may not read (ADR 0044).
@@ -424,6 +447,19 @@ impl TableAccess for Viewer {
             }
         }
         Ok(())
+    }
+
+    fn check_write(&self, table: &ResolvedTableReference) -> DfResult<()> {
+        let allowed = self
+            .writable
+            .as_ref()
+            .is_some_and(|w| w.contains("*") || w.contains(table.schema.as_ref()));
+        if allowed && table.catalog.as_ref() != "system" {
+            return Ok(());
+        }
+        Err(DataFusionError::External(Box::new(AccessDenied {
+            table: format!("{table} (write)"),
+        })))
     }
 
     fn check(&self, table: &ResolvedTableReference) -> DfResult<()> {
@@ -525,7 +561,14 @@ pub(crate) mod tests {
         let a = auth(&[(TOKENS, tokens.clone()), (OPERATORS, "ops".into())]).unwrap();
         assert_eq!(a.viewer("ops").only, None);
         assert_eq!(a.viewer("ana").only, Some("ana".into()));
-        assert_eq!(Auth::Disabled.viewer("x"), Viewer::default());
+        // Development: sees and reads everything (and writes, ADR 0075).
+        assert_eq!(
+            Auth::Disabled.viewer("x"),
+            Viewer {
+                writable: Some(["*".to_owned()].into()),
+                ..Viewer::default()
+            }
+        );
         // Unknown operator (typo) and operators without auth fail boot.
         let e = auth(&[(TOKENS, tokens), (OPERATORS, "opz".into())]).unwrap_err();
         assert_eq!(e.var, OPERATORS);
@@ -587,6 +630,45 @@ pub(crate) mod tests {
         for bad in ["zed=gold", "ana", "ana=gold,ana=silver"] {
             let e = auth(&[(TOKENS, tokens.clone()), (GRANTS, bad.into())]).unwrap_err();
             assert_eq!(e.var, GRANTS, "{bad}");
+        }
+    }
+
+    #[test]
+    fn write_grants_name_the_schemas_a_principal_may_insert_into() {
+        let tokens = format!("ana:sha256:{},etl:sha256:{}", hex("t1"), hex("t2"));
+        let t = |catalog: &str, schema: &str| ResolvedTableReference {
+            catalog: catalog.into(),
+            schema: schema.into(),
+            table: "t".into(),
+        };
+        // Unset: nobody writes, readers included.
+        let none = auth(&[(TOKENS, tokens.clone())]).unwrap();
+        assert!(
+            none.viewer("ana")
+                .check_write(&t("datafusion", "bronze"))
+                .is_err()
+        );
+        let a = auth(&[
+            (TOKENS, tokens.clone()),
+            (WRITE_GRANTS, "etl=bronze|silver".into()),
+        ])
+        .unwrap();
+        let etl = a.viewer("etl");
+        assert!(etl.check_write(&t("datafusion", "bronze")).is_ok());
+        assert!(etl.check_write(&t("datafusion", "gold")).is_err());
+        // System tables are never written.
+        assert!(etl.check_write(&t("system", "bronze")).is_err());
+        assert!(
+            a.viewer("ana")
+                .check_write(&t("datafusion", "bronze"))
+                .is_err()
+        );
+        // Development mode writes, as it reads, everything.
+        let dev = Auth::Disabled.viewer("anyone");
+        assert!(dev.check_write(&t("datafusion", "bronze")).is_ok());
+        for bad in ["zed=bronze", "etl", "etl=a,etl=b"] {
+            let e = auth(&[(TOKENS, tokens.clone()), (WRITE_GRANTS, bad.into())]).unwrap_err();
+            assert_eq!(e.var, WRITE_GRANTS, "{bad}");
         }
     }
 

@@ -56,6 +56,7 @@ mod files;
 pub mod meta;
 
 mod prune;
+pub mod write;
 use deletes::{DeleteFile, EqualityDelete};
 use prune::{PartitionField, Prim, Pruner, Summary};
 
@@ -210,6 +211,14 @@ impl IcebergConnector {
         self.table.snapshot_id
     }
 
+    /// Accept `INSERT INTO`, committing through `committer` (ADR 0075).
+    pub fn with_committer(mut self, committer: Arc<dyn write::Committer>) -> Self {
+        let mut table = (*self.table).clone();
+        table.committer = Some(committer);
+        self.table = Arc::new(table);
+        self
+    }
+
     /// `$files` / `$manifests` of the pinned snapshot (ADR 0032): manifests
     /// are read at execution, one at a time, under the session's pool.
     /// `None` when `kind` is not one of them.
@@ -259,6 +268,12 @@ struct IcebergTable {
     /// The `metadata.json` this table was read from (ADR 0058: what a
     /// worker re-opens).
     metadata_path: String,
+    /// Where `INSERT INTO` commits (ADR 0075); `None`: not writable.
+    committer: Option<Arc<dyn write::Committer>>,
+    /// Why this table cannot take an append, if it cannot.
+    unwritable: Option<String>,
+    /// `current-schema-id`, which appended files are written against.
+    schema_id: i64,
     /// A worker's fragment: only these data files (ADR 0058).
     only_files: Option<Arc<HashSet<String>>>,
 }
@@ -462,6 +477,9 @@ impl IcebergTable {
             name_mapping,
             identity,
             metadata_path: path.to_owned(),
+            committer: None,
+            unwritable: write::unwritable(meta),
+            schema_id: meta["current-schema-id"].as_i64().unwrap_or(0),
             only_files: None,
         })
     }
@@ -787,6 +805,52 @@ impl TableProvider for IcebergTable {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    /// `INSERT INTO` (ADR 0075): an append, committed through the table's
+    /// catalog. Refused before anything runs when the table cannot take
+    /// one.
+    async fn insert_into(
+        &self,
+        _state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: datafusion::logical_expr::dml::InsertOp,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion::logical_expr::dml::InsertOp;
+        let refuse = |why: &str| {
+            Err(DataFusionError::Plan(format!(
+                "cannot insert into {}: {why}",
+                self.name
+            )))
+        };
+        if insert_op != InsertOp::Append {
+            return refuse("only appends are supported (INSERT INTO, not OVERWRITE)");
+        }
+        let Some(committer) = &self.committer else {
+            return refuse("only tables served by a REST catalog accept writes");
+        };
+        if self.name.contains('@') {
+            return refuse("a snapshot or branch reference is read-only");
+        }
+        if let Some(why) = &self.unwritable {
+            return refuse(why);
+        }
+        let Some(location) = &self.location else {
+            return refuse("the table has no location");
+        };
+        let sink = write::IcebergSink {
+            name: self.name.clone(),
+            schema: Arc::new(field_ids::with_field_ids(&self.schema, &self.names)),
+            location: location.trim_end_matches('/').to_owned(),
+            scoped: self.scoped.clone(),
+            committer: committer.clone(),
+            schema_id: self.schema_id,
+        };
+        Ok(Arc::new(datafusion::datasource::sink::DataSinkExec::new(
+            input,
+            Arc::new(sink),
+            None,
+        )))
     }
 
     /// Filters that identity partitions decide are `Exact` (ADR 0055): the

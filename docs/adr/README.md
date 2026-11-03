@@ -31,7 +31,7 @@ are allowed in place.
 | [0021](0021-bearer-token-authentication.md) | Bearer-token authentication for the SQL endpoint | Accepted | 2026-10-30 | `Authorization: Bearer` mapped to a principal via SHA-256 digests in `PLIMSOLL_AUTH_TOKENS`; `user` = principal, impersonation 403; boot fails without tokens unless `PLIMSOLL_AUTH=disabled` | 0004, 0013, 0015 |
 | [0022](0022-principal-scoped-system-tables.md) | Principal-scoped system tables | Accepted | 2026-10-30 | The caller's `Viewer` rides in a per-query session config extension; `system.runtime.queries` shows own rows, all for `PLIMSOLL_AUTH_OPERATORS`, and fails closed without a viewer | 0002, 0021 |
 | [0023](0023-resource-groups.md) | Configurable resource groups bound to principals | Accepted | 2026-10-30 | Closed set of groups (`default` + `PLIMSOLL_RESOURCE_GROUPS`) with own running/queued limits; `PLIMSOLL_AUTH_GROUPS` binds principals, first = default; unknown 400, unbound 403 | 0004, 0013, 0021, 0022 |
-| [0024](0024-read-only-query-api.md) | Read-only query API | Accepted | 2026-10-30 | User SQL runs with DDL, DML (incl. `COPY`) and statements (`SET`) disabled: closes arbitrary server file read/write and shared-catalog mutation | 0002, 0004, 0013, 0021 |
+| [0024](0024-read-only-query-api.md) | Read-only query API | Accepted (amended by 0075) | 2026-10-30 | User SQL runs with DDL, DML (incl. `COPY`) and statements (`SET`) disabled: closes arbitrary server file read/write and shared-catalog mutation | 0002, 0004, 0013, 0021 |
 | [0025](0025-schema-grants.md) | Per-schema data grants | Accepted | 2026-10-30 | `PLIMSOLL_AUTH_GRANTS` lists readable schemas per principal; the engine checks every `TableScan` (subqueries, CTEs, joins) through a `TableAccess` policy before anything executes; denial is 403 | 0002, 0013, 0021, 0022, 0024 |
 | [0026](0026-shutdown-drain.md) | Shutdown drain: unadvertise, keep serving, then close | Accepted | 2026-10-30 | Readiness and serving are separate flags; SIGTERM turns `/readyz` 503 but serves queries for `PLIMSOLL_DRAIN_DELAY_MS` (5 s) before closing; ctrl-c closes at once | 0004, 0013 |
 | [0027](0027-structured-logs.md) | Structured JSON logs | Accepted | 2026-10-30 | One JSON object per line on stderr; a `query` event for every `/v1/sql` outcome with identity, code, phase timings and a SQL fingerprint (never the text); no logging crate | 0004, 0013, 0019, 0021 |
@@ -82,6 +82,7 @@ are allowed in place.
 | [0072](0072-shuffles-survive-a-lost-worker.md) | Shuffles survive a lost worker | Accepted | 2026-11-03 | A bucket whose map worker is unreachable before its schema is recomputed on another peer (`only` keeps just that bucket, fresh shuffle id); a reduce failing before its first batch is retried on the next reducer under a fresh id, every map re-running for that bucket; worker calls get a 3 s connect timeout so lost hosts fail over instead of hanging to the deadline | 0060, 0064, 0065, 0070 |
 | [0073](0073-release-shuffles-when-queries-end.md) | Release shuffles when queries end | Accepted | 2026-11-03 | An executed `RemoteReduceExec`, when dropped (query finished, failed or cancelled), sends a best-effort `release` to every worker involved; workers drop the shuffle's maps and its retry-derived ones (`id~…`), freeing memory and spill files at once; the TTL remains the backstop | 0064, 0067, 0072 |
 | [0074](0074-shuffle-maps-expire-with-their-query.md) | Shuffle maps expire with their query | Accepted | 2026-11-03 | Maps expire at the deadline the creating request carried (no fixed TTL); a sweeper drops expired maps every 5 s; released shuffle ids are remembered 10 min and bucket requests for them (or their `~` retries) are refused before opening the table | 0059, 0064, 0072, 0073 |
+| [0075](0075-insert-into-iceberg.md) | `INSERT INTO` Iceberg tables (append) | Accepted | 2026-11-03 | DML is planned but only `INSERT INTO` (append) is accepted, gated by `check_write` (deny by default; `PLIMSOLL_AUTH_WRITE_GRANTS`); the Iceberg sink writes Parquet with field ids, a v2 manifest and a manifest list carrying the parent's manifests (deflate Avro), and commits through REST `updateTable` with retry on conflict; v2, unpartitioned, flat, REST-catalog tables only | 0024, 0025, 0008, 0040, 0004 |
 
 ## Reading order
 
@@ -90,6 +91,7 @@ are allowed in place.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
 - Federation: 0005 → 0006.
 - Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074.
+- Writes: 0024 → 0075.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046.
 

@@ -1,6 +1,6 @@
 # ADR 0024 — Read-only query API
 
-- Status: Accepted
+- Status: Accepted (amended by ADR 0075: `INSERT INTO` is allowed, granted per schema)
 - Date: 2026-10-30
 - Owner: JoaoLucas2210
 - Related: ADR 0002 (operator registers tables), ADR 0004 (HTTP surface), ADR 0013 (error classes), ADR 0021/0022/0023 (identity and authorization this would have bypassed)

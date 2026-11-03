@@ -64,6 +64,17 @@ impl TableProvider for FederationFilterGuard {
         self.inner.table_type()
     }
 
+    /// Writes go straight to the source (ADR 0075): the guard is about
+    /// what reads may trust, not about writes.
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: datafusion::logical_expr::dml::InsertOp,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.inner.insert_into(state, input, insert_op).await
+    }
+
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Result<Vec<Pushdown>> {
         Ok(self
             .decide(filters)?

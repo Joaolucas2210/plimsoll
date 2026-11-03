@@ -93,11 +93,11 @@ jobs:
           s3.secret-access-key=password s3.region=us-east-1 | grep ^PLIMSOLL_ >> "$GITHUB_ENV"
 
       # Ignored tests return early without their env: fail here instead.
-      - name: live tests (Postgres, REST catalog, Iceberg on S3, pruning)
+      - name: live tests (Postgres, REST catalog, Iceberg on S3, pruning, appends)
         run: |
           test -n "$PLIMSOLL_ICEBERG_FIXTURE" && test -n "$PLIMSOLL_ICEBERG_EVENTS"
           cargo test --workspace -- --ignored \
-            pg_live_roundtrip pg_streams_in_accounted_batches live_rest_catalog reads_a_pyiceberg_table prunes_a_partitioned_pyiceberg_table
+            pg_live_roundtrip pg_streams_in_accounted_batches live_rest_catalog reads_a_pyiceberg_table prunes_a_partitioned_pyiceberg_table appends_through_the_rest_catalog
         env:
           PLIMSOLL_PG_URL: postgres://postgres:plimsoll@localhost:5432/postgres
           PLIMSOLL_CATALOG_URI: http://localhost:8181

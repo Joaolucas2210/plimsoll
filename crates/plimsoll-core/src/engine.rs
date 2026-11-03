@@ -19,7 +19,8 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::SQLOptions;
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::logical_expr::{Filter, LogicalPlan};
+use datafusion::logical_expr::dml::InsertOp;
+use datafusion::logical_expr::{Filter, LogicalPlan, WriteOp};
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use futures::StreamExt;
@@ -73,6 +74,14 @@ impl std::fmt::Debug for QueryResult {
 /// server's caller identity); the engine only asks.
 pub trait TableAccess: Send + Sync + 'static {
     fn check(&self, table: &ResolvedTableReference) -> Result<()>;
+
+    /// Whether the caller may append to `table` (`INSERT INTO`, ADR 0075).
+    /// Denied unless a policy grants it.
+    fn check_write(&self, table: &ResolvedTableReference) -> Result<()> {
+        Err(DataFusionError::External(Box::new(AccessDenied {
+            table: table.to_string(),
+        })))
+    }
 
     /// The resource group the query runs in; its memory share, if any,
     /// caps every reservation the query makes (ADR 0036).
@@ -292,13 +301,27 @@ impl Engine {
         // server files (`CREATE EXTERNAL TABLE ... LOCATION '/etc/...'`,
         // `COPY ... TO`) and mutate the catalogs every user shares; `SET`
         // would tune engine limits. Tables are registered by the operator
-        // (env, catalog), never through the query API.
-        let read_only = SQLOptions::new()
+        // (env, catalog), never through the query API. The one write is
+        // `INSERT INTO <table> ...` (append), granted per table (ADR 0075).
+        let options = SQLOptions::new()
             .with_allow_ddl(false)
-            .with_allow_dml(false)
+            .with_allow_dml(true)
             .with_allow_statements(false);
-        let df = bind(ctx.sql_with_options(sql, read_only).await?, params)?;
+        let df = bind(ctx.sql_with_options(sql, options).await?, params)?;
         let (state, plan) = df.into_parts();
+        let target = match &plan {
+            LogicalPlan::Dml(dml) if dml.op == WriteOp::Insert(InsertOp::Append) => {
+                Some(dml.table_name.clone())
+            }
+            LogicalPlan::Dml(_) | LogicalPlan::Copy(_) => {
+                return Err(DataFusionError::Plan(
+                    "only SELECT and INSERT INTO ... are allowed; the query API is otherwise \
+                     read-only"
+                        .into(),
+                ));
+            }
+            _ => None,
+        };
         // Before subquery pre-evaluation, which already executes.
         if let Some(access) = access {
             let options = state.config_options();
@@ -306,6 +329,9 @@ impl Engine {
                 &options.catalog.default_catalog,
                 &options.catalog.default_schema,
             );
+            if let Some(target) = &target {
+                access.check_write(&target.clone().resolve(catalog, schema))?;
+            }
             plan.apply_with_subqueries(|node| {
                 if let LogicalPlan::TableScan(scan) = node {
                     access.check(&scan.table_name.clone().resolve(catalog, schema))?;
@@ -355,7 +381,7 @@ impl Engine {
         let cache = self
             .result_cache
             .as_ref()
-            .filter(|_| result_cache::deterministic(&plan));
+            .filter(|_| target.is_none() && result_cache::deterministic(&plan));
         let plan = preevaluate_scalar_subqueries(&state, plan).await?;
         // Optimized once, here, so column grants see what each scan really
         // reads (projection pushdown) before anything executes (ADR 0044).
@@ -604,7 +630,12 @@ mod tests {
                 continue;
             }
             let err = result.unwrap_err().to_string();
-            assert!(err.contains("not supported"), "{sql}: {err}");
+            // DDL and statements: DataFusion's "not supported"; COPY: our
+            // own refusal, since DML must stay on for INSERT (ADR 0075).
+            assert!(
+                err.contains("not supported") || err.contains("read-only"),
+                "{sql}: {err}"
+            );
         }
         assert!(!out.exists(), "COPY must not write");
         assert!(
@@ -668,6 +699,87 @@ mod tests {
             );
         }
         assert_eq!(e.pool().used(), 0);
+    }
+
+    /// `INSERT INTO` is the one write (ADR 0075): denied unless the policy
+    /// grants it, and never a way past read grants on its source; `COPY`,
+    /// `UPDATE` and `DELETE` stay refused (ADR 0024).
+    #[tokio::test]
+    async fn inserts_need_a_write_grant_and_other_writes_stay_refused() {
+        struct Writes(&'static str);
+        impl TableAccess for Writes {
+            fn check(&self, table: &ResolvedTableReference) -> Result<()> {
+                NoGold.check(table)
+            }
+            fn check_write(&self, table: &ResolvedTableReference) -> Result<()> {
+                if table.schema.as_ref() == self.0 {
+                    return Ok(());
+                }
+                Err(DataFusionError::External(Box::new(AccessDenied {
+                    table: table.to_string(),
+                })))
+            }
+        }
+        let e = engine(64 << 20);
+        let ctx = e.context();
+        for sql in [
+            "CREATE TABLE gold.g AS SELECT 1 AS x",
+            "CREATE TABLE silver.s AS SELECT 2 AS x",
+            "CREATE TABLE bronze.b AS SELECT 3 AS x",
+        ] {
+            ctx.sql(sql).await.unwrap();
+        }
+        use datafusion::arrow::util::pretty::pretty_format_batches;
+        let denied = |err: &DataFusionError| {
+            matches!(err.find_root(), DataFusionError::External(inner)
+                if inner.downcast_ref::<AccessDenied>().is_some())
+        };
+        // No write grant on silver: denied, nothing written.
+        let none = Arc::new(NoGold);
+        let err = e
+            .sql_with("INSERT INTO silver.s VALUES (9)", &[], none)
+            .await
+            .unwrap_err();
+        assert!(denied(&err));
+        // Granted on bronze: the append runs and returns its row count.
+        let bronze = Arc::new(Writes("bronze"));
+        let out = e
+            .sql_with(
+                "INSERT INTO bronze.b SELECT x FROM silver.s",
+                &[],
+                bronze.clone(),
+            )
+            .await
+            .unwrap();
+        let count = pretty_format_batches(&out.batches).unwrap().to_string();
+        assert!(count.contains("| 1     |"), "{count}");
+        drop(out);
+        // ...but not with rows it may not read.
+        let err = e
+            .sql_with(
+                "INSERT INTO bronze.b SELECT x FROM gold.g",
+                &[],
+                bronze.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(denied(&err));
+        for sql in [
+            "COPY (SELECT 1) TO '/tmp/plimsoll-copy.csv'",
+            "DELETE FROM bronze.b",
+            "UPDATE bronze.b SET x = 0",
+            "INSERT OVERWRITE bronze.b SELECT 1",
+        ] {
+            let err = e.sql_with(sql, &[], bronze.clone()).await.unwrap_err();
+            assert!(!denied(&err), "{sql}: {err}");
+            assert!(
+                err.to_string().contains("read-only") || err.to_string().contains("not supported"),
+                "{sql}: {err}"
+            );
+        }
+        let rows = e.sql("SELECT count(*) AS n FROM bronze.b").await.unwrap();
+        let rows = pretty_format_batches(&rows.batches).unwrap().to_string();
+        assert!(rows.contains("| 2 |"), "{rows}");
     }
 
     /// A query in a capped group fails on its group's share while the

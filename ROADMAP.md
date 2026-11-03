@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] `INSERT INTO` Iceberg tables (append): v2, unpartitioned, through the REST catalog commit; write grants per schema; read by Spark and pyiceberg (ADR 0075)
 - [x] Shuffle maps expire with their query's deadline, swept every 5 s; bucket requests for released shuffles refused (ADR 0074)
 - [x] Shuffles released when queries end: workers drop a finished, failed or cancelled query's maps (and its retries') at once; the TTL is only a backstop (ADR 0073)
 - [x] Shuffles survive a lost worker: maps re-run elsewhere for one bucket, reduces retried under a fresh shuffle id, 3 s connect timeout for every worker call (ADR 0072)
@@ -107,18 +108,20 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Write path, step 1: append** — `INSERT INTO <iceberg table> SELECT …`
-writes Parquet data files under the table location and commits a new
-snapshot through the REST catalog (optimistic concurrency, retry on
-conflict). The query API is read-only today (ADR 0024); writes need
-their own grant and resource group.
+**Write path, step 2: partitioned appends and file statistics** — route
+appended rows by the partition spec's transforms (identity, bucket,
+truncate, day/hour…) into per-partition files, and write column
+statistics (value/null counts, lower/upper bounds) so every engine can
+prune the new files (ADR 0075 debt).
 
 ## Missing
 
 **Lakehouse writes** (the largest gap)
-- Append (above), then `DELETE`/`UPDATE`/`MERGE` as position deletes or
-  deletion vectors, then table maintenance: compaction, expire
-  snapshots, remove orphan files.
+- Partitioned appends and file statistics (above); appends to v3 and
+  nested columns; data files written on workers.
+- `DELETE`/`UPDATE`/`MERGE` as position deletes or deletion vectors,
+  then table maintenance: compaction, expire snapshots, remove orphan
+  files.
 - DDL: `CREATE TABLE` / schema and partition evolution through the
   catalog.
 

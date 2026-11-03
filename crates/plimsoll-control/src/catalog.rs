@@ -40,6 +40,12 @@ pub enum CatalogError {
     Status { status: u16, message: String },
     #[error("unexpected catalog response: {0}")]
     Protocol(String),
+    /// A commit's requirements no longer hold (another writer committed
+    /// first): reload and retry (ADR 0075).
+    #[error("commit conflict: {0}")]
+    CommitConflict(String),
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 /// Multi-level namespace, e.g. `["gold", "finance"]`.
@@ -111,6 +117,19 @@ pub trait Catalog: Send + Sync {
     async fn list_namespaces(&self) -> Result<Vec<Namespace>, CatalogError>;
     async fn list_tables(&self, namespace: &Namespace) -> Result<Vec<TableIdent>, CatalogError>;
     async fn load_table(&self, ident: &TableIdent) -> Result<LoadedTable, CatalogError>;
+
+    /// Commits `updates` to `ident` if `requirements` hold (the REST
+    /// `updateTable`, ADR 0075); the table as committed.
+    async fn update_table(
+        &self,
+        ident: &TableIdent,
+        _requirements: Vec<serde_json::Value>,
+        _updates: Vec<serde_json::Value>,
+    ) -> Result<LoadedTable, CatalogError> {
+        Err(CatalogError::Unsupported(format!(
+            "{ident}: this catalog does not accept commits"
+        )))
+    }
 }
 
 /// REST catalog connection settings.
