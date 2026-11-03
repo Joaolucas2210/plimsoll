@@ -12,6 +12,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -375,10 +376,20 @@ impl Reduce {
 pub enum Task {
     Scan(Fragment),
     Reduce(Reduce),
+    /// Drop every map of this shuffle, and of the shuffles derived from
+    /// it by retries (`<id>~…`): the query is over (ADR 0073).
+    Release(String),
 }
 
 impl Task {
     pub fn from_json(v: &Json) -> Result<Self, String> {
+        if let Some(r) = v.get("release") {
+            return r["shuffle"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(|s| Self::Release(s.to_owned()))
+                .ok_or_else(|| "`release.shuffle` is required".to_owned());
+        }
         if v.get("reduce").is_some() {
             Reduce::from_json(v).map(Self::Reduce)
         } else {
@@ -971,6 +982,9 @@ pub struct RemoteReduceExec {
     /// What is reduced, for display: `aggregate` or the join type.
     kind: String,
     properties: Arc<PlanProperties>,
+    /// Set once a partition runs: only then do workers hold maps to
+    /// release when this plan is dropped (ADR 0073).
+    executed: AtomicBool,
 }
 
 impl RemoteReduceExec {
@@ -992,7 +1006,55 @@ impl RemoteReduceExec {
             reduces,
             kind,
             properties,
+            executed: AtomicBool::new(false),
         }
+    }
+}
+
+/// The query is over (finished, failed or cancelled): every worker that
+/// held a map or ran a reduce of this shuffle drops its maps now, instead
+/// of at the TTL (ADR 0073). Best effort, off the dropping thread.
+impl Drop for RemoteReduceExec {
+    fn drop(&mut self) {
+        let Some((_, first)) = self.reduces.first() else {
+            return;
+        };
+        if !self.executed.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut urls: Vec<String> = self
+            .reduces
+            .iter()
+            .map(|(url, _)| url.clone())
+            .chain(first.maps.iter().map(|(url, _)| url.clone()))
+            .chain(
+                first
+                    .join
+                    .iter()
+                    .flat_map(|j| j.right.iter().map(|(u, _)| u.clone())),
+            )
+            .collect();
+        urls.sort();
+        urls.dedup();
+        let body = Bytes::from(json!({"release": {"shuffle": first.shuffle}}).to_string());
+        let workers = self.workers.clone();
+        runtime.spawn(async move {
+            let releases = urls.into_iter().map(|url| {
+                let request = workers
+                    .client
+                    .post(format!("{url}/v1/fragment"))
+                    .bearer_auth(&workers.token)
+                    .header("content-type", "application/json")
+                    .timeout(Duration::from_secs(5))
+                    .body(body.clone())
+                    .send();
+                async move { request.await.map(|r| r.status().is_success()) }
+            });
+            futures::future::join_all(releases).await;
+        });
     }
 }
 
@@ -1052,6 +1114,7 @@ impl ExecutionPlan for RemoteReduceExec {
     ) -> Result<SendableRecordBatchStream> {
         let tag = ctx.session_config().get_extension::<QueryTag>();
         let schema = self.schema.clone();
+        self.executed.store(true, Ordering::Relaxed);
         let Some((url, reduce)) = self.reduces.get(partition) else {
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 schema,
@@ -1867,6 +1930,11 @@ mod tests {
         );
         assert_eq!(split_body(b"{}\n\x01\x02"), (&b"{}"[..], &b"\x01\x02"[..]));
         assert_eq!(split_body(b"{}"), (&b"{}"[..], &b""[..]));
+        assert_eq!(
+            Task::from_json(&json!({"release": {"shuffle": "s1"}})).unwrap(),
+            Task::Release("s1".into())
+        );
+        assert!(Task::from_json(&json!({"release": {"shuffle": ""}})).is_err());
         // Without a join, every map must aggregate.
         r.maps[0].1.aggregate = None;
         assert!(Task::from_json(&r.to_json()).is_err());

@@ -157,6 +157,12 @@ pub trait QueryEngine: Send + Sync {
         Err(EngineError::Unsupported("scan fragments".into()))
     }
 
+    /// Drops this worker's maps of `shuffle` and of its retries (ADR
+    /// 0073); an empty stream. Default: not a worker.
+    async fn release(&self, _shuffle: &str) -> Result<Running, EngineError> {
+        Err(EngineError::Unsupported("shuffle releases".into()))
+    }
+
     /// A worker's shuffle reduce (ADR 0064), as a stream. `token` is the
     /// worker token it was called with, presented to its peers. Default:
     /// not a worker.
@@ -754,6 +760,32 @@ impl QueryEngine for CoreEngine {
         }
     }
 
+    async fn release(&self, shuffle: &str) -> Result<Running, EngineError> {
+        use plimsoll_core::datafusion::arrow::datatypes::Schema;
+        use plimsoll_core::datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        let derived = format!("{shuffle}~");
+        let released = {
+            let mut maps = MAPS.lock().unwrap_or_else(|e| e.into_inner());
+            let before = maps.len();
+            // Dropping a map drops its buckets: reservations shrink and
+            // spill files are deleted (ADR 0067).
+            maps.retain(|(id, _), _| id != shuffle && !id.starts_with(&derived));
+            before - maps.len()
+        };
+        if released > 0 {
+            crate::log::emit(
+                crate::log::Level::Info,
+                "shuffle_release",
+                serde_json::json!({"shuffle": shuffle, "maps": released}),
+            );
+        }
+        let schema = Arc::new(Schema::empty());
+        Ok(Running::from(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::empty(),
+        )) as SendableRecordBatchStream))
+    }
+
     async fn reduce(
         &self,
         r: Reduce,
@@ -1186,6 +1218,35 @@ mod tests {
             panic!("expected the temp directory limit");
         };
         assert!(e.contains("max_temp_directory_size"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn releasing_a_shuffle_drops_its_maps_and_its_retries() {
+        let pool = Arc::new(CeilingPool::new(1 << 20, 1 << 17).unwrap());
+        let e = CoreEngine(Arc::new(Engine::new(pool, None).unwrap()));
+        let ids = ["rel-a", "rel-a~r2", "rel-a~m1r0", "rel-ab", "rel-b"];
+        {
+            let mut maps = MAPS.lock().unwrap();
+            for id in ids {
+                maps.insert(
+                    (id.to_owned(), 0),
+                    (Instant::now() + SHUFFLE_TTL, Arc::default()),
+                );
+            }
+        }
+        e.release("rel-a").await.unwrap();
+        let left: Vec<String> = MAPS
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|(id, _)| id.clone())
+            .filter(|id| id.starts_with("rel-"))
+            .collect();
+        // Its retries go with it; a shuffle that merely shares a prefix
+        // does not.
+        let mut left = left;
+        left.sort();
+        assert_eq!(left, ["rel-ab", "rel-b"]);
     }
 
     #[tokio::test]

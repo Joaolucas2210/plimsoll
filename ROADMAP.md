@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Shuffles released when queries end: workers drop a finished, failed or cancelled query's maps (and its retries') at once; the TTL is only a backstop (ADR 0073)
 - [x] Shuffles survive a lost worker: maps re-run elsewhere for one bucket, reduces retried under a fresh shuffle id, 3 s connect timeout for every worker call (ADR 0072)
 - [x] Execution spans per operator, from DataFusion's own metrics, on the coordinator and on workers, nested in one distributed trace (ADR 0071)
 - [x] Worker discovery by DNS: `dns+http://name:port` entries re-resolved every health round; workers join and leave without restarts (ADR 0070)
@@ -105,9 +106,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Release shuffles when queries end**: the coordinator tells maps a
-shuffle is over, so a failed or retried query's buckets (ADR 0072) free
-their memory and disk at once instead of at the TTL.
+**Shuffle maps expire with their query**: expire maps at the deadline
+the coordinator sent (ADR 0059) instead of a fixed 5-minute TTL, and
+refuse bucket requests for released shuffles (ADR 0073 stragglers).
 
 ## Later
 

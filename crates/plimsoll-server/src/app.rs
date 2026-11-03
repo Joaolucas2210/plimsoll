@@ -407,7 +407,8 @@ async fn fragment(
     // A shuffle bucket request is part of a reduce that already holds a
     // slot (ADR 0064): admitting it too could leave every slot held by
     // reduces waiting on their own buckets.
-    let admit = !matches!(&task, Task::Scan(f) if f.bucket.is_some());
+    let admit =
+        !matches!(&task, Task::Scan(f) if f.bucket.is_some()) && !matches!(task, Task::Release(_));
     let slot = match tokio::time::timeout_at(deadline, async {
         match admit {
             true => st.admission.acquire(&user, group).await.map(Some),
@@ -435,10 +436,12 @@ async fn fragment(
         Task::Scan(_) => "scan",
         Task::Reduce(r) if r.join.is_some() => "join_reduce",
         Task::Reduce(_) => "aggregate_reduce",
+        Task::Release(_) => "release",
     };
     let files = match &task {
         Task::Scan(f) => f.files.len(),
         Task::Reduce(r) => r.maps.iter().map(|(_, f)| f.files.len()).sum(),
+        Task::Release(_) => 0,
     };
     let mut report = FragmentReport {
         st: shared.clone(),
@@ -457,6 +460,7 @@ async fn fragment(
     };
     let run = match task {
         Task::Scan(f) => st.engine.fragment(f, build).await,
+        Task::Release(shuffle) => st.engine.release(&shuffle).await,
         Task::Reduce(r) => {
             // Peers see the query as this worker saw it.
             let tag = query_id.map(|query_id| {
