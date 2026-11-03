@@ -236,6 +236,35 @@ fn nanos(t: SystemTime) -> String {
         .to_string()
 }
 
+/// One SERVER span for work done on behalf of another node (a worker's
+/// fragment, ADR 0059): the caller's trace continues here.
+pub fn server_span(
+    ctx: &TraceContext,
+    name: &str,
+    started: SystemTime,
+    ended: SystemTime,
+    attributes: Vec<(&str, Value)>,
+    error: Option<&str>,
+) -> Value {
+    let mut span = json!({
+        "traceId": ctx.trace_id,
+        "spanId": ctx.span_id,
+        "name": name,
+        "kind": 2,
+        "startTimeUnixNano": nanos(started),
+        "endTimeUnixNano": nanos(ended),
+        "attributes": attributes.into_iter().map(|(k, v)| attr(k, v)).collect::<Vec<_>>(),
+        "status": match error {
+            Some(m) => json!({"code": 2, "message": m}),
+            None => json!({"code": 0}),
+        },
+    });
+    if let Some(parent) = &ctx.parent_id {
+        span["parentSpanId"] = json!(parent);
+    }
+    span
+}
+
 /// The spans of one `/v1/sql` request: `query` (SERVER) and a child per
 /// phase that ran. The phases are laid back to back, ending when the request
 /// ended. ponytail: the only gap is auth and body parsing before the queue,

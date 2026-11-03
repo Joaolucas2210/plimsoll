@@ -21,6 +21,11 @@ const TOKEN: &str = "a-worker-token-for-tests";
 
 /// A worker node: the real router and engine on a loopback port.
 async fn worker() -> String {
+    worker_with(Default::default()).await.0
+}
+
+/// A worker with these resource groups; its state too, to poke at.
+async fn worker_with(groups: std::collections::HashMap<String, Limits>) -> (String, Arc<AppState>) {
     let pool = Arc::new(CeilingPool::new(256 << 20, 8 << 20).unwrap());
     let limits = Limits {
         max_running: 8,
@@ -30,7 +35,7 @@ async fn worker() -> String {
         global: limits,
         per_group: limits,
         per_user: limits,
-        groups: Default::default(),
+        groups,
     };
     let state = Arc::new(AppState {
         engine: Arc::new(CoreEngine(Arc::new(Engine::new(pool, None).unwrap()))),
@@ -49,8 +54,9 @@ async fn worker() -> String {
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
-    url
+    let served = state.clone();
+    tokio::spawn(async move { axum::serve(listener, router(served)).await.unwrap() });
+    (url, state)
 }
 
 /// A query's result as text, and the plan's text.
@@ -143,4 +149,148 @@ async fn distributed_scans_match_local_ones() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("401"), "{err}");
+}
+
+/// Step 2 (ADR 0059): admission, health and identity on workers.
+#[tokio::test]
+#[ignore = "needs PLIMSOLL_ICEBERG_MOR from scripts/spark_mor_fixture.sh"]
+async fn workers_govern_fragments_and_report_health() {
+    use std::sync::atomic::Ordering;
+    let Ok(location) = std::env::var("PLIMSOLL_ICEBERG_MOR") else {
+        return;
+    };
+    let one = Limits {
+        max_running: 1,
+        max_queued: 0,
+    };
+    let (url, state) = worker_with([("fragments".to_owned(), one)].into()).await;
+    let workers = Arc::new(Workers::new(vec![url], TOKEN.into()).unwrap());
+    let coordinator = Engine::new(
+        Arc::new(CeilingPool::new(256 << 20, 8 << 20).unwrap()),
+        None,
+    )
+    .unwrap();
+    coordinator
+        .context()
+        .state_ref()
+        .write()
+        .config_mut()
+        .set_extension(workers.clone());
+    IcebergConnector::try_new("mor", &location, &coordinator.context().state())
+        .await
+        .unwrap()
+        .register(coordinator.context())
+        .unwrap();
+    let sql = "SELECT count(*), sum(id) FROM mor";
+    let (want, plan) = run(&coordinator, sql).await;
+    assert!(plan.contains("RemoteScanExec"), "{plan}");
+    assert!(want.contains("| 32       | 768"), "{want}");
+
+    // The fragments group is full: the worker answers 429 and the query
+    // fails cleanly (retryable upstream); once free, it runs again.
+    let held = state
+        .admission
+        .acquire("someone", "fragments")
+        .await
+        .unwrap();
+    let err = coordinator.sql(sql).await.unwrap_err();
+    assert!(err.to_string().contains("429"), "{err}");
+    drop(held);
+    assert_eq!(run(&coordinator, sql).await.0, want);
+
+    // A worker that stops being ready leaves the rotation: the scan runs
+    // locally with the same answer; ready again, it comes back.
+    state.ready.store(false, Ordering::Relaxed);
+    assert_eq!(workers.check_health(Duration::from_secs(2)).await, 0);
+    let (got, plan) = run(&coordinator, sql).await;
+    assert!(!plan.contains("RemoteScanExec"), "{plan}");
+    assert_eq!(got, want);
+    state.ready.store(true, Ordering::Relaxed);
+    assert_eq!(workers.check_health(Duration::from_secs(2)).await, 1);
+    assert!(run(&coordinator, sql).await.1.contains("RemoteScanExec"));
+}
+
+/// The coordinator's query identity reaches the worker as headers.
+#[tokio::test]
+async fn fragments_carry_the_query_identity() {
+    use plimsoll_core::datafusion::arrow::array::Int64Array;
+    use plimsoll_core::datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use plimsoll_core::datafusion::arrow::ipc::writer::StreamWriter;
+    use plimsoll_core::datafusion::arrow::record_batch::RecordBatch;
+    use plimsoll_core::datafusion::physical_plan::{ExecutionPlan, collect};
+    use plimsoll_core::engine::QueryTag;
+    use tokio::sync::mpsc;
+
+    // A fake worker: records the headers, answers one row as Arrow IPC.
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let app = axum::Router::new().route(
+        "/v1/fragment",
+        axum::routing::post(move |headers: axum::http::HeaderMap| async move {
+            let get = |k: &str| headers.get(k).map(|v| v.to_str().unwrap().to_owned());
+            tx.send((
+                get("x-plimsoll-query-id"),
+                get("x-plimsoll-user"),
+                get("traceparent"),
+                get("x-plimsoll-deadline-ms"),
+                get("authorization"),
+            ))
+            .unwrap();
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![7]))])
+                    .unwrap();
+            let mut w = StreamWriter::try_new(Vec::new(), &schema).unwrap();
+            w.write(&batch).unwrap();
+            w.finish().unwrap();
+            w.into_inner().unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let workers = Arc::new(Workers::new(vec![url.clone()], TOKEN.into()).unwrap());
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let plan = Arc::new(plimsoll_connectors::remote::RemoteScanExec::new(
+        schema,
+        workers,
+        &[url],
+        "file:///t/metadata/v1.metadata.json",
+        Some(1),
+        vec!["file:///t/data/a.parquet".into()],
+        vec!["id".into()],
+    ));
+    let tag = |deadline: Duration| QueryTag {
+        query_id: 7,
+        user: "ana".into(),
+        traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
+        deadline: Some(Instant::now() + deadline),
+    };
+    let ctx = plimsoll_core::datafusion::prelude::SessionContext::new_with_config(
+        plimsoll_core::datafusion::prelude::SessionConfig::new()
+            .with_extension(Arc::new(tag(Duration::from_secs(30)))),
+    );
+    let out = collect(plan.clone() as Arc<dyn ExecutionPlan>, ctx.task_ctx())
+        .await
+        .unwrap();
+    assert_eq!(out[0].num_rows(), 1);
+    let (id, user, tp, deadline, auth) = rx.recv().await.unwrap();
+    assert_eq!(id.as_deref(), Some("7"));
+    assert_eq!(user.as_deref(), Some("ana"));
+    assert!(
+        tp.unwrap()
+            .starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-")
+    );
+    let left: u64 = deadline.unwrap().parse().unwrap();
+    assert!(left > 25_000 && left <= 30_000, "{left}");
+    assert_eq!(auth.as_deref(), Some(format!("Bearer {TOKEN}").as_str()));
+    // A deadline already gone: no request is sent at all.
+    let late = plimsoll_core::datafusion::prelude::SessionContext::new_with_config(
+        plimsoll_core::datafusion::prelude::SessionConfig::new()
+            .with_extension(Arc::new(tag(Duration::ZERO))),
+    );
+    let err = collect(plan as Arc<dyn ExecutionPlan>, late.task_ctx())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("deadline"), "{err}");
 }

@@ -76,14 +76,39 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     system::register(engine.context(), admission.registry().clone())?;
     // Coordinator (ADR 0058): Iceberg scans fan out to these workers.
     if let (false, Some(token)) = (cfg.workers.is_empty(), &cfg.worker_token) {
-        let workers =
-            plimsoll_connectors::remote::Workers::new(cfg.workers.clone(), token.clone())?;
+        let workers = Arc::new(plimsoll_connectors::remote::Workers::new(
+            cfg.workers.clone(),
+            token.clone(),
+        )?);
         engine
             .context()
             .state_ref()
             .write()
             .config_mut()
-            .set_extension(Arc::new(workers));
+            .set_extension(workers.clone());
+        // Fragments only go to workers whose /readyz answers (ADR 0059): a
+        // draining or dead worker drops out within one interval.
+        tokio::spawn(async move {
+            let mut last = workers.urls().len();
+            loop {
+                let healthy = workers
+                    .check_health(std::time::Duration::from_secs(2))
+                    .await;
+                if healthy != last {
+                    log::emit(
+                        if healthy < workers.urls().len() {
+                            Level::Warn
+                        } else {
+                            Level::Info
+                        },
+                        "workers_health",
+                        json!({ "healthy": workers.healthy_urls(), "total": workers.urls().len() }),
+                    );
+                    last = healthy;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
     }
     // Catalog first: env tables aimed at a catalog-backed schema then fail
     // fast (those schemas are read-only) instead of being silently shadowed.

@@ -103,7 +103,7 @@ HTTP streaming already gives back-pressure and cancellation (ADR 0035).
 - No new crate. reqwest gains its `stream` feature only; `Cargo.lock`
   changes by one dependency edge.
 
-**Negative (accepted, step 2 and later)**
+**Negative (accepted; ADR 0059 resolves the first three)**
 - **Workers do not run fragments under their admission control.** The
   ceiling protects them, but concurrency is not bounded per worker yet.
 - **No query id, trace context or deadline propagation to workers.**

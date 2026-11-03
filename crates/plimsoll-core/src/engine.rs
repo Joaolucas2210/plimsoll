@@ -90,6 +90,24 @@ pub trait TableAccess: Send + Sync + 'static {
     fn row_filter(&self, _table: &ResolvedTableReference) -> Option<String> {
         None
     }
+
+    /// Who and what this query is, for work it sends to other nodes
+    /// (ADR 0059): set as a session config extension for the query.
+    fn tag(&self) -> Option<QueryTag> {
+        None
+    }
+}
+
+/// A query's identity across nodes (ADR 0059): what a coordinator tells
+/// the workers running its fragments.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueryTag {
+    pub query_id: u64,
+    pub user: String,
+    /// W3C `traceparent` of the coordinator's request span (ADR 0031).
+    pub traceparent: Option<String>,
+    /// When the query's deadline passes on the coordinator.
+    pub deadline: Option<Instant>,
 }
 
 /// The caller may not read `table`. Returned (wrapped in
@@ -205,6 +223,9 @@ impl Engine {
             state = SessionStateBuilder::new_from_existing(state)
                 .with_runtime_env(runtime)
                 .build();
+        }
+        if let Some(tag) = access.tag() {
+            state.config_mut().set_extension(Arc::new(tag));
         }
         state.config_mut().set_extension(access);
         SessionContext::new_with_state(state)

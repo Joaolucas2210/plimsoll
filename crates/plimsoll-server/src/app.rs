@@ -337,23 +337,25 @@ async fn cancel_query(
     }
 }
 
-/// `POST /v1/fragment` (ADR 0058): a worker scans the data files a
+/// `POST /v1/fragment` (ADR 0058, 0059): a worker scans the data files a
 /// coordinator assigned it and streams the rows back as Arrow IPC. Only
 /// with `PLIMSOLL_WORKER_TOKEN` set, and only for a caller presenting it.
-/// A failure after the first batch aborts the body, so the coordinator's
-/// decoder sees no end-of-stream marker and fails the query (ADR 0037).
+/// The fragment holds an admission slot (group `fragments` if configured)
+/// for as long as its stream lives, honours the coordinator's remaining
+/// deadline, continues its trace and logs one `fragment` line. A failure
+/// after the first batch aborts the body, so the coordinator's decoder
+/// sees no end-of-stream marker and fails the query (ADR 0037).
 async fn fragment(
-    State(st): State<Arc<AppState>>,
+    State(shared): State<Arc<AppState>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let st = st.as_ref();
+    let st = shared.as_ref();
     let Some(expected) = st.worker_token else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let presented = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let presented = header("authorization")
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(crate::auth::token_digest);
     if presented != Some(expected) {
@@ -373,11 +375,56 @@ async fn fragment(
                 .respond(st, e, None);
         }
     };
+    let started = Instant::now();
+    let wall = std::time::SystemTime::now();
+    let user = header("x-plimsoll-user")
+        .unwrap_or("coordinator")
+        .to_owned();
+    let query_id: Option<u64> = header("x-plimsoll-query-id").and_then(|v| v.parse().ok());
+    let ctx = TraceContext::from_traceparent(header("traceparent"));
+    // The coordinator's remaining budget, never more than this node's own.
+    let budget = header("x-plimsoll-deadline-ms")
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(st.query_timeout, |ms| {
+            Duration::from_millis(ms).min(st.query_timeout)
+        });
+    let deadline = tokio::time::Instant::now() + budget;
+    let group = if st.admission.config().has_group("fragments") {
+        "fragments"
+    } else {
+        DEFAULT_GROUP
+    };
+    let slot = match tokio::time::timeout_at(deadline, st.admission.acquire(&user, group)).await {
+        Ok(Ok(slot)) => slot,
+        Ok(Err(e)) => {
+            let e = GovernedError::<EngineError>::Rejected(e);
+            return ApiError::of(&e).respond(st, &e, query_id);
+        }
+        Err(_) => {
+            let e = GovernedError::<EngineError>::TimedOut(budget);
+            return ApiError::of(&e).respond(st, &e, query_id);
+        }
+    };
+    let files = fragment.files.len();
+    let mut report = FragmentReport {
+        st: shared.clone(),
+        ctx,
+        wall,
+        started,
+        query_id,
+        user,
+        files,
+        rows: 0,
+        bytes: 0,
+        error: None,
+        _slot: slot,
+    };
     let stream = match st.engine.fragment(fragment).await {
         Ok(s) => s,
         Err(e) => {
             let e = GovernedError::Failed(e);
-            return ApiError::of(&e).respond(st, &e, None);
+            report.error = Some(e.to_string());
+            return ApiError::of(&e).respond(st, &e, query_id);
         }
     };
     let schema = stream.schema();
@@ -387,34 +434,110 @@ async fn fragment(
     ) {
         Ok(w) => w,
         Err(e) => {
+            report.error = Some(e.to_string());
             return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", false)
-                .respond(st, e, None);
+                .respond(st, e, query_id);
         }
     };
+    let state = (stream, Some(writer), report);
     let chunks =
-        futures::stream::unfold((stream, Some(writer)), |(mut stream, writer)| async move {
+        futures::stream::unfold(state, move |(mut stream, writer, mut report)| async move {
             let mut writer = writer?;
-            let fail = |e: String| Err::<Vec<u8>, _>(std::io::Error::other(e));
-            match stream.next().await {
-                Some(Ok(batch)) => match writer.write(&batch) {
-                    Ok(()) => {
-                        let bytes = std::mem::take(writer.get_mut());
-                        Some((Ok(bytes), (stream, Some(writer))))
+            let fail = |report: &mut FragmentReport, e: String| {
+                report.error = Some(e.clone());
+                Err::<Vec<u8>, _>(std::io::Error::other(e))
+            };
+            let next = match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    let e = fail(
+                        &mut report,
+                        format!("fragment exceeded its deadline of {budget:?}"),
+                    );
+                    return Some((e, (stream, None, report)));
+                }
+            };
+            let out = match next {
+                Some(Ok(batch)) => {
+                    report.rows += batch.num_rows() as u64;
+                    match writer.write(&batch) {
+                        Ok(()) => {
+                            let bytes = std::mem::take(writer.get_mut());
+                            report.bytes += bytes.len() as u64;
+                            return Some((Ok(bytes), (stream, Some(writer), report)));
+                        }
+                        Err(e) => fail(&mut report, e.to_string()),
                     }
-                    Err(e) => Some((fail(e.to_string()), (stream, None))),
-                },
-                Some(Err(e)) => Some((fail(e.to_string()), (stream, None))),
+                }
+                Some(Err(e)) => fail(&mut report, e.to_string()),
                 None => match writer.finish() {
-                    Ok(()) => Some((Ok(std::mem::take(writer.get_mut())), (stream, None))),
-                    Err(e) => Some((fail(e.to_string()), (stream, None))),
+                    Ok(()) => Ok(std::mem::take(writer.get_mut())),
+                    Err(e) => fail(&mut report, e.to_string()),
                 },
-            }
+            };
+            Some((out, (stream, None, report)))
         });
     (
         [(header::CONTENT_TYPE, "application/vnd.apache.arrow.stream")],
         axum::body::Body::from_stream(chunks),
     )
         .into_response()
+}
+
+/// Lives as long as a fragment's stream: holds its admission slot, and on
+/// drop (end, error or the coordinator going away) logs the `fragment`
+/// line and exports its span (ADR 0059).
+struct FragmentReport {
+    st: Arc<AppState>,
+    ctx: TraceContext,
+    wall: std::time::SystemTime,
+    started: Instant,
+    query_id: Option<u64>,
+    user: String,
+    files: usize,
+    rows: u64,
+    bytes: u64,
+    error: Option<String>,
+    _slot: plimsoll_control::governance::AdmissionSlot,
+}
+
+impl Drop for FragmentReport {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        let level = if self.error.is_some() {
+            Level::Warn
+        } else {
+            Level::Info
+        };
+        crate::log::emit(
+            level,
+            "fragment",
+            json!({
+                "query_id": self.query_id,
+                "user": self.user,
+                "trace_id": self.ctx.trace_id,
+                "files": self.files,
+                "rows": self.rows,
+                "bytes": self.bytes,
+                "error": self.error,
+                "total_ms": (elapsed.as_micros() as f64) / 1e3,
+            }),
+        );
+        if let (Some(tracer), true) = (&self.st.tracer, self.ctx.sampled) {
+            tracer.record(vec![trace::server_span(
+                &self.ctx,
+                "fragment",
+                self.wall,
+                self.wall + elapsed,
+                vec![
+                    ("plimsoll.query_id", json!(self.query_id)),
+                    ("plimsoll.files", json!(self.files)),
+                    ("plimsoll.rows", json!(self.rows)),
+                ],
+                self.error.as_deref(),
+            )]);
+        }
+    }
 }
 
 /// `/v1/sql`: runs the request and writes one structured `query` log line
@@ -430,6 +553,7 @@ async fn sql(
         TraceContext::from_traceparent(headers.get("traceparent").and_then(|v| v.to_str().ok()));
     let mut log = QueryLog {
         trace_id: Some(ctx.trace_id.clone()),
+        traceparent: Some(ctx.traceparent()),
         ..Default::default()
     };
     let mut response = run_sql(&st, &headers, body, &mut log).await;
@@ -602,6 +726,10 @@ async fn stream_sql(
                         u64::try_from(queued.as_micros()).unwrap_or(u64::MAX),
                         Ordering::Relaxed,
                     );
+                    let mut viewer = viewer;
+                    if let Some(tag) = &mut viewer.tag {
+                        tag.query_id = id;
+                    }
                     async move {
                         engine
                             .engine
@@ -834,6 +962,14 @@ async fn run_sql(
     };
     let mut viewer = st.auth.viewer(&request.user);
     viewer.group = Some(request.resource_group.clone());
+    // What this query's fragments tell workers (ADR 0059); the id is set
+    // once admission assigns it.
+    viewer.tag = Some(plimsoll_core::engine::QueryTag {
+        query_id: 0,
+        user: request.user.clone(),
+        traceparent: log.traceparent.clone(),
+        deadline: Some(Instant::now() + st.query_timeout),
+    });
     match req.format.as_deref() {
         None | Some("json") => {}
         Some("ndjson") => {
@@ -883,6 +1019,10 @@ async fn run_sql(
                 u64::try_from(queued.as_micros()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
+            let mut viewer = viewer;
+            if let Some(tag) = &mut viewer.tag {
+                tag.query_id = id;
+            }
             st.engine.execute(&sql_text, &params, viewer)
         })
         .await;

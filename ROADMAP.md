@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Coordinator/worker step 2: fragments under worker admission (`fragments` group), deadline, query id/user/trace propagated, worker health with local fallback (ADR 0059)
 - [x] Coordinator/worker step 1: Iceberg scans fan out to workers as file fragments over HTTP + Arrow IPC, deletes applied on workers, same answers (ADR 0058)
 - [x] Slow-query log: `PLIMSOLL_SLOW_QUERY_MS`, a `slow_query` line with timings, reads and planning events (ADR 0057)
 - [x] Planning spans in traces: `catalog.load_table` and `iceberg.plan` (files/manifests/deletes) under `planning` (ADR 0056)
@@ -91,11 +92,10 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Coordinator/worker step 2 — governance on workers**: run fragments
-under the worker's admission (a `fragments` resource group with its own
-limits and memory share), propagate the query id, trace context and
-deadline to workers, and report worker health (`/readyz` fan-out) so a
-coordinator skips draining workers.
+**Coordinator/worker step 3 — balanced, resilient fragments**: assign files
+by bytes (manifest `file_size_in_bytes`) instead of count, and retry a
+fragment once on another healthy worker when its request fails before the
+first batch (no rows emitted yet, so a retry cannot duplicate rows).
 
 ## Later
 

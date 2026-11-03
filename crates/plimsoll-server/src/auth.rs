@@ -323,6 +323,7 @@ impl Auth {
                 group: None,
                 denied_columns: None,
                 row_filters: None,
+                tag: None,
             };
         };
         Viewer {
@@ -333,6 +334,7 @@ impl Auth {
             group: None,
             denied_columns: column_deny.get(principal).cloned(),
             row_filters: row_filters.get(principal).cloned(),
+            tag: None,
         }
     }
 
@@ -370,11 +372,17 @@ pub struct Viewer {
     pub denied_columns: Option<Arc<HashSet<String>>>,
     /// `schema.table` -> predicate on every row it reads (ADR 0045).
     pub row_filters: Option<Arc<HashMap<String, String>>>,
+    /// The query's identity for its fragments on workers (ADR 0059).
+    pub tag: Option<plimsoll_core::engine::QueryTag>,
 }
 
 impl TableAccess for Viewer {
     fn resource_group(&self) -> Option<&str> {
         self.group.as_deref()
+    }
+
+    fn tag(&self) -> Option<plimsoll_core::engine::QueryTag> {
+        self.tag.clone()
     }
 
     fn row_filter(&self, table: &ResolvedTableReference) -> Option<String> {

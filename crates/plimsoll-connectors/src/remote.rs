@@ -12,6 +12,8 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use datafusion::arrow::array::RecordBatch;
@@ -27,6 +29,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 use futures::stream::{self, BoxStream, StreamExt};
+use plimsoll_core::engine::QueryTag;
 use serde_json::{Value as Json, json};
 
 /// Worker endpoints and the shared secret they accept, set as a session
@@ -36,6 +39,8 @@ pub struct Workers {
     urls: Vec<String>,
     token: String,
     client: reqwest::Client,
+    /// Per URL: last health check passed (ADR 0059). Starts healthy.
+    healthy: Arc<Vec<AtomicBool>>,
 }
 
 impl fmt::Debug for Workers {
@@ -47,6 +52,7 @@ impl fmt::Debug for Workers {
 
 impl Workers {
     pub fn new(urls: Vec<String>, token: String) -> Result<Self, reqwest::Error> {
+        let healthy = Arc::new(urls.iter().map(|_| AtomicBool::new(true)).collect());
         Ok(Self {
             urls: urls
                 .into_iter()
@@ -54,11 +60,40 @@ impl Workers {
                 .collect(),
             token,
             client: reqwest::Client::builder().build()?,
+            healthy,
         })
     }
 
     pub fn urls(&self) -> &[String] {
         &self.urls
+    }
+
+    /// Workers whose last `/readyz` answered 200: the ones fragments go
+    /// to. A draining or dead worker drops out until it answers again.
+    pub fn healthy_urls(&self) -> Vec<String> {
+        self.urls
+            .iter()
+            .zip(self.healthy.iter())
+            .filter(|(_, h)| h.load(Ordering::Relaxed))
+            .map(|(u, _)| u.clone())
+            .collect()
+    }
+
+    /// One round of health checks; returns how many workers are healthy.
+    pub async fn check_health(&self, timeout: Duration) -> usize {
+        let checks = self.urls.iter().map(|url| {
+            let request = self
+                .client
+                .get(format!("{url}/readyz"))
+                .timeout(timeout)
+                .send();
+            async move { request.await.is_ok_and(|r| r.status().is_success()) }
+        });
+        let results = futures::future::join_all(checks).await;
+        for (flag, ok) in self.healthy.iter().zip(&results) {
+            flag.store(*ok, Ordering::Relaxed);
+        }
+        results.iter().filter(|ok| **ok).count()
     }
 }
 
@@ -123,18 +158,18 @@ impl RemoteScanExec {
     pub fn new(
         schema: SchemaRef,
         workers: Arc<Workers>,
+        urls: &[String],
         metadata_location: &str,
         snapshot_id: Option<i64>,
         files: Vec<String>,
         columns: Vec<String>,
     ) -> Self {
-        let n = workers.urls.len().max(1);
+        let n = urls.len().max(1);
         let mut split: Vec<Vec<String>> = vec![Vec::new(); n];
         for (i, f) in files.into_iter().enumerate() {
             split[i % n].push(f);
         }
-        let fragments: Vec<(String, Fragment)> = workers
-            .urls
+        let fragments: Vec<(String, Fragment)> = urls
             .iter()
             .zip(split)
             .filter(|(_, files)| !files.is_empty())
@@ -208,8 +243,9 @@ impl ExecutionPlan for RemoteScanExec {
     fn execute(
         &self,
         partition: usize,
-        _ctx: Arc<TaskContext>,
+        ctx: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let tag = ctx.session_config().get_extension::<QueryTag>();
         let schema = self.schema.clone();
         let Some((url, fragment)) = self.fragments.get(partition).cloned() else {
             // No files at all: an empty partition.
@@ -219,7 +255,7 @@ impl ExecutionPlan for RemoteScanExec {
             )));
         };
         let workers = self.workers.clone();
-        let body = stream::once(open(workers, url, fragment))
+        let body = stream::once(open(workers, url, fragment, tag))
             .flat_map(|r| match r {
                 Ok(s) => s,
                 Err(e) => stream::iter([Err(e)]).boxed(),
@@ -237,13 +273,33 @@ async fn open(
     workers: Arc<Workers>,
     url: String,
     fragment: Fragment,
+    tag: Option<Arc<QueryTag>>,
 ) -> Result<BoxStream<'static, Result<Bytes>>> {
     let external = |m: String| DataFusionError::External(m.into());
-    let response = workers
+    let mut request = workers
         .client
         .post(format!("{url}/v1/fragment"))
         .bearer_auth(&workers.token)
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+    // The query's identity, trace and remaining time (ADR 0059).
+    if let Some(tag) = tag {
+        request = request
+            .header("x-plimsoll-query-id", tag.query_id.to_string())
+            .header("x-plimsoll-user", tag.user.as_str());
+        if let Some(tp) = &tag.traceparent {
+            request = request.header("traceparent", tp.as_str());
+        }
+        if let Some(deadline) = tag.deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(external(
+                    "query deadline passed before a fragment was sent".into(),
+                ));
+            }
+            request = request.header("x-plimsoll-deadline-ms", left.as_millis().to_string());
+        }
+    }
+    let response = request
         .body(fragment.to_json().to_string())
         .send()
         .await

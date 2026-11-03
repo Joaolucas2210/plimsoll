@@ -66,6 +66,7 @@ are allowed in place.
 | [0056](0056-planning-spans.md) | Planning spans in traces | Accepted | 2026-11-02 | A `tokio::task_local` collector in core (`plan_trace::{collect, record}`) gathers events from inside DataFusion planning (catalog `loadTable`, Iceberg planning with file/manifest/delete counts); exported as children of the `planning` span at their real times | 0031, 0027 |
 | [0057](0057-slow-query-log.md) | Slow-query log | Accepted | 2026-11-02 | `PLIMSOLL_SLOW_QUERY_MS` (off by default): queries at least that long emit a `slow_query` warn line with the query line's fields plus every planning event and its attributes; same no-SQL rule | 0027, 0046, 0056 |
 | [0058](0058-scan-fragments-on-workers.md) | Coordinator/worker step 1: scan fragments | Accepted | 2026-11-02 | A coordinator (`PLIMSOLL_WORKERS`) splits an Iceberg scan's kept files into fragments; workers (`PLIMSOLL_WORKER_TOKEN`) re-open the table at the snapshot, re-plan deletes for their files and stream Arrow IPC from `/v1/fragment`; `RemoteScanExec` decodes incrementally and fails on truncated streams; vended-credential tables stay local | 0002, 0035, 0037, 0007 |
+| [0059](0059-worker-governance.md) | Coordinator/worker step 2: governance on workers | Accepted | 2026-11-02 | A `QueryTag` (query id, user, traceparent, deadline) rides the session config to `RemoteScanExec`, which sends it as headers; workers admit fragments in a `fragments` group (429 when full), enforce min(remaining, own timeout), hold the slot for the stream's life, log `fragment` and continue the trace; coordinators health-check `/readyz` and fall back to local scans | 0021, 0023, 0031, 0058 |
 
 ## Reading order
 
@@ -73,7 +74,7 @@ are allowed in place.
 - Shape of the system: 0001, 0002, 0004.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
 - Federation: 0005 → 0006.
-- Distribution: 0002 → 0058.
+- Distribution: 0002 → 0058 → 0059.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046.
 

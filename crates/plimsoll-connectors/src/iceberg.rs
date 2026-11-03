@@ -878,17 +878,19 @@ impl TableProvider for IcebergTable {
         // into fragments, one per worker, each re-planned (deletes
         // included) and scanned there. Tables read with vended credentials
         // stay local: those credentials are not sent over the wire.
+        // Only healthy workers get fragments (ADR 0059); none healthy
+        // means the scan runs here, as on a single node.
         let workers = state
             .config()
             .get_extension::<crate::remote::Workers>()
-            .filter(|w| {
-                !w.urls().is_empty()
-                    && self.scoped.is_none()
-                    && self.only_files.is_none()
-                    && !files.is_empty()
-            });
+            .filter(|_| self.scoped.is_none() && self.only_files.is_none() && !files.is_empty())
+            .map(|w| {
+                let urls = w.healthy_urls();
+                (w, urls)
+            })
+            .filter(|(_, urls)| !urls.is_empty());
         let input: Arc<dyn ExecutionPlan> = match workers {
-            Some(workers) => {
+            Some((workers, urls)) => {
                 let schema = match projection {
                     Some(p) => Arc::new(self.schema.project(p)?),
                     None => self.schema.clone(),
@@ -898,6 +900,7 @@ impl TableProvider for IcebergTable {
                 Arc::new(crate::remote::RemoteScanExec::new(
                     schema,
                     workers,
+                    &urls,
                     &self.metadata_path,
                     self.snapshot_id,
                     paths,
