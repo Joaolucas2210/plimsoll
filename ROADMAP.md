@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] `UPDATE … SET … WHERE`: position deletes plus rewritten rows (partition moves included) in one `overwrite` snapshot; subqueries in SET refused (ADR 0081)
 - [x] Orphan file removal: `POST /v1/maintenance/remove-orphans` (dry run, ≥1 hour window) deletes unreferenced files under the table location (ADR 0080)
 - [x] Snapshot expiration: `POST /v1/maintenance/expire-snapshots` drops old snapshots (branch and tag heads and the last N kept) through the catalog, then deletes files only they reached (ADR 0079)
 - [x] Compaction: `POST /v1/maintenance/compact` rewrites small files and files carrying deletes into a `replace` snapshot; manifests rewritten with explicit sequence numbers; read by Spark and pyiceberg, time travel intact (ADR 0078)
@@ -113,17 +114,17 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Write path: `UPDATE … SET … WHERE`** — the rows a `DELETE` would find
-(ADR 0077), rewritten with the new values and appended, as one
-`overwrite` snapshot (position deletes plus data files), so updates are
-atomic; then `MERGE INTO` on the same machinery.
+**Write path: `MERGE INTO`** — matched source rows update or delete
+target rows, unmatched ones are inserted, in one `overwrite` snapshot on
+the `UPDATE` machinery (ADR 0081), with the source query governed like
+any read.
 
 ## Missing
 
 **Lakehouse writes** (the largest gap)
 - Appends to v3 and nested columns; decimal partition values; data
   files written on workers; vectorized partition transforms.
-- `UPDATE` (above) and `MERGE`; deletion vectors for v3 tables;
+- `MERGE` (above); deletion vectors for v3 tables;
   deletes across partition spec evolution.
 - Scheduled maintenance (compaction, expiration, orphans) by policy
   instead of on demand.

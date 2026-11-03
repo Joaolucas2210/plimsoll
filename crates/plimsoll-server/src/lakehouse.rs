@@ -582,6 +582,36 @@ mod tests {
             .map(|s| s["summary"]["operation"].as_str().unwrap())
             .collect();
         assert_eq!(ops, ["append", "append", "delete", "append"]);
+        // UPDATE (ADR 0081): a row moved to another partition, in one
+        // overwrite snapshot; filters on either side see it right.
+        assert!(
+            deleted(format!("UPDATE {p} SET region = 'us' WHERE id = 1"))
+                .await
+                .contains("| 1 ")
+        );
+        let us = text(&format!(
+            "SELECT id FROM {p} WHERE region = 'us' ORDER BY id"
+        ))
+        .await;
+        assert!(us.contains("| 1  |") && us.contains("| 3  |"), "{us}");
+        let eu = text(&format!(
+            "SELECT id FROM {p} WHERE region = 'eu' ORDER BY id"
+        ))
+        .await;
+        assert!(!eu.contains("| 1  |") && eu.contains("| 11 |"), "{eu}");
+        let meta = catalog
+            .load_table(&TableIdent::new(Namespace::new(&["bronze"]), &parted))
+            .await
+            .unwrap()
+            .metadata;
+        let last = meta["snapshots"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(last["summary"]["operation"], "overwrite");
+        assert_eq!(last["summary"]["added-position-deletes"], "1");
         // Compaction (ADR 0078): the partition with deletes, and the one
         // with small files, rewritten; the rows unchanged; the position
         // deletes gone with the files they referenced.

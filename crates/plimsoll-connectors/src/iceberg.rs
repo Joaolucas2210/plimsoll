@@ -289,6 +289,19 @@ impl Connector for IcebergConnector {
     }
 }
 
+/// `e` with its columns unqualified: DML expressions name the table's own
+/// columns (ADR 0077, 0081).
+fn unqualified(e: Expr) -> Result<Expr> {
+    use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+    e.transform(|e| match e {
+        Expr::Column(c) => Ok(Transformed::yes(Expr::Column(
+            datafusion::common::Column::new_unqualified(c.name),
+        ))),
+        e => Ok(Transformed::no(e)),
+    })
+    .data()
+}
+
 /// What a compaction did (ADR 0078).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Compaction {
@@ -905,72 +918,49 @@ impl TableProvider for IcebergTable {
         )))
     }
 
-    /// `DELETE FROM t WHERE …` (ADR 0077): the WHERE predicate prunes the
-    /// data files like a scan's; each remaining file is read in file
-    /// order, and the positions of matching rows are committed as position
-    /// delete files. Refused before anything runs when the table cannot
-    /// take a write.
+    /// `DELETE FROM t WHERE …` (ADR 0077): the positions of the matching
+    /// rows are committed as position delete files. Refused before
+    /// anything runs when the table cannot take a write.
     async fn delete_from(
         &self,
         state: &dyn Session,
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
-        let sink = self.writable("delete from")?;
-        // Against the table's own columns, unqualified.
-        let filters = filters
-            .into_iter()
-            .map(|f| {
-                f.transform(|e| match e {
-                    Expr::Column(c) => Ok(Transformed::yes(Expr::Column(
-                        datafusion::common::Column::new_unqualified(c.name),
-                    ))),
-                    e => Ok(Transformed::no(e)),
-                })
-                .data()
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let predicate = match conjunction(filters.clone()) {
-            Some(e) => {
-                let schema = DFSchema::try_from(self.schema.as_ref().clone())?;
-                state.create_physical_expr(e, &schema)?
-            }
-            None => datafusion::physical_expr::expressions::lit(true),
-        };
-        self.register_scoped(state);
-        let pruner = Pruner::new(&filters, &self.columns);
-        let (files, _, _) = self.data_files(state, &pruner).await?;
-        let mut targets = Vec::with_capacity(files.len());
-        for file in files {
-            if file.spec != sink.layout.spec_id() {
+        let (exec, _) = self.row_change("delete from", state, filters).await?;
+        Ok(Arc::new(exec))
+    }
+
+    /// `UPDATE t SET … WHERE …` (ADR 0081): the rows a `DELETE` with the
+    /// same WHERE would remove are deleted by position and written back
+    /// with their new values, in one `overwrite` snapshot.
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let (exec, schema) = self.row_change("update", state, filters).await?;
+        let mut set: HashMap<String, Expr> = HashMap::new();
+        for (column, expr) in assignments {
+            if self.schema.field_with_name(&column).is_err() {
                 return Err(DataFusionError::Plan(format!(
-                    "cannot delete from {}: files written under an older partition spec are \
-                     not supported yet",
+                    "cannot update {}: no column {column}",
                     self.name
                 )));
             }
-            // Every row, in order: no selection, no pushed predicate.
-            let whole = DataFile {
-                path: file.path.clone(),
-                size: file.size,
-                rows: file.rows,
-                seq: file.seq,
-                selection: None,
-                spec: file.spec,
-                partition: None,
-                eq: Vec::new(),
-            };
-            let plan = self.parquet_scan(state, &[&whole], None, &[], None).await?;
-            targets.push(write::Target {
-                path: file.path,
-                partition: prune::partition_values(file.partition.as_ref()),
-                selection: file.selection,
-                plan,
-            });
+            set.insert(column, unqualified(expr)?);
         }
-        Ok(Arc::new(write::IcebergDeleteExec::new(
-            sink, targets, predicate,
-        )))
+        let row = self
+            .schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, field)| match set.remove(field.name()) {
+                Some(expr) => state.create_physical_expr(expr, &schema),
+                None => Ok(Arc::new(Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(exec.with_update(row)))
     }
 
     /// Filters that identity partitions decide are `Exact` (ADR 0055): the
@@ -1375,6 +1365,63 @@ impl IcebergTable {
 }
 
 impl IcebergTable {
+    /// The rows of a `DELETE` or `UPDATE` (ADR 0077, 0081): the WHERE
+    /// prunes the data files like a scan's, and each remaining file is
+    /// planned whole, in file order (no row selection, no pushed
+    /// predicate), so a running count is each row's position. Also the
+    /// table's schema, for expressions over a row.
+    async fn row_change(
+        &self,
+        verb: &str,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> Result<(write::IcebergDeleteExec, DFSchema)> {
+        let sink = self.writable(verb)?;
+        let filters = filters
+            .into_iter()
+            .map(unqualified)
+            .collect::<Result<Vec<_>>>()?;
+        let schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        let predicate = match conjunction(filters.clone()) {
+            Some(e) => state.create_physical_expr(e, &schema)?,
+            None => datafusion::physical_expr::expressions::lit(true),
+        };
+        self.register_scoped(state);
+        let pruner = Pruner::new(&filters, &self.columns);
+        let (files, _, _) = self.data_files(state, &pruner).await?;
+        let mut targets = Vec::with_capacity(files.len());
+        for file in files {
+            if file.spec != sink.layout.spec_id() {
+                return Err(DataFusionError::Plan(format!(
+                    "cannot {verb} {}: files written under an older partition spec are not \
+                     supported yet",
+                    self.name
+                )));
+            }
+            let whole = DataFile {
+                path: file.path.clone(),
+                size: file.size,
+                rows: file.rows,
+                seq: file.seq,
+                selection: None,
+                spec: file.spec,
+                partition: None,
+                eq: Vec::new(),
+            };
+            let plan = self.parquet_scan(state, &[&whole], None, &[], None).await?;
+            targets.push(write::Target {
+                path: file.path,
+                partition: prune::partition_values(file.partition.as_ref()),
+                selection: file.selection,
+                plan,
+            });
+        }
+        Ok((
+            write::IcebergDeleteExec::new(sink, targets, predicate),
+            schema,
+        ))
+    }
+
     /// See [`IcebergConnector::compact`]. A partition is rewritten when it
     /// has a file carrying deletes (position, deletion vector or
     /// equality), or two small files; its other files stay.

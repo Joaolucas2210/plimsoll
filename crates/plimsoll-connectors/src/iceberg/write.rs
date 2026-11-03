@@ -262,6 +262,8 @@ struct Written {
     stats: Vec<(i64, Option<Prim>, ColumnStats)>,
     /// A position delete file's one data file (ADR 0077).
     referenced: Option<String>,
+    /// 0: data file; 1: position delete file.
+    content: i32,
 }
 
 /// What a commit adds.
@@ -274,16 +276,9 @@ pub(super) enum Change {
     /// Data files replacing others with the same live rows (compaction,
     /// ADR 0078).
     Replace,
-}
-
-impl Change {
-    /// Manifest and data file `content`: 0 data, 1 position deletes.
-    fn content(self) -> i32 {
-        match self {
-            Self::Append | Self::Replace => 0,
-            Self::Delete => 1,
-        }
-    }
+    /// Position deletes for changed rows plus data files with their new
+    /// values (`UPDATE`, ADR 0081).
+    Overwrite,
 }
 
 /// A unique-enough id for files and snapshots: time, process and a counter.
@@ -576,6 +571,7 @@ impl IcebergSink {
                 .map(|((id, prim), s)| (*id, *prim, s))
                 .collect(),
             referenced: None,
+            content: 0,
         })
     }
 
@@ -608,19 +604,36 @@ impl IcebergSink {
         // Positive, as Java writers make them.
         let snapshot_id = (unique() >> 1) as i64;
         let meta = self.committer.current().await.map_err(failed)?;
-        let manifest_path = format!("{}/metadata/{snapshot_id:x}-m0.avro", self.location);
-        let manifest = manifest(
-            &meta,
-            &self.layout,
-            files,
-            snapshot_id,
-            self.schema_id,
-            change,
-        )
-        .map_err(|e| failed(format!("manifest: {e}")))?;
-        let manifest_length = manifest.len() as i64;
-        self.put_bytes(&manifest_path, manifest, env).await?;
-        let added_rows: u64 = files.iter().map(|f| f.rows).sum();
+        // One manifest per content: data files, then position deletes.
+        let mut manifests = Vec::new();
+        for content in [0, 1] {
+            let group: Vec<&Written> = files.iter().filter(|f| f.content == content).collect();
+            if group.is_empty() {
+                continue;
+            }
+            let path = format!("{}/metadata/{snapshot_id:x}-m{content}.avro", self.location);
+            let bytes = manifest(
+                &meta,
+                &self.layout,
+                &group,
+                snapshot_id,
+                self.schema_id,
+                content,
+            )
+            .map_err(|e| failed(format!("manifest: {e}")))?;
+            let length = bytes.len() as i64;
+            self.put_bytes(&path, bytes, env).await?;
+            manifests.push((content, path, length, group));
+        }
+        let rows_of = |content: i32| -> u64 {
+            files
+                .iter()
+                .filter(|f| f.content == content)
+                .map(|f| f.rows)
+                .sum()
+        };
+        let files_of = |content: i32| files.iter().filter(|f| f.content == content).count();
+        let added_rows = rows_of(0);
         let mut meta = meta;
         for attempt in 0..COMMIT_ATTEMPTS {
             if attempt > 0 {
@@ -710,19 +723,22 @@ impl IcebergSink {
                     ));
                 }
             }
-            let new_entry = ManifestFile {
-                path: manifest_path.clone(),
-                length: manifest_length,
-                spec_id: self.layout.spec_id,
-                sequence,
-                snapshot_id,
-                files: files.len() as i64,
-                rows: added_rows as i64,
-                partitions: summaries(&self.layout, files),
-                content: change.content(),
-            };
+            let new_entries: Vec<ManifestFile> = manifests
+                .iter()
+                .map(|(content, path, length, group)| ManifestFile {
+                    path: path.clone(),
+                    length: *length,
+                    spec_id: self.layout.spec_id,
+                    sequence,
+                    snapshot_id,
+                    files: group.len() as i64,
+                    rows: group.iter().map(|f| f.rows as i64).sum(),
+                    partitions: summaries(&self.layout, group),
+                    content: *content,
+                })
+                .collect();
             let list = manifest_list(
-                &new_entry,
+                &new_entries,
                 parent_list.as_deref(),
                 snapshot_id,
                 parent,
@@ -737,31 +753,30 @@ impl IcebergSink {
             );
             self.put_bytes(&list_path, list, env).await?;
             let size = files.iter().map(|f| f.bytes).sum::<u64>().to_string();
-            let mut summary = match change {
-                Change::Append => json!({
-                    "operation": "append",
-                    "added-data-files": files.len().to_string(),
-                    "added-records": added_rows.to_string(),
-                    "added-files-size": size,
-                }),
-                Change::Delete => json!({
-                    "operation": "delete",
-                    "added-delete-files": files.len().to_string(),
-                    "added-position-delete-files": files.len().to_string(),
-                    "added-position-deletes": added_rows.to_string(),
-                    "added-files-size": size,
-                }),
-                Change::Replace => json!({
-                    "operation": "replace",
-                    "added-data-files": files.len().to_string(),
-                    "added-records": added_rows.to_string(),
-                    "added-files-size": size,
-                    "deleted-data-files": gone.data_paths.len().to_string(),
-                    "deleted-records": gone.data_rows.to_string(),
-                    "removed-delete-files": gone.delete_files.to_string(),
-                    "removed-position-deletes": gone.delete_rows.to_string(),
-                }),
-            };
+            let mut summary = json!({
+                "operation": match change {
+                    Change::Append => "append",
+                    Change::Delete => "delete",
+                    Change::Replace => "replace",
+                    Change::Overwrite => "overwrite",
+                },
+                "added-files-size": size,
+            });
+            if files_of(0) > 0 {
+                summary["added-data-files"] = json!(files_of(0).to_string());
+                summary["added-records"] = json!(added_rows.to_string());
+            }
+            if files_of(1) > 0 {
+                summary["added-delete-files"] = json!(files_of(1).to_string());
+                summary["added-position-delete-files"] = json!(files_of(1).to_string());
+                summary["added-position-deletes"] = json!(rows_of(1).to_string());
+            }
+            if change == Change::Replace {
+                summary["deleted-data-files"] = json!(gone.data_paths.len().to_string());
+                summary["deleted-records"] = json!(gone.data_rows.to_string());
+                summary["removed-delete-files"] = json!(gone.delete_files.to_string());
+                summary["removed-position-deletes"] = json!(gone.delete_rows.to_string());
+            }
             summary["engine-name"] = json!("plimsoll");
             summary["changed-partition-count"] = json!(
                 files
@@ -827,6 +842,9 @@ pub(super) struct IcebergDeleteExec {
     pub(super) sink: Arc<IcebergSink>,
     pub(super) targets: Arc<Vec<Target>>,
     pub(super) predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+    /// `UPDATE` (ADR 0081): each table column of a changed row, as its
+    /// new value (`SET`) or itself. `None`: a `DELETE`.
+    update: Option<Arc<Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>>>>,
     properties: Arc<datafusion::physical_plan::PlanProperties>,
 }
 
@@ -847,8 +865,19 @@ impl IcebergDeleteExec {
             sink: Arc::new(sink),
             targets: Arc::new(targets),
             predicate,
+            update: None,
             properties,
         }
+    }
+
+    /// An `UPDATE` instead: matching rows are rewritten as `row` computes
+    /// them, besides being deleted (ADR 0081).
+    pub(super) fn with_update(
+        mut self,
+        row: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
+    ) -> Self {
+        self.update = Some(Arc::new(row));
+        self
     }
 }
 
@@ -872,7 +901,12 @@ impl DisplayAs for IcebergDeleteExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "IcebergDelete[{}] files={} predicate={}",
+            "{}[{}] files={} predicate={}",
+            if self.update.is_some() {
+                "IcebergUpdate"
+            } else {
+                "IcebergDelete"
+            },
             self.sink.name,
             self.targets.len(),
             self.predicate
@@ -914,13 +948,21 @@ impl datafusion::physical_plan::ExecutionPlan for IcebergDeleteExec {
         _partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let (sink, targets, predicate) = (
+        let (sink, targets, predicate, update) = (
             self.sink.clone(),
             self.targets.clone(),
             self.predicate.clone(),
+            self.update.clone(),
         );
         let run = async move {
-            let deleted = sink.delete(&targets, &predicate, &context).await?;
+            let deleted = sink
+                .delete(
+                    &targets,
+                    &predicate,
+                    update.as_deref().map(Vec::as_slice),
+                    &context,
+                )
+                .await?;
             Ok(RecordBatch::try_new(
                 count_schema(),
                 vec![Arc::new(datafusion::arrow::array::UInt64Array::from(vec![
@@ -974,12 +1016,19 @@ impl IcebergSink {
         &self,
         targets: &[Target],
         predicate: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        update: Option<&[Arc<dyn datafusion::physical_expr::PhysicalExpr>]>,
         context: &Arc<TaskContext>,
     ) -> Result<u64> {
-        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::array::{AsArray, BooleanArray};
         let env = context.runtime_env();
         let run = unique();
         let mut written = Vec::new();
+        // UPDATE: the changed rows' new values, reserved until written.
+        // ponytail: buffered whole; stream them into the writer if updates
+        // of more rows than the pool holds matter.
+        let mut changed = Vec::new();
+        let memory = MemoryConsumer::new(format!("IcebergUpdate[{}]", self.name))
+            .register(context.memory_pool());
         for target in targets {
             let kept = target.selection.as_ref().map(kept_ranges);
             let mut range = 0;
@@ -993,15 +1042,40 @@ impl IcebergSink {
                 let mask = mask.as_boolean_opt().ok_or_else(|| {
                     DataFusionError::Plan("DELETE predicate is not boolean".into())
                 })?;
+                let mut hit = Vec::with_capacity(n);
                 for i in 0..n {
                     let pos = offset + i as u64;
                     // NULL is not true: SQL keeps the row.
-                    if mask.is_valid(i) && mask.value(i) && alive(kept.as_deref(), pos, &mut range)
-                    {
+                    let take = mask.is_valid(i)
+                        && mask.value(i)
+                        && alive(kept.as_deref(), pos, &mut range);
+                    if take {
                         positions.push(pos as i64);
                     }
+                    hit.push(take);
                 }
                 offset += n as u64;
+                if let Some(row) = update {
+                    let rows = datafusion::arrow::compute::filter_record_batch(
+                        &batch,
+                        &BooleanArray::from(hit),
+                    )?;
+                    if rows.num_rows() > 0 {
+                        let columns = row
+                            .iter()
+                            .zip(self.schema.fields())
+                            .map(|(expr, field)| {
+                                let value = expr.evaluate(&rows)?.into_array(rows.num_rows())?;
+                                // Assignments are planned in the column's type;
+                                // cast anything that is not.
+                                Ok(datafusion::arrow::compute::cast(&value, field.data_type())?)
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        let rows = RecordBatch::try_new(self.schema.clone(), columns)?;
+                        memory.try_grow(rows.get_array_memory_size())?;
+                        changed.push(rows);
+                    }
+                }
             }
             if !positions.is_empty() {
                 written.push(
@@ -1011,9 +1085,23 @@ impl IcebergSink {
             }
         }
         let deleted = written.iter().map(|w| w.rows).sum();
-        if !written.is_empty() {
-            self.commit(&written, Change::Delete, None, &env).await?;
+        if written.is_empty() {
+            return Ok(0);
         }
+        let change = match update {
+            None => Change::Delete,
+            Some(_) => {
+                let rows = datafusion::physical_plan::memory::MemoryStream::try_new(
+                    changed,
+                    self.schema.clone(),
+                    None,
+                )?;
+                written.extend(self.write_rows(Box::pin(rows), context).await?);
+                Change::Overwrite
+            }
+        };
+        self.commit(&written, change, None, &env).await?;
+        memory.resize(0);
         Ok(deleted)
     }
 
@@ -1064,6 +1152,7 @@ impl IcebergSink {
                 (DELETE_POS, Some(Prim::Long), pos_stats),
             ],
             referenced: Some(target.path.clone()),
+            content: 1,
         })
     }
 }
@@ -1280,10 +1369,10 @@ fn avro_map(entries: Vec<(i64, Avro)>) -> Avro {
 fn manifest(
     meta: &Json,
     layout: &Layout,
-    files: &[Written],
+    files: &[&Written],
     snapshot_id: i64,
     schema_id: i64,
-    change: Change,
+    content: i32,
 ) -> std::result::Result<Vec<u8>, String> {
     let schema_json = manifest_entry_schema(layout);
     let schema = avro_schema(&schema_json)?;
@@ -1304,11 +1393,7 @@ fn manifest(
             ("format-version", "2".to_owned()),
             (
                 "content",
-                match change {
-                    Change::Append | Change::Replace => "data",
-                    Change::Delete => "deletes",
-                }
-                .to_owned(),
+                if content == 0 { "data" } else { "deletes" }.to_owned(),
             ),
         ],
     )?;
@@ -1352,7 +1437,7 @@ fn manifest(
             (
                 "data_file".into(),
                 Avro::Record(vec![
-                    ("content".into(), Avro::Int(change.content())),
+                    ("content".into(), Avro::Int(content)),
                     ("file_path".into(), Avro::String(f.path.clone())),
                     ("file_format".into(), Avro::String("PARQUET".into())),
                     ("partition".into(), Avro::Record(partition)),
@@ -1381,7 +1466,7 @@ type FieldSummary = (bool, Option<Vec<u8>>, Option<Vec<u8>>);
 /// Per partition field across `files`: whether any value is null, and
 /// the encoded lowest and highest values (the manifest list's
 /// `partitions`, which readers prune whole manifests by).
-fn summaries(layout: &Layout, files: &[Written]) -> Vec<FieldSummary> {
+fn summaries(layout: &Layout, files: &[&Written]) -> Vec<FieldSummary> {
     layout
         .parts
         .iter()
@@ -1422,7 +1507,7 @@ struct ManifestFile {
 /// The new snapshot's manifest list: the new manifest first, then every
 /// manifest of the parent's list, carried over field by field.
 fn manifest_list(
-    new: &ManifestFile,
+    new: &[ManifestFile],
     parent: Option<&[u8]>,
     snapshot_id: i64,
     parent_id: Option<i64>,
@@ -1443,37 +1528,39 @@ fn manifest_list(
             ("format-version", "2".to_owned()),
         ],
     )?;
-    let partitions = new
-        .partitions
-        .iter()
-        .map(|(null, lo, hi)| {
-            Avro::Record(vec![
-                ("contains_null".into(), Avro::Boolean(*null)),
-                ("contains_nan".into(), opt(None)),
-                ("lower_bound".into(), opt(lo.clone().map(Avro::Bytes))),
-                ("upper_bound".into(), opt(hi.clone().map(Avro::Bytes))),
-            ])
-        })
-        .collect();
-    writer
-        .append_value(Avro::Record(vec![
-            ("manifest_path".into(), Avro::String(new.path.clone())),
-            ("manifest_length".into(), Avro::Long(new.length)),
-            ("partition_spec_id".into(), Avro::Int(new.spec_id as i32)),
-            ("content".into(), Avro::Int(new.content)),
-            ("sequence_number".into(), Avro::Long(new.sequence)),
-            ("min_sequence_number".into(), Avro::Long(new.sequence)),
-            ("added_snapshot_id".into(), Avro::Long(new.snapshot_id)),
-            ("added_files_count".into(), Avro::Int(new.files as i32)),
-            ("existing_files_count".into(), Avro::Int(0)),
-            ("deleted_files_count".into(), Avro::Int(0)),
-            ("added_rows_count".into(), Avro::Long(new.rows)),
-            ("existing_rows_count".into(), Avro::Long(0)),
-            ("deleted_rows_count".into(), Avro::Long(0)),
-            ("partitions".into(), opt(Some(Avro::Array(partitions)))),
-            ("key_metadata".into(), opt(None)),
-        ]))
-        .map_err(|e| e.to_string())?;
+    for new in new {
+        let partitions = new
+            .partitions
+            .iter()
+            .map(|(null, lo, hi)| {
+                Avro::Record(vec![
+                    ("contains_null".into(), Avro::Boolean(*null)),
+                    ("contains_nan".into(), opt(None)),
+                    ("lower_bound".into(), opt(lo.clone().map(Avro::Bytes))),
+                    ("upper_bound".into(), opt(hi.clone().map(Avro::Bytes))),
+                ])
+            })
+            .collect();
+        writer
+            .append_value(Avro::Record(vec![
+                ("manifest_path".into(), Avro::String(new.path.clone())),
+                ("manifest_length".into(), Avro::Long(new.length)),
+                ("partition_spec_id".into(), Avro::Int(new.spec_id as i32)),
+                ("content".into(), Avro::Int(new.content)),
+                ("sequence_number".into(), Avro::Long(new.sequence)),
+                ("min_sequence_number".into(), Avro::Long(new.sequence)),
+                ("added_snapshot_id".into(), Avro::Long(new.snapshot_id)),
+                ("added_files_count".into(), Avro::Int(new.files as i32)),
+                ("existing_files_count".into(), Avro::Int(0)),
+                ("deleted_files_count".into(), Avro::Int(0)),
+                ("added_rows_count".into(), Avro::Long(new.rows)),
+                ("existing_rows_count".into(), Avro::Long(0)),
+                ("deleted_rows_count".into(), Avro::Long(0)),
+                ("partitions".into(), opt(Some(Avro::Array(partitions)))),
+                ("key_metadata".into(), opt(None)),
+            ]))
+            .map_err(|e| e.to_string())?;
+    }
     if let Some(bytes) = parent {
         let reader = apache_avro::Reader::new(bytes).map_err(|e| e.to_string())?;
         for entry in reader {
@@ -1831,8 +1918,10 @@ mod tests {
                 .map(|((id, prim), s)| (*id, *prim, s))
                 .collect(),
             referenced: None,
+            content: 0,
         }];
-        let bytes = manifest(&meta, &layout, &files, 7, 0, Change::Append).unwrap();
+        let refs: Vec<&Written> = files.iter().collect();
+        let bytes = manifest(&meta, &layout, &refs, 7, 0, 0).unwrap();
         // The header keeps the schema as written: Java reads the stats
         // arrays as maps only with their `logicalType`.
         let head = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).into_owned();
@@ -1898,17 +1987,25 @@ mod tests {
             snapshot_id: 7,
             files: 1,
             rows: 3,
-            partitions: summaries(&layout, &files),
+            partitions: summaries(&layout, &refs),
         };
         assert_eq!(new.partitions[0].1, Some(19_723i32.to_le_bytes().to_vec()));
-        let first = manifest_list(&new, None, 6, None, 1, &HashMap::new()).unwrap();
+        let first = manifest_list(
+            std::slice::from_ref(&new),
+            None,
+            6,
+            None,
+            1,
+            &HashMap::new(),
+        )
+        .unwrap();
         let second = manifest_list(
-            &ManifestFile {
+            &[ManifestFile {
                 path: "m2".into(),
                 sequence: 3,
                 partitions: vec![],
                 ..new
-            },
+            }],
             Some(&first),
             8,
             Some(7),
@@ -1942,16 +2039,17 @@ mod tests {
             bytes: 10,
             partition: vec![],
             stats: vec![],
+            content: i32::from(referenced.is_some()),
             referenced: referenced.map(str::to_owned),
         };
         // A data manifest with two files, sequence numbers inherited.
         let data = manifest(
             &meta,
             &layout,
-            &[file("a", 3, None), file("b", 4, None)],
+            &[&file("a", 3, None), &file("b", 4, None)],
             7,
             0,
-            Change::Append,
+            0,
         )
         .unwrap();
         // Its header is read back as written, Iceberg metadata included.
@@ -1987,10 +2085,10 @@ mod tests {
         let deletes = manifest(
             &meta,
             &layout,
-            &[file("d1", 1, Some("a")), file("d2", 1, Some("z"))],
+            &[&file("d1", 1, Some("a")), &file("d2", 1, Some("z"))],
             7,
             0,
-            Change::Delete,
+            1,
         )
         .unwrap();
         let (_, counts) = rewrite_manifest(&deletes, &removed, 5, 9).unwrap().unwrap();

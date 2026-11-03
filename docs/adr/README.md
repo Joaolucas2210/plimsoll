@@ -31,7 +31,7 @@ are allowed in place.
 | [0021](0021-bearer-token-authentication.md) | Bearer-token authentication for the SQL endpoint | Accepted | 2026-10-30 | `Authorization: Bearer` mapped to a principal via SHA-256 digests in `PLIMSOLL_AUTH_TOKENS`; `user` = principal, impersonation 403; boot fails without tokens unless `PLIMSOLL_AUTH=disabled` | 0004, 0013, 0015 |
 | [0022](0022-principal-scoped-system-tables.md) | Principal-scoped system tables | Accepted | 2026-10-30 | The caller's `Viewer` rides in a per-query session config extension; `system.runtime.queries` shows own rows, all for `PLIMSOLL_AUTH_OPERATORS`, and fails closed without a viewer | 0002, 0021 |
 | [0023](0023-resource-groups.md) | Configurable resource groups bound to principals | Accepted | 2026-10-30 | Closed set of groups (`default` + `PLIMSOLL_RESOURCE_GROUPS`) with own running/queued limits; `PLIMSOLL_AUTH_GROUPS` binds principals, first = default; unknown 400, unbound 403 | 0004, 0013, 0021, 0022 |
-| [0024](0024-read-only-query-api.md) | Read-only query API | Accepted (amended by 0075, 0077) | 2026-10-30 | User SQL runs with DDL, DML (incl. `COPY`) and statements (`SET`) disabled: closes arbitrary server file read/write and shared-catalog mutation | 0002, 0004, 0013, 0021 |
+| [0024](0024-read-only-query-api.md) | Read-only query API | Accepted (amended by 0075, 0077, 0081) | 2026-10-30 | User SQL runs with DDL, DML (incl. `COPY`) and statements (`SET`) disabled: closes arbitrary server file read/write and shared-catalog mutation | 0002, 0004, 0013, 0021 |
 | [0025](0025-schema-grants.md) | Per-schema data grants | Accepted | 2026-10-30 | `PLIMSOLL_AUTH_GRANTS` lists readable schemas per principal; the engine checks every `TableScan` (subqueries, CTEs, joins) through a `TableAccess` policy before anything executes; denial is 403 | 0002, 0013, 0021, 0022, 0024 |
 | [0026](0026-shutdown-drain.md) | Shutdown drain: unadvertise, keep serving, then close | Accepted | 2026-10-30 | Readiness and serving are separate flags; SIGTERM turns `/readyz` 503 but serves queries for `PLIMSOLL_DRAIN_DELAY_MS` (5 s) before closing; ctrl-c closes at once | 0004, 0013 |
 | [0027](0027-structured-logs.md) | Structured JSON logs | Accepted | 2026-10-30 | One JSON object per line on stderr; a `query` event for every `/v1/sql` outcome with identity, code, phase timings and a SQL fingerprint (never the text); no logging crate | 0004, 0013, 0019, 0021 |
@@ -88,6 +88,7 @@ are allowed in place.
 | [0078](0078-compaction.md) | Compaction: rewrite small files and files carrying deletes | Accepted | 2026-11-03 | `POST /v1/maintenance/compact` (read + write grants, admission): per partition, files with deletes or ≥2 small files are read through the regular scan (deletes applied, fully-deleted files included) and rewritten by the partitioned writer; a `replace` snapshot marks them and their file-scoped position deletes DELETED in rewritten manifests (original Avro schema kept, sequence numbers explicit); retries only over appends; deletes now check concurrency against the planned snapshot | 0075, 0076, 0077, 0014, 0023 |
 | [0079](0079-expire-snapshots.md) | Snapshot expiration | Accepted | 2026-11-03 | `POST /v1/maintenance/expire-snapshots` (read + write grants, admission; defaults 5 days, keep 1): keeps branch and tag heads, each branch's last N and recent ancestors and recent strays; commits `remove-snapshots` with retry, then deletes manifest lists, manifests, data and delete files only expired snapshots reached (DELETED entries skipped) | 0078, 0075, 0077, 0028, 0029 |
 | [0080](0080-remove-orphan-files.md) | Orphan file removal | Accepted | 2026-11-03 | `POST /v1/maintenance/remove-orphans` (grants, admission; dry run; window default 3 days, never under 1 hour) lists the table location and deletes files no snapshot reaches (DELETED entries and statistics files count as referenced), never the catalog's metadata files or hidden files | 0079, 0075, 0024 |
+| [0081](0081-update-iceberg.md) | `UPDATE` Iceberg tables (merge-on-read overwrite) | Accepted | 2026-11-03 | `UPDATE` is allowed under the write grant (no subqueries in WHERE or SET); the rows a DELETE would choose are deleted by position and rewritten with SET applied through the partitioned writer; one `overwrite` snapshot with a data manifest and a delete manifest; retries only over appends | 0077, 0075, 0076, 0078, 0024 |
 
 ## Reading order
 
@@ -96,7 +97,7 @@ are allowed in place.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
 - Federation: 0005 → 0006.
 - Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074.
-- Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080.
+- Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046.
 

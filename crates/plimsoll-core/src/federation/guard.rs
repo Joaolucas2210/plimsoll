@@ -84,6 +84,16 @@ impl TableProvider for FederationFilterGuard {
         self.inner.delete_from(state, filters).await
     }
 
+    /// Updates too (ADR 0081).
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.inner.update(state, assignments, filters).await
+    }
+
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Result<Vec<Pushdown>> {
         Ok(self
             .decide(filters)?

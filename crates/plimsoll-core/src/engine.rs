@@ -314,14 +314,14 @@ impl Engine {
             LogicalPlan::Dml(dml) if dml.op == WriteOp::Insert(InsertOp::Append) => {
                 Some(dml.table_name.clone())
             }
-            LogicalPlan::Dml(dml) if dml.op == WriteOp::Delete => {
+            LogicalPlan::Dml(dml) if matches!(dml.op, WriteOp::Delete | WriteOp::Update) => {
                 only_own_predicates(&dml.input, &dml.table_name)?;
                 Some(dml.table_name.clone())
             }
             LogicalPlan::Dml(_) | LogicalPlan::Copy(_) => {
                 return Err(DataFusionError::Plan(
-                    "only SELECT, INSERT INTO ... and DELETE FROM ... are allowed; the query API \
-                     is otherwise read-only"
+                    "only SELECT, INSERT INTO ..., UPDATE ... and DELETE FROM ... are allowed; \
+                     the query API is otherwise read-only"
                         .into(),
                 ));
             }
@@ -502,15 +502,16 @@ fn bind(df: DataFrame, params: &[ScalarValue]) -> Result<DataFrame> {
     df.with_param_values(values)
 }
 
-/// A `DELETE`'s rows must be chosen by predicates on the table's own
-/// columns (ADR 0077). DataFusion hands a provider only the predicates on
-/// the target and silently drops the rest: a subquery or join in the
-/// WHERE would turn into a predicate-less delete of every row. Refused.
+/// A `DELETE`'s or `UPDATE`'s rows must be chosen by predicates on the
+/// table's own columns, and new values computed from them (ADR 0077,
+/// 0081). DataFusion hands a provider only the predicates on the target
+/// and silently drops the rest: a subquery or join in the WHERE would
+/// turn into a predicate-less change of every row. Refused.
 fn only_own_predicates(input: &LogicalPlan, target: &TableReference) -> Result<()> {
     let refuse = || {
         Err(DataFusionError::Plan(
-            "DELETE supports WHERE predicates on the table's own columns only (no subqueries \
-             or joins)"
+            "DELETE and UPDATE support WHERE predicates and SET values on the table's own \
+             columns only (no subqueries or joins)"
                 .into(),
         ))
     };
@@ -524,7 +525,16 @@ fn only_own_predicates(input: &LogicalPlan, target: &TableReference) -> Result<(
                     Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_)
                 ))
             })?,
-            LogicalPlan::Projection(_) | LogicalPlan::SubqueryAlias(_) => false,
+            LogicalPlan::Projection(p) => p.expr.iter().any(|e| {
+                e.exists(|e| {
+                    Ok(matches!(
+                        e,
+                        Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_)
+                    ))
+                })
+                .unwrap_or(true)
+            }),
+            LogicalPlan::SubqueryAlias(_) => false,
             _ => true,
         };
         Ok(TreeNodeRecursion::Continue)
@@ -815,10 +825,42 @@ mod tests {
             "DELETE FROM bronze.b WHERE x IN (SELECT x FROM silver.s)",
             "DELETE FROM bronze.b WHERE EXISTS (SELECT 1 FROM silver.s)",
             "DELETE FROM bronze.b WHERE x = (SELECT max(x) FROM silver.s)",
+            // UPDATE (ADR 0081): the same, and no subquery in SET either.
+            "UPDATE bronze.b SET x = 1 WHERE x IN (SELECT x FROM silver.s)",
+            "UPDATE bronze.b SET x = (SELECT max(x) FROM silver.s)",
         ] {
             let err = e.sql_with(sql, &[], bronze.clone()).await.unwrap_err();
             assert!(err.to_string().contains("own columns only"), "{sql}: {err}");
         }
+        // UPDATE needs the write grant too.
+        let err = e
+            .sql_with("UPDATE silver.s SET x = 0", &[], Arc::new(Writes("bronze")))
+            .await
+            .unwrap_err();
+        assert!(denied(&err), "{err}");
+        // Granted: the provider updates.
+        let out = e
+            .sql_with(
+                "UPDATE bronze.b SET x = x + 10 WHERE x = 2",
+                &[],
+                bronze.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            pretty_format_batches(&out.batches)
+                .unwrap()
+                .to_string()
+                .contains("| 1     |")
+        );
+        drop(out);
+        e.sql_with(
+            "UPDATE bronze.b SET x = x - 10 WHERE x = 12",
+            &[],
+            bronze.clone(),
+        )
+        .await
+        .unwrap();
         // Granted and well-formed: the provider deletes.
         let out = e
             .sql_with("DELETE FROM bronze.b WHERE x = 3", &[], bronze.clone())
@@ -829,7 +871,6 @@ mod tests {
         drop(out);
         for sql in [
             "COPY (SELECT 1) TO '/tmp/plimsoll-copy.csv'",
-            "UPDATE bronze.b SET x = 0",
             "INSERT OVERWRITE bronze.b SELECT 1",
         ] {
             let err = e.sql_with(sql, &[], bronze.clone()).await.unwrap_err();
