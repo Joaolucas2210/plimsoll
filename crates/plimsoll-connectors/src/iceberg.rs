@@ -143,6 +143,28 @@ impl IcebergConnector {
         Self::from_metadata(name, &metadata_path, &meta)
     }
 
+    /// A worker's view of a coordinator's scan (ADR 0058): the table at
+    /// `metadata_path`, pinned to `snapshot`, reading only `files`.
+    /// Planning (deletes included) runs here as for any scan; only the set
+    /// of data files is narrowed.
+    pub async fn fragment(
+        metadata_path: &str,
+        snapshot: Option<i64>,
+        files: HashSet<String>,
+        state: &dyn Session,
+    ) -> Result<Self, ConnectorError> {
+        let raw = read(metadata_path, state, None).await?;
+        let mut meta: Json = serde_json::from_slice(&raw).map_err(|e| invalid(metadata_path, e))?;
+        if let Some(id) = snapshot {
+            meta = at(&meta, AsOf::Snapshot(id)).map_err(|m| invalid(metadata_path, m))?;
+        }
+        let mut connector = Self::from_metadata("fragment", metadata_path, &meta)?;
+        let mut table = (*connector.table).clone();
+        table.only_files = Some(Arc::new(files));
+        connector.table = Arc::new(table);
+        Ok(connector)
+    }
+
     /// From metadata already in hand, e.g. a REST catalog `loadTable`
     /// response. `location` is only used in error messages.
     pub fn from_metadata(
@@ -232,6 +254,11 @@ struct IcebergTable {
     name_mapping: Option<Arc<field_ids::NameMapping>>,
     /// Identity partition sources common to every spec (ADR 0055).
     identity: HashSet<i64>,
+    /// The `metadata.json` this table was read from (ADR 0058: what a
+    /// worker re-opens).
+    metadata_path: String,
+    /// A worker's fragment: only these data files (ADR 0058).
+    only_files: Option<Arc<HashSet<String>>>,
 }
 
 /// A data file the scan will read, from its manifest entry.
@@ -432,6 +459,8 @@ impl IcebergTable {
             renamed,
             name_mapping,
             identity,
+            metadata_path: path.to_owned(),
+            only_files: None,
         })
     }
 
@@ -815,6 +844,9 @@ impl TableProvider for IcebergTable {
             }
         }
         let filters = inexact.as_slice();
+        if let Some(only) = &self.only_files {
+            files.retain(|f| only.contains(&f.path));
+        }
         if !exact.is_empty() {
             let mut kept = Vec::with_capacity(files.len());
             for file in files {
@@ -842,60 +874,94 @@ impl TableProvider for IcebergTable {
             }
             files = kept;
         }
-        // Files sharing the same equality delete sets scan together; a group
-        // with sets is anti-joined against their keys (ADR 0016).
-        let mut groups: BTreeMap<&[usize], Vec<&DataFile>> = BTreeMap::new();
-        for file in &files {
-            groups.entry(&file.eq).or_default().push(file);
-        }
-        if groups.is_empty() {
-            groups.insert(&[], vec![]);
-        }
-        let mut plans = Vec::new();
-        for (eq, files) in groups {
-            if eq.is_empty() {
-                plans.push(
-                    self.parquet_scan(state, &files, projection, filters, limit)
-                        .await?,
-                );
-                continue;
+        // Coordinator with workers (ADR 0058): the kept files are split
+        // into fragments, one per worker, each re-planned (deletes
+        // included) and scanned there. Tables read with vended credentials
+        // stay local: those credentials are not sent over the wire.
+        let workers = state
+            .config()
+            .get_extension::<crate::remote::Workers>()
+            .filter(|w| {
+                !w.urls().is_empty()
+                    && self.scoped.is_none()
+                    && self.only_files.is_none()
+                    && !files.is_empty()
+            });
+        let input: Arc<dyn ExecutionPlan> = match workers {
+            Some(workers) => {
+                let schema = match projection {
+                    Some(p) => Arc::new(self.schema.project(p)?),
+                    None => self.schema.clone(),
+                };
+                let columns = schema.fields().iter().map(|f| f.name().clone()).collect();
+                let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+                Arc::new(crate::remote::RemoteScanExec::new(
+                    schema,
+                    workers,
+                    &self.metadata_path,
+                    self.snapshot_id,
+                    paths,
+                    columns,
+                ))
             }
-            // Key columns are scanned even when not selected, then dropped.
-            let scan_projection = projection.map(|p| {
-                let mut p = p.clone();
-                for &i in eq {
-                    for f in &sets[i].key {
-                        if let Ok(k) = self.schema.index_of(f.name()) {
-                            if !p.contains(&k) {
-                                p.push(k);
+            None => {
+                // Files sharing the same equality delete sets scan together; a group
+                // with sets is anti-joined against their keys (ADR 0016).
+                let mut groups: BTreeMap<&[usize], Vec<&DataFile>> = BTreeMap::new();
+                for file in &files {
+                    groups.entry(&file.eq).or_default().push(file);
+                }
+                if groups.is_empty() {
+                    groups.insert(&[], vec![]);
+                }
+                let mut plans = Vec::new();
+                for (eq, files) in groups {
+                    if eq.is_empty() {
+                        plans.push(
+                            self.parquet_scan(state, &files, projection, filters, limit)
+                                .await?,
+                        );
+                        continue;
+                    }
+                    // Key columns are scanned even when not selected, then dropped.
+                    let scan_projection = projection.map(|p| {
+                        let mut p = p.clone();
+                        for &i in eq {
+                            for f in &sets[i].key {
+                                if let Ok(k) = self.schema.index_of(f.name()) {
+                                    if !p.contains(&k) {
+                                        p.push(k);
+                                    }
+                                }
                             }
                         }
+                        p
+                    });
+                    // No limit below the anti-join: it would cut rows before deletes.
+                    let mut plan = self
+                        .parquet_scan(state, &files, scan_projection.as_ref(), filters, None)
+                        .await?;
+                    for &i in eq {
+                        plan = anti_join(&sets[i], plan)?;
                     }
+                    if let Some(p) = projection {
+                        let schema = plan.schema();
+                        let exprs = (0..p.len())
+                            .map(|i| {
+                                let f = schema.field(i);
+                                (
+                                    Arc::new(Column::new(f.name(), i)) as Arc<dyn PhysicalExpr>,
+                                    f.name().clone(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        plan = Arc::new(ProjectionExec::try_new(exprs, plan)?);
+                    }
+                    plans.push(plan);
                 }
-                p
-            });
-            // No limit below the anti-join: it would cut rows before deletes.
-            let mut plan = self
-                .parquet_scan(state, &files, scan_projection.as_ref(), filters, None)
-                .await?;
-            for &i in eq {
-                plan = anti_join(&sets[i], plan)?;
+                UnionExec::try_new(plans)?
             }
-            if let Some(p) = projection {
-                let schema = plan.schema();
-                let exprs = (0..p.len())
-                    .map(|i| {
-                        let f = schema.field(i);
-                        (
-                            Arc::new(Column::new(f.name(), i)) as Arc<dyn PhysicalExpr>,
-                            f.name().clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                plan = Arc::new(ProjectionExec::try_new(exprs, plan)?);
-            }
-            plans.push(plan);
-        }
+        };
         // Exact row count from the manifests (ADR 0054), when it is exact:
         // no deletes apply to the files kept, every file states its
         // record_count, and nothing (filter pushed into Parquet, limit) can
@@ -928,7 +994,7 @@ impl TableProvider for IcebergTable {
                 stats.cache_hits,
                 stats.manifest_cache_hits,
             ),
-            UnionExec::try_new(plans)?,
+            input,
         )
 .with_pinned(format!(
             "{}@{}",

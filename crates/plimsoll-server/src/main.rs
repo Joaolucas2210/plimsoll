@@ -74,6 +74,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .with_result_cache(usize::try_from(cfg.result_cache_bytes)?),
     );
     system::register(engine.context(), admission.registry().clone())?;
+    // Coordinator (ADR 0058): Iceberg scans fan out to these workers.
+    if let (false, Some(token)) = (cfg.workers.is_empty(), &cfg.worker_token) {
+        let workers =
+            plimsoll_connectors::remote::Workers::new(cfg.workers.clone(), token.clone())?;
+        engine
+            .context()
+            .state_ref()
+            .write()
+            .config_mut()
+            .set_extension(Arc::new(workers));
+    }
     // Catalog first: env tables aimed at a catalog-backed schema then fail
     // fast (those schemas are read-only) instead of being silently shadowed.
     if let Some(catalog_cfg) = catalog.clone() {
@@ -128,6 +139,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         auth: cfg.auth.clone(),
         tracer,
         slow_query: cfg.slow_query,
+        worker_token: cfg
+            .worker_token
+            .as_deref()
+            .map(plimsoll_server::auth::token_digest),
     });
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
@@ -139,6 +154,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "catalog": catalog.as_ref().map(|c| c.uri.as_str()),
             "auth": format!("{:?}", cfg.auth),
             "otlp": cfg.otlp.as_ref().map(|o| o.endpoint.as_str()),
+            "workers": cfg.workers,
+            "worker": cfg.worker_token.is_some(),
         }),
     );
     if cfg.auth == Auth::Disabled {

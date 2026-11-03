@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Coordinator/worker step 1: Iceberg scans fan out to workers as file fragments over HTTP + Arrow IPC, deletes applied on workers, same answers (ADR 0058)
 - [x] Slow-query log: `PLIMSOLL_SLOW_QUERY_MS`, a `slow_query` line with timings, reads and planning events (ADR 0057)
 - [x] Planning spans in traces: `catalog.load_table` and `iceberg.plan` (files/manifests/deletes) under `planning` (ADR 0056)
 - [x] Exact identity-partition filters: decided per file, no `FilterExec`, partition-filtered `count(*)` from metadata (ADR 0055)
@@ -90,15 +91,16 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Coordinator/worker split, step 1 — a worker protocol**: execute a
-planned Iceberg scan fragment (a file group with its deletes) on another
-node over Arrow IPC (ADR 0037's encoding), with the same ceiling,
-admission and cancellation semantics, as the first building block of the
-plane split in "Later".
+**Coordinator/worker step 2 — governance on workers**: run fragments
+under the worker's admission (a `fragments` resource group with its own
+limits and memory share), propagate the query id, trace context and
+deadline to workers, and report worker health (`/readyz` fan-out) so a
+coordinator skips draining workers.
 
 ## Later
 
 - Spans below planning (per-operator, per-fetch) via `tracing` +
   `opentelemetry-otlp`, and OTLP metrics (ADR 0031/0056 upgrade path).
 
-- Coordinator/worker split along the existing plane boundary.
+- Coordinator/worker: shuffle-based joins and aggregations across
+  workers (step 1 distributes scans only); worker discovery.

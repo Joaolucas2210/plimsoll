@@ -19,6 +19,9 @@ chrono = { version = "0.4", default-features = false }
 apache-avro = { version = "0.22", default-features = false }
 serde_json.workspace = true
 bytes = "1"
+# ADR 0058: worker fragments over HTTP. Same reqwest line and TLS features as
+# object_store and the catalog client (ADR 0015): no new crate in the build.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
 # ADR 0017: Iceberg v3 deletion vectors are portable 64-bit Roaring bitmaps.
 roaring = "0.12"
 

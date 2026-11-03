@@ -41,6 +41,11 @@ pub struct Config {
     /// `PLIMSOLL_SLOW_QUERY_MS`: queries at least this long log
     /// `slow_query`; unset or 0 = off (ADR 0057).
     pub slow_query: Option<Duration>,
+    /// `PLIMSOLL_WORKER_TOKEN` (secret): shared by coordinator and workers;
+    /// on a worker it enables `/v1/fragment` (ADR 0058).
+    pub worker_token: Option<String>,
+    /// `PLIMSOLL_WORKERS`: worker base URLs; set, this node coordinates.
+    pub workers: Vec<String>,
 }
 
 impl Config {
@@ -82,6 +87,38 @@ impl Config {
         )?;
 
         let (groups, group_memory) = resource_groups(&lookup)?;
+        let worker_token = lookup("PLIMSOLL_WORKER_TOKEN")
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty());
+        if worker_token.as_ref().is_some_and(|t| t.len() < 16) {
+            return Err(ConfigError {
+                var: "PLIMSOLL_WORKER_TOKEN",
+                value: "<redacted>".into(),
+                reason: "at least 16 characters",
+            });
+        }
+        let mut workers = Vec::new();
+        for url in lookup("PLIMSOLL_WORKERS").unwrap_or_default().split(',') {
+            let url = url.trim();
+            if url.is_empty() {
+                continue;
+            }
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return Err(ConfigError {
+                    var: "PLIMSOLL_WORKERS",
+                    value: url.to_owned(),
+                    reason: "expected http:// or https:// URLs",
+                });
+            }
+            workers.push(url.to_owned());
+        }
+        if !workers.is_empty() && worker_token.is_none() {
+            return Err(ConfigError {
+                var: "PLIMSOLL_WORKERS",
+                value: String::new(),
+                reason: "needs PLIMSOLL_WORKER_TOKEN",
+            });
+        }
         let slow_ms: u64 = parse(
             &lookup,
             "PLIMSOLL_SLOW_QUERY_MS",
@@ -128,6 +165,8 @@ impl Config {
             group_memory,
             result_cache_bytes,
             slow_query: (slow_ms > 0).then(|| Duration::from_millis(slow_ms)),
+            worker_token,
+            workers,
         })
     }
 }
@@ -414,5 +453,26 @@ mod tests {
             None
         );
         assert!(cfg(&[("PLIMSOLL_SLOW_QUERY_MS", "soon")]).is_err());
+    }
+
+    #[test]
+    fn workers_need_a_token_and_urls() {
+        let c = cfg(&[]).unwrap();
+        assert!(c.workers.is_empty() && c.worker_token.is_none());
+        let token = ("PLIMSOLL_WORKER_TOKEN", "0123456789abcdef");
+        let c = cfg(&[
+            token,
+            ("PLIMSOLL_WORKERS", "http://w1:8080, http://w2:8080"),
+        ])
+        .unwrap();
+        assert_eq!(c.workers, ["http://w1:8080", "http://w2:8080"]);
+        for bad in [
+            vec![("PLIMSOLL_WORKERS", "http://w1:8080")],
+            vec![token, ("PLIMSOLL_WORKERS", "w1:8080")],
+            vec![("PLIMSOLL_WORKER_TOKEN", "short")],
+        ] {
+            let e = cfg(&bad).unwrap_err();
+            assert!(!e.to_string().contains("0123456789"), "{e}");
+        }
     }
 }

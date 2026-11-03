@@ -9,15 +9,18 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use plimsoll_connectors::ConnectorError;
+use plimsoll_connectors::remote::Fragment;
+use plimsoll_connectors::{Connector, ConnectorError, IcebergConnector};
 use plimsoll_control::catalog::CatalogError;
 use plimsoll_core::datafusion::arrow::ipc::writer::StreamWriter;
 use plimsoll_core::datafusion::arrow::json::ArrayWriter;
 use plimsoll_core::datafusion::arrow::record_batch::RecordBatch;
 use plimsoll_core::datafusion::common::ScalarValue;
 use plimsoll_core::datafusion::error::DataFusionError;
+use plimsoll_core::datafusion::execution::SendableRecordBatchStream;
 use plimsoll_core::datafusion::object_store::Error as ObjectStoreError;
 use plimsoll_core::datafusion::parquet::errors::ParquetError;
+use plimsoll_core::datafusion::physical_plan::execute_stream;
 use plimsoll_core::engine::{AccessDenied, Engine, QueryResult, TableRead};
 use plimsoll_core::plan_trace::{self, PlanEvent};
 
@@ -137,6 +140,15 @@ pub trait QueryEngine: Send + Sync {
         viewer: Viewer,
     ) -> Result<QueryOutput, EngineError>;
 
+    /// A worker's scan fragment (ADR 0058), as a stream. Default: not a
+    /// worker.
+    async fn fragment(
+        &self,
+        _fragment: Fragment,
+    ) -> Result<SendableRecordBatchStream, EngineError> {
+        Err(EngineError::Unsupported("scan fragments".into()))
+    }
+
     /// Runs `sql`, sending the result to `tx` as it is produced. `tx` is
     /// bounded: a slow reader slows the query instead of buffering it.
     /// Default: [`Self::execute`], then the whole result as one chunk.
@@ -203,6 +215,33 @@ pub struct CoreEngine(pub Arc<Engine>);
 
 #[async_trait]
 impl QueryEngine for CoreEngine {
+    async fn fragment(&self, f: Fragment) -> Result<SendableRecordBatchStream, EngineError> {
+        let fail = |e: DataFusionError| classify(&e);
+        let state = self.0.context().state();
+        let connector = IcebergConnector::fragment(
+            &f.metadata_location,
+            f.snapshot_id,
+            f.files.into_iter().collect(),
+            &state,
+        )
+        .await
+        .map_err(|e| fail(e.into()))?;
+        let table = connector.source();
+        let schema = table.schema();
+        let projection = f
+            .columns
+            .iter()
+            .map(|c| schema.index_of(c))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| fail(e.into()))?;
+        // The worker's own ceiling and runtime apply, as for any scan.
+        let plan = table
+            .scan(&state, Some(&projection), &[], None)
+            .await
+            .map_err(fail)?;
+        execute_stream(plan, state.task_ctx()).map_err(fail)
+    }
+
     async fn execute(
         &self,
         sql: &str,

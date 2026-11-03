@@ -11,6 +11,7 @@ use plimsoll_core::federation::{FederationFilterGuard, PushdownPolicy};
 pub mod iceberg;
 pub mod parquet;
 pub mod postgres;
+pub mod remote;
 
 pub use iceberg::{AsOf, IcebergConnector};
 pub use parquet::ParquetConnector;

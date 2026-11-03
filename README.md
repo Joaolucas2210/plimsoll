@@ -126,6 +126,8 @@ Configuration is environment-only; invalid values abort startup.
 | `OTEL_SERVICE_NAME` | `plimsoll` | `service.name` of exported spans |
 | `PLIMSOLL_RESULT_CACHE_BYTES` | `0` (off) | Result cache for repeated queries over Iceberg snapshots, reserved in the memory pool, at most half the ceiling; keyed by SQL + every table's snapshot id, so a new commit is a miss (ADR 0038) |
 | `PLIMSOLL_SLOW_QUERY_MS` | unset (off) | Queries at least this long also log a `slow_query` warn line: timings, `reads`, and each planning event (catalog loads; Iceberg files/manifests/deletes/cache hits). Never SQL text (ADR 0057) |
+| `PLIMSOLL_WORKER_TOKEN` | unset | Shared secret (≥ 16 chars, env only) between coordinator and workers; on a worker it enables `POST /v1/fragment` (ADR 0058) |
+| `PLIMSOLL_WORKERS` | unset | `http://w1:8080,http://w2:8080`: this node coordinates; Iceberg scans fan out to these workers (needs the token; tables with vended credentials stay local) (ADR 0058) |
 | `PLIMSOLL_SPILL_DIR` | unset | Spill directory; unset = no spill, pressure fails the query |
 | `PLIMSOLL_PARQUET_TABLES` | unset | `bronze.trips=/data/trips/,gold.daily=/data/d.parquet` |
 | `PLIMSOLL_ICEBERG_TABLES` | unset | `bronze.trips=/wh/bronze/trips` (table dir or `*.metadata.json`) |

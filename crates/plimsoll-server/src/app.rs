@@ -47,6 +47,9 @@ pub struct AppState {
     pub tracer: Option<Tracer>,
     /// Queries at least this long also log `slow_query` (ADR 0057).
     pub slow_query: Option<Duration>,
+    /// SHA-256 of the token coordinators present; `None`: not a worker
+    /// and `/v1/fragment` does not exist (ADR 0058).
+    pub worker_token: Option<[u8; 32]>,
 }
 
 #[derive(Default)]
@@ -78,6 +81,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/v1/sql", post(sql))
         .route("/v1/queries/{id}", delete(cancel_query))
+        .route("/v1/fragment", post(fragment))
         .with_state(state)
 }
 
@@ -331,6 +335,86 @@ async fn cancel_query(
         }
         CancelOutcome::NotFound => not_found(),
     }
+}
+
+/// `POST /v1/fragment` (ADR 0058): a worker scans the data files a
+/// coordinator assigned it and streams the rows back as Arrow IPC. Only
+/// with `PLIMSOLL_WORKER_TOKEN` set, and only for a caller presenting it.
+/// A failure after the first batch aborts the body, so the coordinator's
+/// decoder sees no end-of-stream marker and fails the query (ADR 0037).
+async fn fragment(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let st = st.as_ref();
+    let Some(expected) = st.worker_token else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(crate::auth::token_digest);
+    if presented != Some(expected) {
+        return ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", false).respond(
+            st,
+            "invalid worker token",
+            None,
+        );
+    }
+    let parsed = serde_json::from_slice(&body)
+        .map_err(|e| e.to_string())
+        .and_then(|v| plimsoll_connectors::remote::Fragment::from_json(&v));
+    let fragment = match parsed {
+        Ok(f) => f,
+        Err(e) => {
+            return ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", false)
+                .respond(st, e, None);
+        }
+    };
+    let stream = match st.engine.fragment(fragment).await {
+        Ok(s) => s,
+        Err(e) => {
+            let e = GovernedError::Failed(e);
+            return ApiError::of(&e).respond(st, &e, None);
+        }
+    };
+    let schema = stream.schema();
+    let writer = match plimsoll_core::datafusion::arrow::ipc::writer::StreamWriter::try_new(
+        Vec::new(),
+        &schema,
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", false)
+                .respond(st, e, None);
+        }
+    };
+    let chunks =
+        futures::stream::unfold((stream, Some(writer)), |(mut stream, writer)| async move {
+            let mut writer = writer?;
+            let fail = |e: String| Err::<Vec<u8>, _>(std::io::Error::other(e));
+            match stream.next().await {
+                Some(Ok(batch)) => match writer.write(&batch) {
+                    Ok(()) => {
+                        let bytes = std::mem::take(writer.get_mut());
+                        Some((Ok(bytes), (stream, Some(writer))))
+                    }
+                    Err(e) => Some((fail(e.to_string()), (stream, None))),
+                },
+                Some(Err(e)) => Some((fail(e.to_string()), (stream, None))),
+                None => match writer.finish() {
+                    Ok(()) => Some((Ok(std::mem::take(writer.get_mut())), (stream, None))),
+                    Err(e) => Some((fail(e.to_string()), (stream, None))),
+                },
+            }
+        });
+    (
+        [(header::CONTENT_TYPE, "application/vnd.apache.arrow.stream")],
+        axum::body::Body::from_stream(chunks),
+    )
+        .into_response()
 }
 
 /// `/v1/sql`: runs the request and writes one structured `query` log line
@@ -897,6 +981,7 @@ mod tests {
             auth: Auth::Disabled,
             tracer: None,
             slow_query: None,
+            worker_token: None,
         })
     }
 
