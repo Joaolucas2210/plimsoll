@@ -400,7 +400,7 @@ pub(super) async fn cached<T: Send + Sync + 'static>(
 }
 
 /// Magic of a `deletion-vector-v1` blob.
-const DV_MAGIC: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
+pub(super) const DV_MAGIC: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
 
 /// Decodes a `deletion-vector-v1` blob: big-endian length of magic + bitmap,
 /// magic, portable 64-bit Roaring bitmap, big-endian CRC-32 of magic + bitmap.
@@ -425,7 +425,7 @@ fn deletion_vector(blob: &[u8]) -> std::result::Result<RoaringTreemap, String> {
 
 /// CRC-32 (IEEE), bitwise. ponytail: ~10 ms/MB; DV blobs are KBs. Table-driven
 /// or `crc32fast` if profiles ever show it.
-fn crc32(data: &[u8]) -> u32 {
+pub(super) fn crc32(data: &[u8]) -> u32 {
     let mut crc = !0u32;
     for &b in data {
         crc ^= u32::from(b);

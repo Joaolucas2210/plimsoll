@@ -82,6 +82,9 @@ const BOUND_CHARS: usize = 16;
 /// and its default partition spec, as the writer needs them.
 #[derive(Debug, Clone)]
 pub(super) struct Layout {
+    /// The table's format version: 2, or 3 (row lineage and deletion
+    /// vectors, ADR 0095).
+    version: i64,
     spec_id: i64,
     /// `partition-specs[].fields` of the default spec, verbatim.
     spec_fields: Json,
@@ -112,6 +115,10 @@ impl Layout {
         self.spec_id
     }
 
+    pub(super) fn version(&self) -> i64 {
+        self.version
+    }
+
     pub(super) fn arrow(&self) -> SchemaRef {
         self.arrow.clone()
     }
@@ -125,10 +132,10 @@ impl Layout {
     /// manifest of position deletes for files written under an older spec
     /// (ADR 0085).
     pub(super) fn of_spec(meta: &Json, spec_id: i64) -> std::result::Result<Self, String> {
-        if meta["format-version"].as_i64() != Some(2) {
+        let version = meta["format-version"].as_i64().unwrap_or(1);
+        if !(2..=3).contains(&version) {
             return Err(format!(
-                "INSERT supports Iceberg format v2 tables (this one is v{})",
-                meta["format-version"]
+                "writes support Iceberg format v2 and v3 tables (this one is v{version})"
             ));
         }
         let schema = current_schema(meta).ok_or("the current schema is missing")?;
@@ -195,6 +202,7 @@ impl Layout {
             });
         }
         Ok(Self {
+            version,
             spec_id,
             spec_fields,
             columns,
@@ -306,6 +314,12 @@ pub(super) struct Written {
     /// The partition spec `partition` is in: the default spec for new
     /// data, the data file's own for its position deletes (ADR 0085).
     spec: i64,
+    /// A deletion vector's blob in its Puffin file: offset and length (v3,
+    /// ADR 0095). `None`: a Parquet file.
+    dv: Option<(i64, i64)>,
+    /// Rows this statement adds (data) or newly deletes: a deletion vector
+    /// also carries its data file's earlier deletes (ADR 0095).
+    added: u64,
 }
 
 impl Written {
@@ -315,6 +329,11 @@ impl Written {
 
     pub(super) fn is_delete(&self) -> bool {
         self.content == 1
+    }
+
+    /// Rows added, or newly deleted (see the field).
+    pub(super) fn added(&self) -> u64 {
+        self.added
     }
 
     /// As a worker reports it to the coordinator (ADR 0091). Column types
@@ -335,6 +354,8 @@ impl Written {
             "spec": self.spec,
             "content": self.content,
             "referenced": self.referenced,
+            "dv": self.dv.map(|(o, l)| [o, l]),
+            "added": self.added,
         })
     }
 }
@@ -407,6 +428,11 @@ impl IcebergSink {
                 Some(c) => return Err(format!("content {c}")),
             },
             spec: v["spec"].as_i64().ok_or("spec")?,
+            dv: match (v["dv"][0].as_i64(), v["dv"][1].as_i64()) {
+                (Some(offset), Some(length)) => Some((offset, length)),
+                _ => None,
+            },
+            added: v["added"].as_u64().ok_or("added")?,
         })
     }
 
@@ -767,6 +793,8 @@ impl IcebergSink {
             referenced: None,
             content: 0,
             spec: self.layout.spec_id,
+            dv: None,
+            added: file.rows,
         })
     }
 
@@ -892,7 +920,19 @@ impl IcebergSink {
             // manifests that list them.
             let mut rewritten = HashMap::new();
             let mut gone = Gone::default();
-            if let (Some(removed), Some(list)) = (removed, parent_list.as_deref()) {
+            // A deletion vector replaces the earlier deletes of its data
+            // file, which it now includes (ADR 0095).
+            let deletes_of: std::collections::HashSet<String> = files
+                .iter()
+                .filter(|f| f.dv.is_some())
+                .filter_map(|f| f.referenced.clone())
+                .collect();
+            let none = std::collections::HashSet::new();
+            let removed_or_none = removed.unwrap_or(&none);
+            if let (true, Some(list)) = (
+                removed.is_some() || !deletes_of.is_empty(),
+                parent_list.as_deref(),
+            ) {
                 let reader = apache_avro::Reader::new(list).map_err(|e| failed(e.to_string()))?;
                 for (n, entry) in reader.enumerate() {
                     let entry = entry.map_err(|e| failed(e.to_string()))?;
@@ -905,8 +945,9 @@ impl IcebergSink {
                     let bytes = read_env(path, env, self.scoped.as_ref())
                         .await
                         .map_err(DataFusionError::from)?;
-                    let Some((copy, counts)) = rewrite_manifest(&bytes, removed, seq, snapshot_id)
-                        .map_err(|e| failed(format!("rewriting {path}: {e}")))?
+                    let Some((copy, counts)) =
+                        rewrite_manifest(&bytes, removed_or_none, &deletes_of, seq, snapshot_id)
+                            .map_err(|e| failed(format!("rewriting {path}: {e}")))?
                     else {
                         continue;
                     };
@@ -919,25 +960,38 @@ impl IcebergSink {
                     gone.add(&counts);
                     rewritten.insert(path.clone(), (new_path, length, counts));
                 }
-                if gone.data_paths.len() != removed.len() {
+                if gone.data_paths.len() != removed_or_none.len() {
                     return Err(failed(
                         "some files to rewrite are no longer in the table; nothing was committed"
                             .into(),
                     ));
                 }
             }
+            // v3 row lineage (ADR 0095): new data manifests take row ids from
+            // the table's next one on, in list order.
+            let version = self.layout.version;
+            let first_row_id = meta["next-row-id"].as_i64().unwrap_or(0);
+            let mut next_row_id = first_row_id;
             let new_entries: Vec<ManifestFile> = manifests
                 .iter()
-                .map(|(content, path, length, group, layout)| ManifestFile {
-                    path: path.clone(),
-                    length: *length,
-                    spec_id: layout.spec_id,
-                    sequence,
-                    snapshot_id,
-                    files: group.len() as i64,
-                    rows: group.iter().map(|f| f.rows as i64).sum(),
-                    partitions: summaries(layout, group),
-                    content: *content,
+                .map(|(content, path, length, group, layout)| {
+                    let rows: i64 = group.iter().map(|f| f.rows as i64).sum();
+                    let first = (version >= 3 && *content == 0).then(|| {
+                        next_row_id += rows;
+                        next_row_id - rows
+                    });
+                    ManifestFile {
+                        path: path.clone(),
+                        length: *length,
+                        spec_id: layout.spec_id,
+                        sequence,
+                        snapshot_id,
+                        files: group.len() as i64,
+                        rows,
+                        partitions: summaries(layout, group),
+                        content: *content,
+                        first_row_id: first,
+                    }
                 })
                 .collect();
             let list = manifest_list(
@@ -947,6 +1001,7 @@ impl IcebergSink {
                 parent,
                 sequence,
                 &rewritten,
+                version,
             )
             .map_err(|e| failed(format!("manifest list: {e}")))?;
             let list_path = format!(
@@ -977,6 +1032,8 @@ impl IcebergSink {
             if change == Change::Replace {
                 summary["deleted-data-files"] = json!(gone.data_paths.len().to_string());
                 summary["deleted-records"] = json!(gone.data_rows.to_string());
+            }
+            if gone.delete_files > 0 {
                 summary["removed-delete-files"] = json!(gone.delete_files.to_string());
                 summary["removed-position-deletes"] = json!(gone.delete_rows.to_string());
             }
@@ -1001,6 +1058,10 @@ impl IcebergSink {
             });
             if let Some(parent) = parent {
                 snapshot["parent-snapshot-id"] = json!(parent);
+            }
+            if version >= 3 {
+                snapshot["first-row-id"] = json!(first_row_id);
+                snapshot["added-rows"] = json!(next_row_id - first_row_id);
             }
             let (requirements, mut updates) = match &self.staged {
                 // The table and its first snapshot in one commit, which
@@ -1278,7 +1339,7 @@ impl IcebergSink {
         let deleted = written
             .iter()
             .filter(|w| w.content == 1)
-            .map(|w| w.rows)
+            .map(|w| w.added)
             .sum();
         if deleted > 0 {
             self.commit_change(&written, update.is_some(), &context.runtime_env())
@@ -1374,7 +1435,7 @@ impl IcebergSink {
             }
             if !positions.is_empty() {
                 written.push(
-                    self.position_deletes(target, positions, run, written.len(), &env)
+                    self.deletes(target, positions, run, written.len(), &env)
                         .await?,
                 );
             }
@@ -1392,6 +1453,106 @@ impl IcebergSink {
         }
         memory.resize(0);
         Ok(written)
+    }
+
+    /// The deletes of `positions` in `target`: a position delete file (v2),
+    /// or a deletion vector (v3, ADR 0095).
+    pub(super) async fn deletes(
+        &self,
+        target: &Target,
+        positions: Vec<i64>,
+        run: u64,
+        n: usize,
+        env: &datafusion::execution::runtime_env::RuntimeEnv,
+    ) -> Result<Written> {
+        if self.layout.version >= 3 {
+            self.deletion_vector(target, positions, run, n, env).await
+        } else {
+            self.position_deletes(target, positions, run, n, env).await
+        }
+    }
+
+    /// A `deletion-vector-v1` blob in its own Puffin file (ADR 0095): every
+    /// deleted position of `target`, the ones earlier deletes removed
+    /// (v3 allows one vector per data file) and `positions`. The commit
+    /// replaces the file's earlier deletes with it.
+    async fn deletion_vector(
+        &self,
+        target: &Target,
+        positions: Vec<i64>,
+        run: u64,
+        n: usize,
+        env: &datafusion::execution::runtime_env::RuntimeEnv,
+    ) -> Result<Written> {
+        use super::deletes::{DV_MAGIC, crc32};
+        let added = positions.len() as u64;
+        let mut bitmap: roaring::RoaringTreemap = positions.into_iter().map(|p| p as u64).collect();
+        if let Some(selection) = &target.selection {
+            let mut at = 0u64;
+            for s in selection.iter() {
+                let end = at + s.row_count as u64;
+                if s.skip {
+                    bitmap.insert_range(at..end);
+                }
+                at = end;
+            }
+        }
+        let mut body = DV_MAGIC.to_vec();
+        bitmap
+            .serialize_into(&mut body)
+            .map_err(|e| DataFusionError::Execution(format!("deletion vector: {e}")))?;
+        let mut blob = u32::try_from(body.len())
+            .map_err(|_| DataFusionError::Execution("deletion vector too large".into()))?
+            .to_be_bytes()
+            .to_vec();
+        blob.extend(&body);
+        blob.extend(crc32(&body).to_be_bytes());
+        // Puffin: magic, the blob, then the footer (magic, JSON, its size,
+        // flags, magic).
+        const PUFFIN: &[u8; 4] = b"PFA1";
+        let cardinality = bitmap.len();
+        let footer = json!({
+            "blobs": [{
+                "type": "deletion-vector-v1",
+                "fields": [2_147_483_645i64],
+                "snapshot-id": -1,
+                "sequence-number": -1,
+                "offset": PUFFIN.len(),
+                "length": blob.len(),
+                "properties": {
+                    "referenced-data-file": target.path,
+                    "cardinality": cardinality.to_string(),
+                },
+            }],
+            "properties": {"created-by": "plimsoll"},
+        })
+        .to_string();
+        let mut bytes = PUFFIN.to_vec();
+        bytes.extend(&blob);
+        bytes.extend(PUFFIN);
+        bytes.extend(footer.as_bytes());
+        bytes.extend(
+            u32::try_from(footer.len())
+                .map_err(|_| DataFusionError::Execution("puffin footer too large".into()))?
+                .to_le_bytes(),
+        );
+        bytes.extend([0u8; 4]);
+        bytes.extend(PUFFIN);
+        let path = format!("{}/data/{run:016x}-dv-{n:05}.puffin", self.location);
+        let size = bytes.len() as u64;
+        self.put_bytes(&path, bytes, env).await?;
+        Ok(Written {
+            path,
+            rows: cardinality,
+            bytes: size,
+            partition: target.partition.clone(),
+            stats: Vec::new(),
+            referenced: Some(target.path.clone()),
+            content: 1,
+            spec: target.spec,
+            dv: Some((PUFFIN.len() as i64, blob.len() as i64)),
+            added,
+        })
     }
 
     /// One position delete file: `(file_path, pos)` rows, sorted, with
@@ -1443,6 +1604,8 @@ impl IcebergSink {
             referenced: Some(target.path.clone()),
             content: 1,
             spec: target.spec,
+            dv: None,
+            added: rows as u64,
         })
     }
 }
@@ -1521,7 +1684,7 @@ fn manifest_entry_schema(layout: &Layout) -> String {
                 {"name": "value", "type": value_type, "field-id": value},
             ]}}], "default": null, "field-id": id})
     };
-    json!({"type": "record", "name": "manifest_entry", "fields": [
+    let mut schema = json!({"type": "record", "name": "manifest_entry", "fields": [
         {"name": "status", "type": "int", "field-id": 0},
         {"name": "snapshot_id", "type": ["null", "long"], "default": null, "field-id": 1},
         {"name": "sequence_number", "type": ["null", "long"], "default": null, "field-id": 3},
@@ -1539,8 +1702,16 @@ fn manifest_entry_schema(layout: &Layout) -> String {
             map("upper_bounds", 128, 129, 130, "bytes"),
             {"name": "referenced_data_file", "type": ["null", "string"], "default": null, "field-id": 143},
         ]}, "field-id": 2},
-    ]})
-    .to_string()
+    ]});
+    // v3 (ADR 0095): row lineage, and where a deletion vector's blob sits.
+    if layout.version >= 3 {
+        if let Some(fields) = schema["fields"][4]["type"]["fields"].as_array_mut() {
+            fields.push(json!({"name": "first_row_id", "type": ["null", "long"], "default": null, "field-id": 142}));
+            fields.push(json!({"name": "content_offset", "type": ["null", "long"], "default": null, "field-id": 144}));
+            fields.push(json!({"name": "content_size_in_bytes", "type": ["null", "long"], "default": null, "field-id": 145}));
+        }
+    }
+    schema.to_string()
 }
 
 /// The v2 `manifest_file` schema (one manifest list entry).
@@ -1566,6 +1737,19 @@ const MANIFEST_FILE: &str = r#"{"type":"record","name":"manifest_file","fields":
  ]},"element-id":508}],"default":null,"field-id":507},
  {"name":"key_metadata","type":["null","bytes"],"default":null,"field-id":519}
 ]}"#;
+
+/// The `manifest_file` schema of format `version`: v3 adds the first row
+/// id of a data manifest's rows (ADR 0095).
+fn manifest_file_schema(version: i64) -> String {
+    if version < 3 {
+        return MANIFEST_FILE.to_owned();
+    }
+    MANIFEST_FILE.replace(
+        r#" {"name":"key_metadata""#,
+        r#" {"name":"first_row_id","type":["null","long"],"default":null,"field-id":520},
+ {"name":"key_metadata""#,
+    )
+}
 
 fn avro_schema(text: &str) -> std::result::Result<AvroSchema, String> {
     AvroSchema::parse_str(text).map_err(|e| e.to_string())
@@ -1680,7 +1864,7 @@ fn manifest(
             ("schema-id", schema_id.to_string()),
             ("partition-spec", layout.spec_fields.to_string()),
             ("partition-spec-id", layout.spec_id.to_string()),
-            ("format-version", "2".to_owned()),
+            ("format-version", layout.version.to_string()),
             (
                 "content",
                 if content == 0 { "data" } else { "deletes" }.to_owned(),
@@ -1723,30 +1907,41 @@ fn manifest(
                 upper.push((*id, Avro::Bytes(b)));
             }
         }
+        let format = if f.dv.is_some() { "PUFFIN" } else { "PARQUET" };
+        let mut data_file = vec![
+            ("content".into(), Avro::Int(content)),
+            ("file_path".into(), Avro::String(f.path.clone())),
+            ("file_format".into(), Avro::String(format.into())),
+            ("partition".into(), Avro::Record(partition)),
+            ("record_count".into(), Avro::Long(f.rows as i64)),
+            ("file_size_in_bytes".into(), Avro::Long(f.bytes as i64)),
+            ("value_counts".into(), avro_map(values)),
+            ("null_value_counts".into(), avro_map(nulls)),
+            ("lower_bounds".into(), avro_map(lower)),
+            ("upper_bounds".into(), avro_map(upper)),
+            (
+                "referenced_data_file".into(),
+                opt(f.referenced.clone().map(Avro::String)),
+            ),
+        ];
+        if layout.version >= 3 {
+            // New rows' ids are inherited from the manifest's first row id.
+            data_file.push(("first_row_id".into(), opt(None)));
+            data_file.push((
+                "content_offset".into(),
+                opt(f.dv.map(|(o, _)| Avro::Long(o))),
+            ));
+            data_file.push((
+                "content_size_in_bytes".into(),
+                opt(f.dv.map(|(_, l)| Avro::Long(l))),
+            ));
+        }
         let entry = Avro::Record(vec![
             ("status".into(), Avro::Int(1)),
             ("snapshot_id".into(), opt(Some(Avro::Long(snapshot_id)))),
             ("sequence_number".into(), opt(None)),
             ("file_sequence_number".into(), opt(None)),
-            (
-                "data_file".into(),
-                Avro::Record(vec![
-                    ("content".into(), Avro::Int(content)),
-                    ("file_path".into(), Avro::String(f.path.clone())),
-                    ("file_format".into(), Avro::String("PARQUET".into())),
-                    ("partition".into(), Avro::Record(partition)),
-                    ("record_count".into(), Avro::Long(f.rows as i64)),
-                    ("file_size_in_bytes".into(), Avro::Long(f.bytes as i64)),
-                    ("value_counts".into(), avro_map(values)),
-                    ("null_value_counts".into(), avro_map(nulls)),
-                    ("lower_bounds".into(), avro_map(lower)),
-                    ("upper_bounds".into(), avro_map(upper)),
-                    (
-                        "referenced_data_file".into(),
-                        opt(f.referenced.clone().map(Avro::String)),
-                    ),
-                ]),
-            ),
+            ("data_file".into(), Avro::Record(data_file)),
         ]);
         writer.append_value(entry).map_err(|e| e.to_string())?;
     }
@@ -1796,6 +1991,8 @@ struct ManifestFile {
     partitions: Vec<FieldSummary>,
     /// 0: data manifest; 1: delete manifest.
     content: i32,
+    /// v3: the row id of the manifest's first new row (ADR 0095).
+    first_row_id: Option<i64>,
 }
 
 /// The new snapshot's manifest list: the new manifest first, then every
@@ -1807,11 +2004,13 @@ fn manifest_list(
     parent_id: Option<i64>,
     sequence: i64,
     rewritten: &HashMap<String, (String, i64, Counts)>,
+    version: i64,
 ) -> std::result::Result<Vec<u8>, String> {
-    let schema = avro_schema(MANIFEST_FILE)?;
+    let text = manifest_file_schema(version);
+    let schema = avro_schema(&text)?;
     let mut writer = avro_writer(
         &schema,
-        MANIFEST_FILE,
+        &text,
         &[
             ("snapshot-id", snapshot_id.to_string()),
             (
@@ -1819,7 +2018,7 @@ fn manifest_list(
                 parent_id.map_or("null".to_owned(), |p| p.to_string()),
             ),
             ("sequence-number", sequence.to_string()),
-            ("format-version", "2".to_owned()),
+            ("format-version", version.to_string()),
         ],
     )?;
     for new in new {
@@ -1835,24 +2034,28 @@ fn manifest_list(
                 ])
             })
             .collect();
+        let mut fields = vec![
+            ("manifest_path".into(), Avro::String(new.path.clone())),
+            ("manifest_length".into(), Avro::Long(new.length)),
+            ("partition_spec_id".into(), Avro::Int(new.spec_id as i32)),
+            ("content".into(), Avro::Int(new.content)),
+            ("sequence_number".into(), Avro::Long(new.sequence)),
+            ("min_sequence_number".into(), Avro::Long(new.sequence)),
+            ("added_snapshot_id".into(), Avro::Long(new.snapshot_id)),
+            ("added_files_count".into(), Avro::Int(new.files as i32)),
+            ("existing_files_count".into(), Avro::Int(0)),
+            ("deleted_files_count".into(), Avro::Int(0)),
+            ("added_rows_count".into(), Avro::Long(new.rows)),
+            ("existing_rows_count".into(), Avro::Long(0)),
+            ("deleted_rows_count".into(), Avro::Long(0)),
+            ("partitions".into(), opt(Some(Avro::Array(partitions)))),
+        ];
+        if version >= 3 {
+            fields.push(("first_row_id".into(), opt(new.first_row_id.map(Avro::Long))));
+        }
+        fields.push(("key_metadata".into(), opt(None)));
         writer
-            .append_value(Avro::Record(vec![
-                ("manifest_path".into(), Avro::String(new.path.clone())),
-                ("manifest_length".into(), Avro::Long(new.length)),
-                ("partition_spec_id".into(), Avro::Int(new.spec_id as i32)),
-                ("content".into(), Avro::Int(new.content)),
-                ("sequence_number".into(), Avro::Long(new.sequence)),
-                ("min_sequence_number".into(), Avro::Long(new.sequence)),
-                ("added_snapshot_id".into(), Avro::Long(new.snapshot_id)),
-                ("added_files_count".into(), Avro::Int(new.files as i32)),
-                ("existing_files_count".into(), Avro::Int(0)),
-                ("deleted_files_count".into(), Avro::Int(0)),
-                ("added_rows_count".into(), Avro::Long(new.rows)),
-                ("existing_rows_count".into(), Avro::Long(0)),
-                ("deleted_rows_count".into(), Avro::Long(0)),
-                ("partitions".into(), opt(Some(Avro::Array(partitions)))),
-                ("key_metadata".into(), opt(None)),
-            ]))
+            .append_value(Avro::Record(fields))
             .map_err(|e| e.to_string())?;
     }
     if let Some(bytes) = parent {
@@ -2007,6 +2210,7 @@ fn read_header(bytes: &[u8]) -> Option<(String, Vec<(String, String)>)> {
 fn rewrite_manifest(
     bytes: &[u8],
     removed: &std::collections::HashSet<String>,
+    deletes_of: &std::collections::HashSet<String>,
     inherited: i64,
     snapshot_id: i64,
 ) -> std::result::Result<Option<(Vec<u8>, Counts)>, String> {
@@ -2037,7 +2241,10 @@ fn rewrite_manifest(
             .unwrap_or(0);
         let gone = match content {
             0 => text("file_path").is_some_and(|p| removed.contains(&p)),
-            1 => text("referenced_data_file").is_some_and(|p| removed.contains(&p)),
+            // Deletes of a removed file go with it; so do the earlier
+            // deletes of a file a new deletion vector now covers (ADR 0095).
+            1 => text("referenced_data_file")
+                .is_some_and(|p| removed.contains(&p) || deletes_of.contains(&p)),
             _ => false,
         };
         let seq = field(&entry, "sequence_number")
@@ -2214,6 +2421,8 @@ mod tests {
             referenced: None,
             content: 0,
             spec: 0,
+            dv: None,
+            added: 0,
         }];
         let refs: Vec<&Written> = files.iter().collect();
         let bytes = manifest(&meta, &layout, &refs, 7, 0, 0).unwrap();
@@ -2283,6 +2492,7 @@ mod tests {
             files: 1,
             rows: 3,
             partitions: summaries(&layout, &refs),
+            first_row_id: None,
         };
         assert_eq!(new.partitions[0].1, Some(19_723i32.to_le_bytes().to_vec()));
         let first = manifest_list(
@@ -2292,6 +2502,7 @@ mod tests {
             None,
             1,
             &HashMap::new(),
+            2,
         )
         .unwrap();
         let second = manifest_list(
@@ -2306,6 +2517,7 @@ mod tests {
             Some(7),
             3,
             &HashMap::new(),
+            2,
         )
         .unwrap();
         let entries: Vec<Avro> = apache_avro::Reader::new(&second[..])
@@ -2337,6 +2549,8 @@ mod tests {
             content: i32::from(referenced.is_some()),
             referenced: referenced.map(str::to_owned),
             spec: 0,
+            dv: None,
+            added: 0,
         };
         // A data manifest with two files, sequence numbers inherited.
         let data = manifest(
@@ -2353,7 +2567,9 @@ mod tests {
         assert!(schema.contains(r#""logicalType":"map""#));
         assert!(metadata.contains(&("content".to_owned(), "data".to_owned())));
         let removed = std::collections::HashSet::from(["a".to_owned()]);
-        let (copy, counts) = rewrite_manifest(&data, &removed, 5, 9).unwrap().unwrap();
+        let (copy, counts) = rewrite_manifest(&data, &removed, &Default::default(), 5, 9)
+            .unwrap()
+            .unwrap();
         assert_eq!((counts.deleted_files, counts.existing_files), (1, 1));
         assert_eq!((counts.deleted_rows, counts.existing_rows), (3, 4));
         assert_eq!(counts.data_paths, ["a"]);
@@ -2373,7 +2589,9 @@ mod tests {
         );
         // Rewritten again: the earlier DELETED entry is dropped.
         let removed_b = std::collections::HashSet::from(["b".to_owned()]);
-        let (again, counts) = rewrite_manifest(&copy, &removed_b, 6, 10).unwrap().unwrap();
+        let (again, counts) = rewrite_manifest(&copy, &removed_b, &Default::default(), 6, 10)
+            .unwrap()
+            .unwrap();
         assert_eq!((counts.deleted_files, counts.existing_files), (1, 0));
         assert_eq!(apache_avro::Reader::new(&again[..]).unwrap().count(), 1);
         // A delete manifest: the delete file referencing a replaced file
@@ -2387,11 +2605,17 @@ mod tests {
             1,
         )
         .unwrap();
-        let (_, counts) = rewrite_manifest(&deletes, &removed, 5, 9).unwrap().unwrap();
+        let (_, counts) = rewrite_manifest(&deletes, &removed, &Default::default(), 5, 9)
+            .unwrap()
+            .unwrap();
         assert_eq!((counts.delete_files, counts.existing_files), (1, 1));
         assert!(counts.data_paths.is_empty());
         let none = std::collections::HashSet::from(["q".to_owned()]);
-        assert!(rewrite_manifest(&deletes, &none, 5, 9).unwrap().is_none());
+        assert!(
+            rewrite_manifest(&deletes, &none, &Default::default(), 5, 9)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2439,7 +2663,10 @@ mod tests {
                 .unwrap_err()
                 .contains("v2")
         );
-        assert!(Layout::of(&table(3, json!([]), flat())).is_err());
+        assert!(
+            Layout::of(&table(4, json!([]), flat())).is_err()
+                && Layout::of(&table(3, json!([]), flat())).is_ok()
+        );
         // Nested columns (ADR 0087): no statistics, ids on every field.
         let nested = json!([{"id": 1, "name": "s", "required": false, "type": {"type": "struct",
             "fields": [{"id": 2, "name": "a", "required": false, "type": "int"}]}}]);
@@ -2548,6 +2775,8 @@ mod tests {
             referenced: None,
             content: 0,
             spec: 0,
+            dv: None,
+            added: 0,
         };
         let back = sink.written_from_json(&file.to_json()).unwrap();
         assert_eq!(back.to_json(), file.to_json());
@@ -2573,6 +2802,8 @@ mod tests {
             referenced: Some("file:///t/data/a.parquet".into()),
             content: 1,
             spec: 4,
+            dv: None,
+            added: 0,
         };
         let back = sink.written_from_json(&deletes.to_json()).unwrap();
         assert!(back.is_delete() && back.referenced.as_deref() == deletes.referenced.as_deref());

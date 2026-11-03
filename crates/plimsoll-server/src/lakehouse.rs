@@ -1087,9 +1087,59 @@ mod tests {
             ));
         })
         .await;
+        // Format v3 (ADR 0095): appends carry row lineage, deletes are
+        // deletion vectors, one per data file (a second delete merges the
+        // first); rewriting rows is refused.
+        let v3 = format!("{name}_v3");
+        Box::pin(async {
+            let t3 = format!("bronze.{v3}");
+            text(&format!(
+                "CREATE TABLE {t3} (id BIGINT NOT NULL) OPTIONS ('format-version' = '3')"
+            ))
+            .await;
+            text(&format!(
+                "INSERT INTO {t3} SELECT value FROM generate_series(1, 10)"
+            ))
+            .await;
+            for sql in [
+                format!("DELETE FROM {t3} WHERE id = 1"),
+                format!("DELETE FROM {t3} WHERE id = 2"),
+            ] {
+                assert!(text(&sql).await.contains("| 1     |"), "{sql}");
+            }
+            let left = text(&format!("SELECT count(*) AS n FROM {t3}")).await;
+            assert!(left.contains("| 8 |"), "{left}");
+            let dvs = text(&format!(
+                "SELECT file_format, record_count FROM bronze.\"{v3}$files\" WHERE content = 1"
+            ))
+            .await;
+            assert!(
+                dvs.contains("| PUFFIN      | 2            |"),
+                "one merged vector: {dvs}"
+            );
+            assert_eq!(
+                dvs.lines().filter(|l| l.contains("PUFFIN")).count(),
+                1,
+                "{dvs}"
+            );
+            let meta = catalog
+                .load_table(&TableIdent::new(Namespace::new(&["bronze"]), &v3))
+                .await
+                .unwrap()
+                .metadata;
+            assert_eq!(meta["next-row-id"], 10);
+            assert_eq!(meta["snapshots"][0]["first-row-id"], 0);
+            assert!(
+                engine
+                    .sql(&format!("UPDATE {t3} SET id = 0 WHERE id = 3"))
+                    .await
+                    .is_err()
+            );
+        })
+        .await;
         // DROP TABLE (ADR 0089) cleans up: gone for queries, and a second
         // drop only passes with IF EXISTS.
-        for t in [name, parted, nested, ctas] {
+        for t in [name, parted, nested, ctas, v3] {
             text(&format!("DROP TABLE bronze.{t} PURGE")).await;
             assert!(
                 engine

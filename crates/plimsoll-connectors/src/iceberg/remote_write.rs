@@ -273,7 +273,7 @@ impl ExecutionPlan for RemoteWriteExec {
                     let deleted = files
                         .iter()
                         .filter(|f| f.is_delete())
-                        .map(|f| f.rows())
+                        .map(|f| f.added())
                         .sum();
                     if deleted > 0 {
                         sink.commit_change(&files, update, &ctx.runtime_env())

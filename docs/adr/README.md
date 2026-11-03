@@ -102,6 +102,7 @@ are allowed in place.
 | [0092](0092-ctas-and-post-shuffle-writes-on-workers.md) | CTAS and post-shuffle writes on workers | Accepted | 2026-11-03 | `WriteTo` (metadata file, or a staged create's metadata inline, and column picks) on fragments and reduces; `distribute` writes on a remote scan's fragments or a shuffle's reducers, for `INSERT` and CTAS (which now hands its checked plan to the create transaction); `RemoteWriteExec` holds its source until the commit so shuffles are not released early | 0091, 0090, 0064, 0065, 0073 |
 | [0093](0093-row-level-writes-on-workers.md) | `DELETE` and `UPDATE` on workers | Accepted | 2026-11-03 | With healthy workers, a writable table, the snapshot's schema current and a portable predicate and new values, target files are split across workers; each re-plans its files at the snapshot and runs the shared rewrite (position deletes, rewritten rows), reporting files as JSON; the coordinator commits one delete/overwrite; MERGE stays local | 0077, 0081, 0091, 0092, 0062 |
 | [0094](0094-merge-on-workers.md) | `MERGE INTO` on workers | Accepted | 2026-11-03 | The source is collected and attached (IPC) to each fragment of target files; workers run `WHEN MATCHED` / `NOT MATCHED BY SOURCE` with clauses as portable SQL over the merged row renamed `t0…`/`s0…`, and report the source rows that paired; the coordinator runs `WHEN NOT MATCHED` over the rest and commits one overwrite | 0082, 0093, 0066, 0063 |
+| [0095](0095-v3-writes.md) | Writes to format v3 tables | Accepted | 2026-11-03 | v3 manifests and manifest lists (first_row_id, content offset/size); commits assign row ids from `next-row-id` (`first-row-id`, `added-rows`); deletes are one Puffin deletion vector per data file including its earlier deletes, which the commit marks DELETED; UPDATE, merge-update and compaction refused on v3 until rewritten rows carry their lineage | 0017, 0075, 0077, 0083, 0093 |
 
 ## Reading order
 
@@ -110,7 +111,7 @@ are allowed in place.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
 - Federation: 0005 → 0006.
 - Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074 → 0091 → 0092 → 0093 → 0094.
-- Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084 → 0085 → 0086 → 0087 → 0088 → 0089 → 0090 → 0091 → 0092 → 0093 → 0094.
+- Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084 → 0085 → 0086 → 0087 → 0088 → 0089 → 0090 → 0091 → 0092 → 0093 → 0094 → 0095.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046.
 

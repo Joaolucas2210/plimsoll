@@ -744,7 +744,7 @@ pub(super) async fn probe(
         if !positions.is_empty() {
             positions.sort_unstable();
             files.push(
-                sink.position_deletes(target, positions, run_id, files.len(), &env)
+                sink.deletes(target, positions, run_id, files.len(), &env)
                     .await?,
             );
         }

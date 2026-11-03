@@ -1168,6 +1168,7 @@ impl TableProvider for IcebergTable {
                     if let Some(name) = set.keys().next() {
                         return refuse(format!("no column {name}"));
                     }
+                    self.keeps_lineage("merge into (WHEN … THEN UPDATE)")?;
                     merge::Action::Update(row)
                 }
                 MergeIntoAction::Insert { columns, values } => {
@@ -1244,6 +1245,7 @@ impl TableProvider for IcebergTable {
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.keeps_lineage("update")?;
         let (exec, schema) = self.row_change("update", state, filters).await?;
         let mut set: HashMap<String, Expr> = HashMap::new();
         for (column, expr) in assignments {
@@ -1765,6 +1767,21 @@ impl IcebergTable {
         Ok((sink, targets, predicate, schema))
     }
 
+    /// Writes that rewrite existing rows (`UPDATE`, a merge's update,
+    /// compaction) are refused on v3 tables (ADR 0095): their rows must
+    /// keep their `_row_id` (row lineage), which Plimsoll does not carry
+    /// into rewritten files yet. Appends and deletes are fine.
+    fn keeps_lineage(&self, verb: &str) -> Result<()> {
+        match &self.layout {
+            Ok(layout) if layout.version() >= 3 => Err(DataFusionError::Plan(format!(
+                "cannot {verb} {}: rewriting rows of a format v3 table would lose their row \
+                 lineage, which is not supported yet (appends and DELETE are)",
+                self.name
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// `exec` run on the workers (ADR 0093): its target files split into
     /// fragments, each rewritten where it lands, the files written
     /// committed here. As it is when there are no healthy workers, the
@@ -1840,6 +1857,7 @@ impl IcebergTable {
     /// has a file carrying deletes (position, deletion vector or
     /// equality), or two small files; its other files stay.
     async fn compact(&self, state: &dyn Session) -> Result<Compaction> {
+        self.keeps_lineage("compact")?;
         let sink = self.writable("compact")?;
         self.register_scoped(state);
         let mut planner = self.clone();

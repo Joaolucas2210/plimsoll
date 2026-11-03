@@ -10,7 +10,7 @@ const FIRST_PARTITION_FIELD: usize = 1000;
 
 /// The request creating table `name` with `schema` (field ids 1…n, `NOT
 /// NULL` as `required`), partitioned by `(transform, column)` pairs and
-/// with `properties`. Format version 2, the one Plimsoll writes.
+/// with `properties`. Format version 2 unless `format-version` asks for 3.
 pub fn create_request(
     name: &str,
     schema: &Schema,
@@ -56,15 +56,18 @@ pub fn create_request(
         .iter()
         .map(|(k, v)| (k.clone(), Value::String(v.clone())))
         .collect();
+    // v2 by default; v3 on request (ADR 0095).
     match props.get("format-version").and_then(Value::as_str) {
-        None | Some("2") => {}
+        None => {
+            props.insert("format-version".into(), "2".into());
+        }
+        Some("2" | "3") => {}
         Some(v) => {
             return Err(unsupported(format!(
-                "format-version {v}: Plimsoll writes version 2"
+                "format-version {v}: Plimsoll writes versions 2 and 3"
             )));
         }
     }
-    props.insert("format-version".into(), "2".into());
     Ok(json!({
         "name": name,
         "schema": {"type": "struct", "schema-id": 0, "fields": fields},
@@ -220,8 +223,13 @@ mod tests {
         // Unknown column, version 3, nested type: refused.
         let bad_column = [("identity".into(), "nope".into())];
         assert!(create_request("t", &schema, &bad_column, &[]).is_err());
+        let v4 = [("format-version".into(), "4".into())];
+        assert!(create_request("t", &schema, &[], &v4).is_err());
         let v3 = [("format-version".into(), "3".into())];
-        assert!(create_request("t", &schema, &[], &v3).is_err());
+        assert_eq!(
+            create_request("t", &schema, &[], &v3).unwrap()["properties"]["format-version"],
+            "3"
+        );
         let unsupported = Schema::new(vec![Field::new("u", DataType::UInt64, true)]);
         assert!(create_request("t", &unsupported, &[], &[]).is_err());
     }

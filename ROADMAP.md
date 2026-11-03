@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Writes to v3 tables: row lineage (`first-row-id`, `added-rows`, manifest `first_row_id`), deletes as deletion vectors in Puffin (one per data file, earlier deletes merged and replaced), `CREATE TABLE … 'format-version' = '3'`; rewrites (UPDATE, merge-update, compaction) refused until lineage is carried (ADR 0095)
 - [x] `MERGE` on workers: the source attached to each fragment of target files; workers run `WHEN MATCHED` / `NOT MATCHED BY SOURCE` with clauses as SQL over a renamed merged row and report the source rows they paired; the coordinator inserts the unpaired ones and commits one overwrite (ADR 0094)
 - [x] `DELETE` and `UPDATE` on workers: target files split across workers, each rewriting its own (position deletes, rewritten rows) from the predicate and new values shipped as SQL; the coordinator commits one delete/overwrite (ADR 0093)
 - [x] CTAS and post-shuffle writes on workers: CTAS hands its plan to the create transaction, workers write into the staged table (metadata sent inline); shuffled aggregates and joins are written by their reducers (ADR 0092)
@@ -127,14 +128,15 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Appends to v3 tables** — write format v3 (row lineage fields,
-`next-row-id`) and deletion vectors instead of position delete files,
-so v3 tables created by other engines take Plimsoll's writes.
+**Row lineage in rewrites** — read `_row_id` and
+`_last_updated_sequence_number` with target rows and write them into
+rewritten files, so `UPDATE`, merge-update and compaction work on v3
+tables (ADR 0095).
 
 ## Missing
 
 **Lakehouse writes** (the largest gap)
-- Appends to v3 (above); decimal partition values; data
+- v3 rewrites (above), several deletion vectors per Puffin file; decimal partition values; data
   a shuffled `MERGE` for sources larger than a node, broadcast-join
   writes; vectorized partition transforms.
 - `MERGE` beyond the pool (spilled source); deletion vectors for v3
