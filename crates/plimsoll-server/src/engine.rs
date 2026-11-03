@@ -17,7 +17,7 @@ use plimsoll_core::datafusion::arrow::json::ArrayWriter;
 use plimsoll_core::datafusion::arrow::record_batch::RecordBatch;
 use plimsoll_core::datafusion::common::ScalarValue;
 use plimsoll_core::datafusion::error::DataFusionError;
-use plimsoll_core::datafusion::execution::SendableRecordBatchStream;
+use plimsoll_core::datafusion::execution::{SendableRecordBatchStream, SpillFile, SpillWriter};
 use plimsoll_core::datafusion::object_store::Error as ObjectStoreError;
 use plimsoll_core::datafusion::parquet::errors::ParquetError;
 use plimsoll_core::engine::{AccessDenied, Engine, QueryResult, QueryTag, TableRead};
@@ -339,8 +339,65 @@ const SHUFFLE_TTL: Duration = Duration::from_secs(300);
 struct ShuffleMap {
     schema: plimsoll_core::datafusion::arrow::datatypes::SchemaRef,
     /// `None` once fetched.
-    buckets: Vec<Option<Vec<RecordBatch>>>,
-    memory: Reservation,
+    buckets: Vec<Option<Kept>>,
+    /// The in-memory buckets.
+    memory: Arc<std::sync::Mutex<Reservation>>,
+}
+
+/// Where a shuffle bucket waits to be fetched (ADR 0067).
+enum Kept {
+    Memory(Vec<RecordBatch>),
+    /// Arrow IPC in a spill file, deleted when dropped.
+    Disk(Arc<dyn SpillFile>),
+}
+
+type SpillStream = StreamWriter<Box<dyn SpillWriter>>;
+
+/// One output partition of a shuffle map, kept as it streams in: in
+/// memory while the pool grants it, then (everything so far, and the
+/// rest) in a spill file.
+async fn keep(
+    mut stream: SendableRecordBatchStream,
+    memory: Arc<std::sync::Mutex<Reservation>>,
+    disk: Arc<plimsoll_core::datafusion::execution::DiskManager>,
+) -> Result<Kept, String> {
+    let lock = || memory.lock().unwrap_or_else(|e| e.into_inner());
+    let schema = stream.schema();
+    let mut held = Vec::new();
+    let mut spill: Option<(Arc<dyn SpillFile>, SpillStream)> = None;
+    let fail = |e: &dyn std::fmt::Display| e.to_string();
+    while let Some(batch) = stream.next().await {
+        let batch = batch.map_err(|e| fail(&e))?;
+        let size = batch.get_array_memory_size();
+        if spill.is_none() && lock().try_grow(size).is_err() {
+            let file = disk
+                .create_tmp_file("shuffle bucket")
+                .map_err(|e| fail(&e))?;
+            let writer = file.open_writer().map_err(|e| fail(&e))?;
+            let mut writer = StreamWriter::try_new(writer, &schema).map_err(|e| fail(&e))?;
+            for b in held.drain(..) {
+                writer.write(&b).map_err(|e| fail(&e))?;
+                lock().shrink(RecordBatch::get_array_memory_size(&b));
+            }
+            spill = Some((file, writer));
+        }
+        match &mut spill {
+            Some((_, writer)) => writer.write(&batch).map_err(|e| fail(&e))?,
+            None => held.push(batch),
+        }
+    }
+    Ok(match spill {
+        None => Kept::Memory(held),
+        Some((file, mut writer)) => {
+            writer.finish().map_err(|e| fail(&e))?;
+            writer
+                .into_inner()
+                .map_err(|e| fail(&e))?
+                .finish()
+                .map_err(|e| fail(&e))?;
+            Kept::Disk(file)
+        }
+    })
 }
 
 impl CoreEngine {
@@ -356,7 +413,8 @@ impl CoreEngine {
         use plimsoll_core::datafusion::physical_expr::expressions::Column;
         use plimsoll_core::datafusion::physical_plan::memory::MemoryStream;
         use plimsoll_core::datafusion::physical_plan::repartition::RepartitionExec;
-        use plimsoll_core::datafusion::physical_plan::{Partitioning, collect_partitioned};
+        use plimsoll_core::datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use plimsoll_core::datafusion::physical_plan::{ExecutionPlan, Partitioning};
         let lock = || MAPS.lock().unwrap_or_else(|e| e.into_inner());
         let key = (bucket.shuffle.clone(), bucket.map);
         let cell = {
@@ -388,22 +446,23 @@ impl CoreEngine {
                 // worker sends a group to the same bucket.
                 let plan = RepartitionExec::try_new(plan, Partitioning::Hash(hash, partitions))
                     .map_err(fail)?;
-                let parts = collect_partitioned(Arc::new(plan), Arc::new(task))
-                    .await
-                    .map_err(fail)?;
-                let memory = self
-                    .0
-                    .pool()
-                    .reserve(
-                        "shuffle-map",
-                        ConsumerKind::Output,
-                        parts
-                            .iter()
-                            .flatten()
-                            .map(RecordBatch::get_array_memory_size)
-                            .sum(),
-                    )
-                    .map_err(|e| e.to_string())?;
+                // Every bucket is drained concurrently (the repartition
+                // feeds them all), each kept in memory or spilled.
+                let plan: Arc<dyn ExecutionPlan> = Arc::new(plan);
+                let task = Arc::new(task);
+                let memory = Arc::new(std::sync::Mutex::new(
+                    self.0
+                        .pool()
+                        .register("shuffle-map", ConsumerKind::Spillable),
+                ));
+                let disk = task.runtime_env().disk_manager.clone();
+                let parts = (0..partitions)
+                    .map(|i| {
+                        let stream = plan.execute(i, task.clone()).map_err(fail)?;
+                        Ok(keep(stream, memory.clone(), disk.clone()))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let parts = futures::future::try_join_all(parts).await?;
                 Ok(Arc::new(std::sync::Mutex::new(ShuffleMap {
                     schema,
                     buckets: parts.into_iter().map(Some).collect(),
@@ -422,31 +481,44 @@ impl CoreEngine {
                     m.buckets.len()
                 )));
             }
-            let batches = m.buckets.get_mut(bucket.index).and_then(Option::take);
-            let size = batches
-                .iter()
-                .flatten()
-                .map(RecordBatch::get_array_memory_size)
-                .sum();
-            m.memory.shrink(size);
+            let kept = m.buckets.get_mut(bucket.index).and_then(Option::take);
+            if let Some(Kept::Memory(batches)) = &kept {
+                let size = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+                m.memory
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .shrink(size);
+            }
             (
                 m.schema.clone(),
-                batches,
+                kept,
                 m.buckets.iter().all(Option::is_none),
             )
         };
         if done {
             lock().remove(&key);
         }
-        let batches = batches.ok_or_else(|| {
+        let kept = batches.ok_or_else(|| {
             EngineError::InvalidQuery(format!(
                 "bucket {} of shuffle {} map {} was already fetched",
                 bucket.index, bucket.shuffle, bucket.map
             ))
         })?;
-        Ok(Box::pin(
-            MemoryStream::try_new(batches, schema, None).map_err(|e| classify(&e))?,
-        ))
+        Ok(match kept {
+            Kept::Memory(batches) => {
+                Box::pin(MemoryStream::try_new(batches, schema, None).map_err(|e| classify(&e))?)
+            }
+            // Read back as it is sent; the file lives until the stream ends.
+            Kept::Disk(file) => {
+                let bytes = file.read_stream().map_err(|e| classify(&e))?;
+                let batches = plimsoll_connectors::remote::decode(bytes.boxed(), schema.clone())
+                    .map(move |b| {
+                        let _file = &file;
+                        b
+                    });
+                Box::pin(RecordBatchStreamAdapter::new(schema, batches))
+            }
+        })
     }
 }
 
@@ -904,6 +976,59 @@ fn object_store(e: &ObjectStoreError, msg: String) -> EngineError {
 mod tests {
     use super::*;
     use plimsoll_core::memory::CeilingPool;
+
+    #[tokio::test]
+    async fn shuffle_buckets_spill_to_disk_when_the_pool_says_no() {
+        use plimsoll_core::datafusion::arrow::array::Int64Array;
+        use plimsoll_core::datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use plimsoll_core::datafusion::execution::runtime_env::RuntimeEnvBuilder;
+        use plimsoll_core::datafusion::physical_plan::memory::MemoryStream;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = |from: i64| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from_iter_values(from..from + 1000))],
+            )
+            .unwrap()
+        };
+        let batches: Vec<_> = (0..4).map(|i| batch(i * 1000)).collect();
+        let disk = RuntimeEnvBuilder::new()
+            .build()
+            .unwrap()
+            .disk_manager
+            .clone();
+        let kept = async |limit: usize| {
+            let pool = Arc::new(CeilingPool::new(limit, 0).unwrap());
+            let memory = Arc::new(std::sync::Mutex::new(
+                pool.register("shuffle-map", ConsumerKind::Spillable),
+            ));
+            let stream = MemoryStream::try_new(batches.clone(), schema.clone(), None).unwrap();
+            let kept = keep(Box::pin(stream), memory.clone(), disk.clone())
+                .await
+                .unwrap();
+            let held = memory.lock().unwrap().size();
+            (kept, held)
+        };
+        // Room for everything: kept in memory, all of it reserved.
+        let (roomy, held) = kept(64 << 20).await;
+        assert!(matches!(&roomy, Kept::Memory(b) if b.len() == 4));
+        assert!(held > 0);
+        // Room for a batch and a half: the bucket spills, the batch held
+        // before is released, and every row reads back from the file.
+        let (tight, held) = kept(batches[0].get_array_memory_size() * 3 / 2).await;
+        let Kept::Disk(file) = tight else {
+            panic!("expected a spilled bucket");
+        };
+        assert_eq!(held, 0);
+        let back: Vec<RecordBatch> = plimsoll_connectors::remote::decode(
+            file.read_stream().unwrap().boxed(),
+            schema.clone(),
+        )
+        .map(|b| b.unwrap())
+        .collect()
+        .await;
+        assert_eq!(back, batches);
+    }
 
     #[tokio::test]
     async fn sql_to_rows_and_typed_errors() {

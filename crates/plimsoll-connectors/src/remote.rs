@@ -1580,8 +1580,9 @@ const END_OF_STREAM: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
 
 /// Arrow IPC bytes -> batches with `schema` (the coordinator's field names
 /// and metadata). A stream that ends without its end-of-stream marker (a
-/// worker that failed mid-scan, ADR 0037) is an error.
-fn decode(
+/// worker that failed mid-scan, ADR 0037; a truncated spill file, ADR
+/// 0067) is an error.
+pub fn decode(
     bytes: BoxStream<'static, Result<Bytes>>,
     schema: SchemaRef,
 ) -> BoxStream<'static, Result<RecordBatch>> {
