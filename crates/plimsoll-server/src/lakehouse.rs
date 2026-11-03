@@ -336,7 +336,7 @@ mod tests {
     /// fixtures stay as other live tests expect them.
     #[tokio::test]
     #[ignore = "needs PLIMSOLL_CATALOG_URI (iceberg-rest-fixture) and its warehouse's storage"]
-    async fn appends_through_the_rest_catalog() {
+    async fn writes_through_the_rest_catalog() {
         use plimsoll_control::catalog::CatalogConfig;
         use plimsoll_control::rest::RestCatalog;
         use plimsoll_core::datafusion::arrow::util::pretty::pretty_format_batches;
@@ -472,6 +472,52 @@ mod tests {
             rows.contains("| eu     | 2 |") && rows.contains("| us     | 2 |"),
             "{rows}"
         );
+        // DELETE (ADR 0077): position deletes, across partitions; rows
+        // already deleted are not deleted again; appends go on after.
+        let deleted = async |sql: String| {
+            let out = text(&sql).await;
+            out.lines().nth(3).unwrap_or_default().to_owned()
+        };
+        assert!(
+            deleted(format!("DELETE FROM {p} WHERE id IN (2, 10)"))
+                .await
+                .contains("| 2 ")
+        );
+        assert!(
+            deleted(format!("DELETE FROM {p} WHERE id IN (2, 10)"))
+                .await
+                .contains("| 0 ")
+        );
+        assert!(
+            deleted(format!("DELETE FROM {t} WHERE name IS NULL"))
+                .await
+                .contains("| 2 ")
+        );
+        text(&format!("INSERT INTO {p} VALUES (11, 'eu')")).await;
+        let ids = text(&format!("SELECT id FROM {p} ORDER BY id")).await;
+        let ids: Vec<&str> = ids
+            .lines()
+            .skip(3)
+            .filter(|l| l.starts_with("| "))
+            .collect();
+        assert_eq!(ids, ["| 1  |", "| 3  |", "| 11 |"]);
+        let left = text(&format!("SELECT id FROM {t} ORDER BY id")).await;
+        assert!(
+            left.contains("| 1  |") && left.contains("| 11 |") && !left.contains("| 12 |"),
+            "{left}"
+        );
+        let meta = catalog
+            .load_table(&TableIdent::new(Namespace::new(&["bronze"]), &parted))
+            .await
+            .unwrap()
+            .metadata;
+        let ops: Vec<&str> = meta["snapshots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["summary"]["operation"].as_str().unwrap())
+            .collect();
+        assert_eq!(ops, ["append", "append", "delete", "append"]);
         for t in [name, parted] {
             let _ = http
                 .delete(format!("{base}/{t}?purgeRequested=true"))

@@ -13,14 +13,15 @@ use std::time::{Duration, Instant};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::MemorySchemaProvider;
 use datafusion::common::ResolvedTableReference;
-use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
+use datafusion::common::TableReference;
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{ScalarValue, plan_err};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::SQLOptions;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::{Filter, LogicalPlan, WriteOp};
+use datafusion::logical_expr::{Expr, Filter, LogicalPlan, WriteOp};
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use futures::StreamExt;
@@ -313,10 +314,14 @@ impl Engine {
             LogicalPlan::Dml(dml) if dml.op == WriteOp::Insert(InsertOp::Append) => {
                 Some(dml.table_name.clone())
             }
+            LogicalPlan::Dml(dml) if dml.op == WriteOp::Delete => {
+                only_own_predicates(&dml.input, &dml.table_name)?;
+                Some(dml.table_name.clone())
+            }
             LogicalPlan::Dml(_) | LogicalPlan::Copy(_) => {
                 return Err(DataFusionError::Plan(
-                    "only SELECT and INSERT INTO ... are allowed; the query API is otherwise \
-                     read-only"
+                    "only SELECT, INSERT INTO ... and DELETE FROM ... are allowed; the query API \
+                     is otherwise read-only"
                         .into(),
                 ));
             }
@@ -495,6 +500,36 @@ fn bind(df: DataFrame, params: &[ScalarValue]) -> Result<DataFrame> {
         })
         .collect::<Result<Vec<_>>>()?;
     df.with_param_values(values)
+}
+
+/// A `DELETE`'s rows must be chosen by predicates on the table's own
+/// columns (ADR 0077). DataFusion hands a provider only the predicates on
+/// the target and silently drops the rest: a subquery or join in the
+/// WHERE would turn into a predicate-less delete of every row. Refused.
+fn only_own_predicates(input: &LogicalPlan, target: &TableReference) -> Result<()> {
+    let refuse = || {
+        Err(DataFusionError::Plan(
+            "DELETE supports WHERE predicates on the table's own columns only (no subqueries \
+             or joins)"
+                .into(),
+        ))
+    };
+    let mut bad = false;
+    input.apply(|node| {
+        bad |= match node {
+            LogicalPlan::TableScan(scan) => !scan.table_name.resolved_eq(target),
+            LogicalPlan::Filter(f) => f.predicate.exists(|e| {
+                Ok(matches!(
+                    e,
+                    Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_)
+                ))
+            })?,
+            LogicalPlan::Projection(_) | LogicalPlan::SubqueryAlias(_) => false,
+            _ => true,
+        };
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    if bad { refuse() } else { Ok(()) }
 }
 
 /// A planned query's result stream. Dropping it stops the query; spill is
@@ -705,7 +740,7 @@ mod tests {
     /// grants it, and never a way past read grants on its source; `COPY`,
     /// `UPDATE` and `DELETE` stay refused (ADR 0024).
     #[tokio::test]
-    async fn inserts_need_a_write_grant_and_other_writes_stay_refused() {
+    async fn writes_need_a_write_grant_and_other_writes_stay_refused() {
         struct Writes(&'static str);
         impl TableAccess for Writes {
             fn check(&self, table: &ResolvedTableReference) -> Result<()> {
@@ -764,9 +799,36 @@ mod tests {
             .await
             .unwrap_err();
         assert!(denied(&err));
+        // DELETE (ADR 0077): the same write grant...
+        let err = e
+            .sql_with(
+                "DELETE FROM silver.s WHERE x = 2",
+                &[],
+                Arc::new(Writes("bronze")),
+            )
+            .await
+            .unwrap_err();
+        assert!(denied(&err), "{err}");
+        // ...and only predicates on the table itself: DataFusion would drop
+        // a subquery's predicate and delete every row.
+        for sql in [
+            "DELETE FROM bronze.b WHERE x IN (SELECT x FROM silver.s)",
+            "DELETE FROM bronze.b WHERE EXISTS (SELECT 1 FROM silver.s)",
+            "DELETE FROM bronze.b WHERE x = (SELECT max(x) FROM silver.s)",
+        ] {
+            let err = e.sql_with(sql, &[], bronze.clone()).await.unwrap_err();
+            assert!(err.to_string().contains("own columns only"), "{sql}: {err}");
+        }
+        // Granted and well-formed: the provider deletes.
+        let out = e
+            .sql_with("DELETE FROM bronze.b WHERE x = 3", &[], bronze.clone())
+            .await
+            .unwrap();
+        let count = pretty_format_batches(&out.batches).unwrap().to_string();
+        assert!(count.contains("| 1     |"), "{count}");
+        drop(out);
         for sql in [
             "COPY (SELECT 1) TO '/tmp/plimsoll-copy.csv'",
-            "DELETE FROM bronze.b",
             "UPDATE bronze.b SET x = 0",
             "INSERT OVERWRITE bronze.b SELECT 1",
         ] {
@@ -777,9 +839,10 @@ mod tests {
                 "{sql}: {err}"
             );
         }
-        let rows = e.sql("SELECT count(*) AS n FROM bronze.b").await.unwrap();
+        // 3 (deleted), then 2 (appended): one row left.
+        let rows = e.sql("SELECT x FROM bronze.b").await.unwrap();
         let rows = pretty_format_batches(&rows.batches).unwrap().to_string();
-        assert!(rows.contains("| 2 |"), "{rows}");
+        assert!(rows.contains("| 2 |") && !rows.contains("| 3 |"), "{rows}");
     }
 
     /// A query in a capped group fails on its group's share while the

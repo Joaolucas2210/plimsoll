@@ -105,6 +105,10 @@ struct Part {
 }
 
 impl Layout {
+    pub(super) fn spec_id(&self) -> i64 {
+        self.spec_id
+    }
+
     /// Why `meta` cannot take an append, as an `Err`.
     pub(super) fn of(meta: &Json) -> std::result::Result<Self, String> {
         if meta["format-version"].as_i64() != Some(2) {
@@ -251,7 +255,29 @@ struct Written {
     rows: u64,
     bytes: u64,
     partition: Key,
-    stats: Vec<ColumnStats>,
+    /// Per column: field id, type (when bounds apply) and statistics.
+    stats: Vec<(i64, Option<Prim>, ColumnStats)>,
+    /// A position delete file's one data file (ADR 0077).
+    referenced: Option<String>,
+}
+
+/// What a commit adds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Change {
+    /// Data files (ADR 0075).
+    Append,
+    /// Position delete files (ADR 0077).
+    Delete,
+}
+
+impl Change {
+    /// Manifest and data file `content`: 0 data, 1 position deletes.
+    fn content(self) -> i32 {
+        match self {
+            Self::Append => 0,
+            Self::Delete => 1,
+        }
+    }
 }
 
 /// A unique-enough id for files and snapshots: time, process and a counter.
@@ -442,7 +468,7 @@ impl DataSink for IcebergSink {
         if written.is_empty() {
             return Ok(0);
         }
-        self.commit(&written, &env).await?;
+        self.commit(&written, Change::Append, &env).await?;
         Ok(rows)
     }
 }
@@ -503,7 +529,14 @@ impl IcebergSink {
             rows: file.rows,
             bytes: size,
             partition,
-            stats: file.stats,
+            stats: self
+                .layout
+                .columns
+                .iter()
+                .zip(file.stats)
+                .map(|((id, prim), s)| (*id, *prim, s))
+                .collect(),
+            referenced: None,
         })
     }
 
@@ -528,6 +561,7 @@ impl IcebergSink {
     async fn commit(
         &self,
         files: &[Written],
+        change: Change,
         env: &datafusion::execution::runtime_env::RuntimeEnv,
     ) -> Result<()> {
         let failed = |m: String| DataFusionError::Execution(format!("{}: {m}", self.name));
@@ -535,8 +569,16 @@ impl IcebergSink {
         let snapshot_id = (unique() >> 1) as i64;
         let meta = self.committer.current().await.map_err(failed)?;
         let manifest_path = format!("{}/metadata/{snapshot_id:x}-m0.avro", self.location);
-        let manifest = manifest(&meta, &self.layout, files, snapshot_id, self.schema_id)
-            .map_err(|e| failed(format!("manifest: {e}")))?;
+        let original_parent = main_snapshot(&meta);
+        let manifest = manifest(
+            &meta,
+            &self.layout,
+            files,
+            snapshot_id,
+            self.schema_id,
+            change,
+        )
+        .map_err(|e| failed(format!("manifest: {e}")))?;
         let manifest_length = manifest.len() as i64;
         self.put_bytes(&manifest_path, manifest, env).await?;
         let added_rows: u64 = files.iter().map(|f| f.rows).sum();
@@ -555,9 +597,21 @@ impl IcebergSink {
                         .into(),
                 ));
             }
-            let parent = meta["refs"]["main"]["snapshot-id"]
-                .as_i64()
-                .or_else(|| meta["current-snapshot-id"].as_i64().filter(|id| *id >= 0));
+            let parent = main_snapshot(&meta);
+            // Position deletes name files of the snapshot they were planned
+            // on: only appends may slip in between (their rows are newer
+            // than the deletes and untouched by them).
+            if change == Change::Delete && parent != original_parent {
+                if let Some(op) = operations_since(&meta, parent, original_parent)
+                    .into_iter()
+                    .find(|op| op != "append")
+                {
+                    return Err(failed(format!(
+                        "a concurrent `{op}` changed the table's data during the DELETE; \
+                         nothing was committed, run it again"
+                    )));
+                }
+            }
             let sequence = meta["last-sequence-number"].as_i64().unwrap_or(0) + 1;
             let parent_list = match parent {
                 None => None,
@@ -587,6 +641,7 @@ impl IcebergSink {
                 files: files.len() as i64,
                 rows: added_rows as i64,
                 partitions: summaries(&self.layout, files),
+                content: change.content(),
             };
             let list = manifest_list(
                 &new_entry,
@@ -602,19 +657,31 @@ impl IcebergSink {
                 unique()
             );
             self.put_bytes(&list_path, list, env).await?;
-            let summary = json!({
-                "operation": "append",
-                "added-data-files": files.len().to_string(),
-                "added-records": added_rows.to_string(),
-                "added-files-size": files.iter().map(|f| f.bytes).sum::<u64>().to_string(),
-                "changed-partition-count": files
+            let size = files.iter().map(|f| f.bytes).sum::<u64>().to_string();
+            let mut summary = match change {
+                Change::Append => json!({
+                    "operation": "append",
+                    "added-data-files": files.len().to_string(),
+                    "added-records": added_rows.to_string(),
+                    "added-files-size": size,
+                }),
+                Change::Delete => json!({
+                    "operation": "delete",
+                    "added-delete-files": files.len().to_string(),
+                    "added-position-delete-files": files.len().to_string(),
+                    "added-position-deletes": added_rows.to_string(),
+                    "added-files-size": size,
+                }),
+            };
+            summary["engine-name"] = json!("plimsoll");
+            summary["changed-partition-count"] = json!(
+                files
                     .iter()
                     .map(|f| &f.partition)
                     .collect::<std::collections::HashSet<_>>()
                     .len()
-                    .to_string(),
-                "engine-name": "plimsoll",
-            });
+                    .to_string()
+            );
             let mut snapshot = json!({
                 "snapshot-id": snapshot_id,
                 "sequence-number": sequence,
@@ -647,6 +714,304 @@ impl IcebergSink {
         }
         Err(failed("commit failed".into()))
     }
+}
+
+/// A data file a `DELETE` reads (ADR 0077): every row, in file order, so
+/// a running count is each row's position.
+pub(super) struct Target {
+    pub(super) path: String,
+    pub(super) partition: Key,
+    /// Rows surviving earlier position deletes; `None` = all rows.
+    pub(super) selection: Option<datafusion::parquet::arrow::arrow_reader::RowSelection>,
+    /// A scan of this file alone: one partition, no row selection, no
+    /// pushed predicate.
+    pub(super) plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+}
+
+/// Iceberg's reserved field ids of a position delete file's columns.
+const DELETE_FILE_PATH: i64 = 2_147_483_546;
+const DELETE_POS: i64 = 2_147_483_545;
+
+/// `DELETE FROM t WHERE …` (ADR 0077): position deletes for the rows of
+/// `targets` matching `predicate`, committed as one snapshot.
+pub(super) struct IcebergDeleteExec {
+    pub(super) sink: Arc<IcebergSink>,
+    pub(super) targets: Arc<Vec<Target>>,
+    pub(super) predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+    properties: Arc<datafusion::physical_plan::PlanProperties>,
+}
+
+impl IcebergDeleteExec {
+    pub(super) fn new(
+        sink: IcebergSink,
+        targets: Vec<Target>,
+        predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+    ) -> Self {
+        use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+        let properties = Arc::new(datafusion::physical_plan::PlanProperties::new(
+            datafusion::physical_expr::EquivalenceProperties::new(count_schema()),
+            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        ));
+        Self {
+            sink: Arc::new(sink),
+            targets: Arc::new(targets),
+            predicate,
+            properties,
+        }
+    }
+}
+
+/// The schema DataFusion expects of DML: one `count` column.
+fn count_schema() -> SchemaRef {
+    use datafusion::arrow::datatypes::{Field, Schema};
+    Arc::new(Schema::new(vec![Field::new(
+        "count",
+        DataType::UInt64,
+        false,
+    )]))
+}
+
+impl fmt::Debug for IcebergDeleteExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "IcebergDeleteExec[{}]", self.sink.name)
+    }
+}
+
+impl DisplayAs for IcebergDeleteExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "IcebergDelete[{}] files={} predicate={}",
+            self.sink.name,
+            self.targets.len(),
+            self.predicate
+        )
+    }
+}
+
+impl datafusion::physical_plan::ExecutionPlan for IcebergDeleteExec {
+    fn name(&self) -> &str {
+        "IcebergDeleteExec"
+    }
+
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> Result<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
+    ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let (sink, targets, predicate) = (
+            self.sink.clone(),
+            self.targets.clone(),
+            self.predicate.clone(),
+        );
+        let run = async move {
+            let deleted = sink.delete(&targets, &predicate, &context).await?;
+            Ok(RecordBatch::try_new(
+                count_schema(),
+                vec![Arc::new(datafusion::arrow::array::UInt64Array::from(vec![
+                    deleted,
+                ]))],
+            )?)
+        };
+        Ok(Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                count_schema(),
+                futures::stream::once(run),
+            ),
+        ))
+    }
+}
+
+/// Positions a [`datafusion::parquet::arrow::arrow_reader::RowSelection`]
+/// keeps, as sorted half-open ranges.
+fn kept_ranges(
+    selection: &datafusion::parquet::arrow::arrow_reader::RowSelection,
+) -> Vec<(u64, u64)> {
+    let mut at = 0u64;
+    let mut out = Vec::new();
+    for s in selection.iter() {
+        let end = at + s.row_count as u64;
+        if !s.skip {
+            out.push((at, end));
+        }
+        at = end;
+    }
+    out
+}
+
+/// Whether `pos` survived earlier deletes, given the kept ranges (`None`:
+/// all rows). Positions must be asked in increasing order: `range` walks
+/// forward with them.
+fn alive(kept: Option<&[(u64, u64)]>, pos: u64, range: &mut usize) -> bool {
+    let Some(kept) = kept else { return true };
+    while *range < kept.len() && kept[*range].1 <= pos {
+        *range += 1;
+    }
+    kept.get(*range).is_some_and(|(start, _)| *start <= pos)
+}
+
+impl IcebergSink {
+    /// Finds the rows of `targets` matching `predicate`, writes one
+    /// position delete file per data file with matches, and commits them;
+    /// the number of rows deleted. Rows an earlier delete removed are not
+    /// deleted (or counted) again.
+    async fn delete(
+        &self,
+        targets: &[Target],
+        predicate: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        context: &Arc<TaskContext>,
+    ) -> Result<u64> {
+        use datafusion::arrow::array::AsArray;
+        let env = context.runtime_env();
+        let run = unique();
+        let mut written = Vec::new();
+        for target in targets {
+            let kept = target.selection.as_ref().map(kept_ranges);
+            let mut range = 0;
+            let mut stream = target.plan.execute(0, context.clone())?;
+            let mut offset = 0u64;
+            let mut positions: Vec<i64> = Vec::new();
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                let n = batch.num_rows();
+                let mask = predicate.evaluate(&batch)?.into_array(n)?;
+                let mask = mask.as_boolean_opt().ok_or_else(|| {
+                    DataFusionError::Plan("DELETE predicate is not boolean".into())
+                })?;
+                for i in 0..n {
+                    let pos = offset + i as u64;
+                    // NULL is not true: SQL keeps the row.
+                    if mask.is_valid(i) && mask.value(i) && alive(kept.as_deref(), pos, &mut range)
+                    {
+                        positions.push(pos as i64);
+                    }
+                }
+                offset += n as u64;
+            }
+            if !positions.is_empty() {
+                written.push(
+                    self.position_deletes(target, positions, run, written.len(), &env)
+                        .await?,
+                );
+            }
+        }
+        let deleted = written.iter().map(|w| w.rows).sum();
+        if !written.is_empty() {
+            self.commit(&written, Change::Delete, &env).await?;
+        }
+        Ok(deleted)
+    }
+
+    /// One position delete file: `(file_path, pos)` rows, sorted, with
+    /// Iceberg's reserved field ids.
+    async fn position_deletes(
+        &self,
+        target: &Target,
+        positions: Vec<i64>,
+        run: u64,
+        n: usize,
+        env: &datafusion::execution::runtime_env::RuntimeEnv,
+    ) -> Result<Written> {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+        let field = |name: &str, ty: DataType, id: i64| {
+            Field::new(name, ty, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_owned(),
+                id.to_string(),
+            )]))
+        };
+        let schema = Arc::new(Schema::new(vec![
+            field("file_path", DataType::Utf8, DELETE_FILE_PATH),
+            field("pos", DataType::Int64, DELETE_POS),
+        ]));
+        let rows = positions.len();
+        let paths: ArrayRef = Arc::new(StringArray::from(vec![target.path.as_str(); rows]));
+        let pos: ArrayRef = Arc::new(Int64Array::from(positions));
+        let batch = RecordBatch::try_new(schema.clone(), vec![paths.clone(), pos.clone()])?;
+        let mut writer = ArrowWriter::try_new(Vec::new(), schema, None)?;
+        writer.write(&batch)?;
+        let bytes = writer.into_inner()?;
+        let path = format!("{}/data/{run:016x}-deletes-{n:05}.parquet", self.location);
+        let size = bytes.len() as u64;
+        self.put_bytes(&path, bytes, env).await?;
+        let mut path_stats = ColumnStats::default();
+        path_stats.update(&paths, Some(Prim::String));
+        let mut pos_stats = ColumnStats::default();
+        pos_stats.update(&pos, Some(Prim::Long));
+        Ok(Written {
+            path,
+            rows: rows as u64,
+            bytes: size,
+            partition: target.partition.clone(),
+            stats: vec![
+                (DELETE_FILE_PATH, Some(Prim::String), path_stats),
+                (DELETE_POS, Some(Prim::Long), pos_stats),
+            ],
+            referenced: Some(target.path.clone()),
+        })
+    }
+}
+
+/// The snapshot `main` points at, if any.
+fn main_snapshot(meta: &Json) -> Option<i64> {
+    meta["refs"]["main"]["snapshot-id"]
+        .as_i64()
+        .or_else(|| meta["current-snapshot-id"].as_i64().filter(|id| *id >= 0))
+}
+
+/// The operations of the snapshots from `head` back to (not including)
+/// `base`, following parents. A chain that never reaches `base` reports
+/// an unknown operation, which no caller treats as safe.
+fn operations_since(meta: &Json, head: Option<i64>, base: Option<i64>) -> Vec<String> {
+    let snapshots: HashMap<i64, &Json> = meta["snapshots"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| Some((s["snapshot-id"].as_i64()?, s)))
+        .collect();
+    let mut ops = Vec::new();
+    let mut at = head;
+    while at != base {
+        let Some(snap) = at.and_then(|id| snapshots.get(&id)) else {
+            ops.push("unknown".to_owned());
+            break;
+        };
+        ops.push(
+            snap["summary"]["operation"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_owned(),
+        );
+        at = snap["parent-snapshot-id"].as_i64();
+    }
+    ops
 }
 
 /// The Avro type of a partition value.
@@ -704,6 +1069,7 @@ fn manifest_entry_schema(layout: &Layout) -> String {
             map("null_value_counts", 110, 121, 122, "long"),
             map("lower_bounds", 125, 126, 127, "bytes"),
             map("upper_bounds", 128, 129, 130, "bytes"),
+            {"name": "referenced_data_file", "type": ["null", "string"], "default": null, "field-id": 143},
         ]}, "field-id": 2},
     ]})
     .to_string()
@@ -828,6 +1194,7 @@ fn manifest(
     files: &[Written],
     snapshot_id: i64,
     schema_id: i64,
+    change: Change,
 ) -> std::result::Result<Vec<u8>, String> {
     let schema_json = manifest_entry_schema(layout);
     let schema = avro_schema(&schema_json)?;
@@ -846,7 +1213,14 @@ fn manifest(
             ("partition-spec", layout.spec_fields.to_string()),
             ("partition-spec-id", layout.spec_id.to_string()),
             ("format-version", "2".to_owned()),
-            ("content", "data".to_owned()),
+            (
+                "content",
+                match change {
+                    Change::Append => "data",
+                    Change::Delete => "deletes",
+                }
+                .to_owned(),
+            ),
         ],
     )?;
     for f in files {
@@ -865,7 +1239,7 @@ fn manifest(
         let mut nulls = Vec::new();
         let mut lower = Vec::new();
         let mut upper = Vec::new();
-        for ((id, prim), s) in layout.columns.iter().zip(&f.stats) {
+        for (id, prim, s) in &f.stats {
             values.push((*id, Avro::Long(s.values as i64)));
             nulls.push((*id, Avro::Long(s.nulls as i64)));
             let Some(prim) = prim else { continue };
@@ -889,7 +1263,7 @@ fn manifest(
             (
                 "data_file".into(),
                 Avro::Record(vec![
-                    ("content".into(), Avro::Int(0)),
+                    ("content".into(), Avro::Int(change.content())),
                     ("file_path".into(), Avro::String(f.path.clone())),
                     ("file_format".into(), Avro::String("PARQUET".into())),
                     ("partition".into(), Avro::Record(partition)),
@@ -899,6 +1273,10 @@ fn manifest(
                     ("null_value_counts".into(), avro_map(nulls)),
                     ("lower_bounds".into(), avro_map(lower)),
                     ("upper_bounds".into(), avro_map(upper)),
+                    (
+                        "referenced_data_file".into(),
+                        opt(f.referenced.clone().map(Avro::String)),
+                    ),
                 ]),
             ),
         ]);
@@ -948,6 +1326,8 @@ struct ManifestFile {
     files: i64,
     rows: i64,
     partitions: Vec<FieldSummary>,
+    /// 0: data manifest; 1: delete manifest.
+    content: i32,
 }
 
 /// The new snapshot's manifest list: the new manifest first, then every
@@ -990,7 +1370,7 @@ fn manifest_list(
             ("manifest_path".into(), Avro::String(new.path.clone())),
             ("manifest_length".into(), Avro::Long(new.length)),
             ("partition_spec_id".into(), Avro::Int(new.spec_id as i32)),
-            ("content".into(), Avro::Int(0)),
+            ("content".into(), Avro::Int(new.content)),
             ("sequence_number".into(), Avro::Long(new.sequence)),
             ("min_sequence_number".into(), Avro::Long(new.sequence)),
             ("added_snapshot_id".into(), Avro::Long(new.snapshot_id)),
@@ -1134,9 +1514,15 @@ mod tests {
             rows: 3,
             bytes: 100,
             partition: vec![Some(Datum::Int(19_723))],
-            stats,
+            stats: layout
+                .columns
+                .iter()
+                .zip(stats)
+                .map(|((id, prim), s)| (*id, *prim, s))
+                .collect(),
+            referenced: None,
         }];
-        let bytes = manifest(&meta, &layout, &files, 7, 0).unwrap();
+        let bytes = manifest(&meta, &layout, &files, 7, 0, Change::Append).unwrap();
         // The header keeps the schema as written: Java reads the stats
         // arrays as maps only with their `logicalType`.
         let head = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).into_owned();
@@ -1194,6 +1580,7 @@ mod tests {
         // The list summarizes partitions and carries the parent's
         // manifests, v1-era names included.
         let new = ManifestFile {
+            content: 0,
             path: "m1".into(),
             length: 1,
             spec_id: 0,
@@ -1232,6 +1619,27 @@ mod tests {
         );
         let carried = strip(field(&entries[1], "partitions").unwrap());
         assert!(matches!(carried, Avro::Array(p) if p.len() == 1));
+    }
+
+    #[test]
+    fn earlier_deletes_are_not_deleted_again() {
+        use datafusion::parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+        // Rows 0-1 kept, 2-4 deleted before, 5-6 kept, 7 deleted.
+        let selection = RowSelection::from(vec![
+            RowSelector::select(2),
+            RowSelector::skip(3),
+            RowSelector::select(2),
+            RowSelector::skip(1),
+        ]);
+        let kept = kept_ranges(&selection);
+        assert_eq!(kept, [(0, 2), (5, 7)]);
+        let mut range = 0;
+        let survivors: Vec<u64> = (0..9)
+            .filter(|p| alive(Some(&kept), *p, &mut range))
+            .collect();
+        assert_eq!(survivors, [0, 1, 5, 6]);
+        let mut range = 0;
+        assert!(alive(None, 7, &mut range));
     }
 
     #[test]

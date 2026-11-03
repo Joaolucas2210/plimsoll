@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] `DELETE FROM … WHERE` as position delete files, skipping rows already deleted; subquery predicates refused (DataFusion would drop them); read by Spark and pyiceberg (ADR 0077)
 - [x] Partitioned appends (identity, bucket, truncate, year/month/day/hour) and per-file column statistics, pruned by Plimsoll, Spark and pyiceberg (ADR 0076)
 - [x] `INSERT INTO` Iceberg tables (append): v2, unpartitioned, through the REST catalog commit; write grants per schema; read by Spark and pyiceberg (ADR 0075)
 - [x] Shuffle maps expire with their query's deadline, swept every 5 s; bucket requests for released shuffles refused (ADR 0074)
@@ -109,19 +110,20 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Write path, step 3: `DELETE FROM … WHERE`** — find the matching rows
-of each data file (position deletes, or v3 deletion vectors) and commit
-them as delete files, so rows can be removed without rewriting data;
-readers already apply both (ADR 0014, 0017).
+**Table maintenance: compaction** — rewrite a partition's small files and
+the data files that carry position deletes into fresh files, committed as
+a `replace` snapshot, so readers stop paying for accumulated deletes and
+small appends (ADR 0076/0077 debt); then expire snapshots and remove
+orphan files.
 
 ## Missing
 
 **Lakehouse writes** (the largest gap)
 - Appends to v3 and nested columns; decimal partition values; data
   files written on workers; vectorized partition transforms.
-- `DELETE`/`UPDATE`/`MERGE` as position deletes or deletion vectors,
-  then table maintenance: compaction, expire snapshots, remove orphan
-  files.
+- `UPDATE`/`MERGE` (a delete plus an append in one `overwrite`
+  snapshot); deletion vectors for v3 tables; deletes across partition
+  spec evolution.
 - DDL: `CREATE TABLE` / schema and partition evolution through the
   catalog.
 

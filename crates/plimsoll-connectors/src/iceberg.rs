@@ -818,41 +818,85 @@ impl TableProvider for IcebergTable {
         insert_op: datafusion::logical_expr::dml::InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         use datafusion::logical_expr::dml::InsertOp;
-        let refuse = |why: &str| {
-            Err(DataFusionError::Plan(format!(
-                "cannot insert into {}: {why}",
-                self.name
-            )))
-        };
         if insert_op != InsertOp::Append {
-            return refuse("only appends are supported (INSERT INTO, not OVERWRITE)");
+            return Err(DataFusionError::Plan(format!(
+                "cannot insert into {}: only appends are supported (INSERT INTO, not OVERWRITE)",
+                self.name
+            )));
         }
-        let Some(committer) = &self.committer else {
-            return refuse("only tables served by a REST catalog accept writes");
-        };
-        if self.name.contains('@') {
-            return refuse("a snapshot or branch reference is read-only");
-        }
-        let layout = match &self.layout {
-            Ok(layout) => layout.clone(),
-            Err(why) => return refuse(why),
-        };
-        let Some(location) = &self.location else {
-            return refuse("the table has no location");
-        };
-        let sink = write::IcebergSink {
-            name: self.name.clone(),
-            schema: Arc::new(field_ids::with_field_ids(&self.schema, &self.names)),
-            location: location.trim_end_matches('/').to_owned(),
-            scoped: self.scoped.clone(),
-            committer: committer.clone(),
-            schema_id: self.schema_id,
-            layout,
-        };
+        let sink = self.writable("insert into")?;
         Ok(Arc::new(datafusion::datasource::sink::DataSinkExec::new(
             input,
             Arc::new(sink),
             None,
+        )))
+    }
+
+    /// `DELETE FROM t WHERE …` (ADR 0077): the WHERE predicate prunes the
+    /// data files like a scan's; each remaining file is read in file
+    /// order, and the positions of matching rows are committed as position
+    /// delete files. Refused before anything runs when the table cannot
+    /// take a write.
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+        let sink = self.writable("delete from")?;
+        // Against the table's own columns, unqualified.
+        let filters = filters
+            .into_iter()
+            .map(|f| {
+                f.transform(|e| match e {
+                    Expr::Column(c) => Ok(Transformed::yes(Expr::Column(
+                        datafusion::common::Column::new_unqualified(c.name),
+                    ))),
+                    e => Ok(Transformed::no(e)),
+                })
+                .data()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let predicate = match conjunction(filters.clone()) {
+            Some(e) => {
+                let schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+                state.create_physical_expr(e, &schema)?
+            }
+            None => datafusion::physical_expr::expressions::lit(true),
+        };
+        self.register_scoped(state);
+        let pruner = Pruner::new(&filters, &self.columns);
+        let (files, _, _) = self.data_files(state, &pruner).await?;
+        let mut targets = Vec::with_capacity(files.len());
+        for file in files {
+            if file.spec != sink.layout.spec_id() {
+                return Err(DataFusionError::Plan(format!(
+                    "cannot delete from {}: files written under an older partition spec are \
+                     not supported yet",
+                    self.name
+                )));
+            }
+            // Every row, in order: no selection, no pushed predicate.
+            let whole = DataFile {
+                path: file.path.clone(),
+                size: file.size,
+                rows: file.rows,
+                seq: file.seq,
+                selection: None,
+                spec: file.spec,
+                partition: None,
+                eq: Vec::new(),
+            };
+            let plan = self.parquet_scan(state, &[&whole], None, &[], None).await?;
+            targets.push(write::Target {
+                path: file.path,
+                partition: prune::partition_values(file.partition.as_ref()),
+                selection: file.selection,
+                plan,
+            });
+        }
+        Ok(Arc::new(write::IcebergDeleteExec::new(
+            sink, targets, predicate,
         )))
     }
 
@@ -1258,6 +1302,39 @@ impl IcebergTable {
 }
 
 impl IcebergTable {
+    /// The sink a write commits through, or why this table takes none
+    /// (ADR 0075).
+    fn writable(&self, verb: &str) -> Result<write::IcebergSink> {
+        let refuse = |why: &str| {
+            Err(DataFusionError::Plan(format!(
+                "cannot {verb} {}: {why}",
+                self.name
+            )))
+        };
+        let Some(committer) = &self.committer else {
+            return refuse("only tables served by a REST catalog accept writes");
+        };
+        if self.name.contains('@') {
+            return refuse("a snapshot or branch reference is read-only");
+        }
+        let layout = match &self.layout {
+            Ok(layout) => layout.clone(),
+            Err(why) => return refuse(why),
+        };
+        let Some(location) = &self.location else {
+            return refuse("the table has no location");
+        };
+        Ok(write::IcebergSink {
+            name: self.name.clone(),
+            schema: Arc::new(field_ids::with_field_ids(&self.schema, &self.names)),
+            location: location.trim_end_matches('/').to_owned(),
+            scoped: self.scoped.clone(),
+            committer: committer.clone(),
+            schema_id: self.schema_id,
+            layout,
+        })
+    }
+
     /// Makes the vended store resolvable by DataFusion's scan. Idempotent.
     fn register_scoped(&self, state: &dyn Session) {
         if let Some(s) = &self.scoped {

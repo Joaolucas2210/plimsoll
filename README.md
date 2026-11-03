@@ -112,7 +112,7 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_RESOURCE_GROUPS` | unset | `interactive=4/16,batch=2/64/40%`: per group, max running / max queued (ADR 0023), and optionally a share of the memory ceiling that the group's queries together may hold (ADR 0036); `default` always exists with the global limits |
 | `PLIMSOLL_AUTH_GROUPS` | unset | `etl=batch,ana=interactive\|batch`: groups each user may use, first = their default; unlisted users get `default` (ADR 0023) |
 | `PLIMSOLL_AUTH_GRANTS` | unset | `ana=gold\|silver,etl=*`: schemas each user may read; once set, unlisted users read no data (system tables stay scoped per user) (ADR 0025) |
-| `PLIMSOLL_AUTH_WRITE_GRANTS` | unset | `etl=bronze\|silver`: schemas each user may `INSERT INTO` (appends to v2 Iceberg tables served by the REST catalog, partitioned or not, with column statistics; ADR 0076); unset = no writes; reads of the source still need read grants (ADR 0075) |
+| `PLIMSOLL_AUTH_WRITE_GRANTS` | unset | `etl=bronze\|silver`: schemas each user may `INSERT INTO` and `DELETE FROM` (ADR 0077) (appends to v2 Iceberg tables served by the REST catalog, partitioned or not, with column statistics; ADR 0076); unset = no writes; reads of the source still need read grants (ADR 0075) |
 | `PLIMSOLL_AUTH_COLUMN_DENY` | unset | `ana=gold.users.email\|gold.users.ssn`: columns a user may not read, checked on what each scan reads after optimization, filters and subqueries included; `403 forbidden` (ADR 0044) |
 | `PLIMSOLL_AUTH_ROW_FILTERS` | unset | `{"ana": {"gold.orders": "region = 'eu'"}}`: a SQL predicate every row a user reads from a table must satisfy, applied to every scan (joins, subqueries, time travel); the table's `$` metadata tables are denied to that user (ADR 0045) |
 | `PLIMSOLL_AUTH` | `required` | `disabled` = no authentication, `user` trusted from the body (development only) |
@@ -215,8 +215,8 @@ Roadmap: [ROADMAP.md](ROADMAP.md).
   formats. Open formats (Parquet, Iceberg) and open catalogs only.
 - No in-process TLS yet; deploy the query API behind a TLS-terminating
   proxy. Authentication is bearer tokens (ADR 0021).
-- Writes are appends only (`INSERT INTO`, ADR 0075): no `UPDATE`,
-  `DELETE`, `MERGE`, DDL or table maintenance yet. See
+- Writes are `INSERT INTO` and `DELETE FROM` (ADR 0075–0077): no
+  `UPDATE`, `MERGE`, DDL or table maintenance yet. See
   [ROADMAP.md](ROADMAP.md).
 
 ## License

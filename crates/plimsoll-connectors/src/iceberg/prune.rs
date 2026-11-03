@@ -369,7 +369,9 @@ impl Pruner {
 
 /// A data file's partition record as datums, in spec order. Unknown or
 /// NULL values are `None` (no pruning on them).
-fn partition_values(partition: Option<&apache_avro::types::Value>) -> Vec<Option<Datum>> {
+pub(super) fn partition_values(
+    partition: Option<&apache_avro::types::Value>,
+) -> Vec<Option<Datum>> {
     use apache_avro::types::Value as A;
     let Some(A::Record(fields)) = partition else {
         return Vec::new();
