@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Slow-query log: `PLIMSOLL_SLOW_QUERY_MS`, a `slow_query` line with timings, reads and planning events (ADR 0057)
 - [x] Planning spans in traces: `catalog.load_table` and `iceberg.plan` (files/manifests/deletes) under `planning` (ADR 0056)
 - [x] Exact identity-partition filters: decided per file, no `FilterExec`, partition-filtered `count(*)` from metadata (ADR 0055)
 - [x] `count(*)` from manifest record counts when exact (no deletes, filters or limit) (ADR 0054)
@@ -89,10 +90,11 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Slow-query log**: a `slow_query` warn line (with the plan's scan labels:
-files, manifests, deletes, cache hits) when a query exceeds
-`PLIMSOLL_SLOW_QUERY_MS`, so slow queries are explainable from logs alone,
-without a trace backend.
+**Coordinator/worker split, step 1 — a worker protocol**: execute a
+planned Iceberg scan fragment (a file group with its deletes) on another
+node over Arrow IPC (ADR 0037's encoding), with the same ceiling,
+admission and cancellation semantics, as the first building block of the
+plane split in "Later".
 
 ## Later
 

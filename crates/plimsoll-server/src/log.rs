@@ -118,6 +118,37 @@ impl QueryLog {
     }
 }
 
+impl QueryLog {
+    /// Fields for the `slow_query` event (ADR 0057): identity, timings,
+    /// what was read, and each planning event (catalog loads, Iceberg
+    /// file/manifest/delete counts). Never SQL text.
+    pub fn slow_fields(&self, error: Option<(&str, &str)>) -> Value {
+        let mut fields = self.fields(0, error);
+        if let Value::Object(map) = &mut fields {
+            map.remove("status");
+            map.remove("message");
+            map.insert(
+                "planning_events".into(),
+                Value::Array(
+                    self.plan_events
+                        .iter()
+                        .map(|e| {
+                            let mut o = Map::new();
+                            o.insert("name".into(), json!(e.name));
+                            o.insert("ms".into(), json!((e.duration.as_micros() as f64) / 1e3));
+                            for (k, v) in &e.attrs {
+                                o.insert((*k).into(), json!(v));
+                            }
+                            Value::Object(o)
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        fields
+    }
+}
+
 /// Level for an HTTP status: 5xx error, 4xx warn, else info.
 pub fn level_for(status: u16) -> Level {
     match status {
@@ -174,6 +205,19 @@ mod tests {
             !v.to_string().contains("example.com"),
             "no SQL text in logs"
         );
+
+        // slow_query carries the planning story, still without SQL.
+        log.plan_events = vec![plimsoll_core::plan_trace::PlanEvent {
+            name: "iceberg.plan",
+            start: SystemTime::now(),
+            duration: Duration::from_micros(1500),
+            attrs: vec![("files", "1/3".into())],
+        }];
+        let slow = log.slow_fields(None);
+        assert_eq!(slow["planning_events"][0]["files"], "1/3");
+        assert_eq!(slow["planning_events"][0]["ms"], 1.5);
+        assert_eq!(slow["user"], "ana");
+        assert!(!slow.to_string().contains("example.com"));
 
         let err = log.fields(403, Some(("forbidden", &"x".repeat(2000))));
         assert_eq!(err["code"], "forbidden");

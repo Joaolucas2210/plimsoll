@@ -127,6 +127,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         latency: Default::default(),
         auth: cfg.auth.clone(),
         tracer,
+        slow_query: cfg.slow_query,
     });
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;

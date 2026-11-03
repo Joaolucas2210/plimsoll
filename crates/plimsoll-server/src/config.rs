@@ -38,6 +38,9 @@ pub struct Config {
     pub group_memory: HashMap<String, u8>,
     /// Result cache size, reserved in the pool; zero = off (ADR 0038).
     pub result_cache_bytes: u64,
+    /// `PLIMSOLL_SLOW_QUERY_MS`: queries at least this long log
+    /// `slow_query`; unset or 0 = off (ADR 0057).
+    pub slow_query: Option<Duration>,
 }
 
 impl Config {
@@ -79,6 +82,12 @@ impl Config {
         )?;
 
         let (groups, group_memory) = resource_groups(&lookup)?;
+        let slow_ms: u64 = parse(
+            &lookup,
+            "PLIMSOLL_SLOW_QUERY_MS",
+            Some(0),
+            "expected a non-negative integer",
+        )?;
         let result_cache_bytes: u64 = parse(
             &lookup,
             "PLIMSOLL_RESULT_CACHE_BYTES",
@@ -118,6 +127,7 @@ impl Config {
             catalog_refresh: Duration::from_millis(refresh_ms),
             group_memory,
             result_cache_bytes,
+            slow_query: (slow_ms > 0).then(|| Duration::from_millis(slow_ms)),
         })
     }
 }
@@ -392,5 +402,17 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(e.var, "PLIMSOLL_RESULT_CACHE_BYTES");
+    }
+
+    #[test]
+    fn slow_query_threshold_is_off_by_default() {
+        assert_eq!(cfg(&[]).unwrap().slow_query, None);
+        let c = cfg(&[("PLIMSOLL_SLOW_QUERY_MS", "2500")]).unwrap();
+        assert_eq!(c.slow_query, Some(Duration::from_millis(2500)));
+        assert_eq!(
+            cfg(&[("PLIMSOLL_SLOW_QUERY_MS", "0")]).unwrap().slow_query,
+            None
+        );
+        assert!(cfg(&[("PLIMSOLL_SLOW_QUERY_MS", "soon")]).is_err());
     }
 }

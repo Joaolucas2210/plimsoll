@@ -45,6 +45,8 @@ pub struct AppState {
     pub auth: Auth,
     /// OTLP export; traces are propagated even without it (ADR 0031).
     pub tracer: Option<Tracer>,
+    /// Queries at least this long also log `slow_query` (ADR 0057).
+    pub slow_query: Option<Duration>,
 }
 
 #[derive(Default)]
@@ -376,6 +378,7 @@ async fn sql(
                 Level::Info
             };
             crate::log::emit(level, "query", log.fields(status, error));
+            slow_query(&st, &log, error);
             if let (Some(tracer), true) = (&st.tracer, ctx.sampled) {
                 tracer.record(trace::spans(&ctx, wall, &log, status, error));
             }
@@ -388,10 +391,20 @@ async fn sql(
         .get::<ErrorInfo>()
         .map(|e| (e.code, e.message.as_str()));
     crate::log::emit(level_for(status), "query", log.fields(status, error));
+    slow_query(&st, &log, error);
     if let (Some(tracer), true) = (&st.tracer, ctx.sampled) {
         tracer.record(trace::spans(&ctx, wall, &log, status, error));
     }
     response
+}
+
+/// `slow_query` (ADR 0057): above `PLIMSOLL_SLOW_QUERY_MS`, the query's
+/// planning story goes to the log too, so a slow query is explainable
+/// without a trace backend.
+fn slow_query(st: &AppState, log: &QueryLog, error: Option<(&str, &str)>) {
+    if st.slow_query.is_some_and(|t| log.total >= t) {
+        crate::log::emit(Level::Warn, "slow_query", log.slow_fields(error));
+    }
 }
 
 /// How a streamed query ended, for its deferred log line and trace.
@@ -883,6 +896,7 @@ mod tests {
             latency: Latency::default(),
             auth: Auth::Disabled,
             tracer: None,
+            slow_query: None,
         })
     }
 
