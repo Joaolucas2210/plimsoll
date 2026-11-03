@@ -147,42 +147,61 @@ impl Fragment {
 pub struct RemoteScanExec {
     schema: SchemaRef,
     workers: Arc<Workers>,
-    /// (worker url, fragment), in partition order.
-    fragments: Vec<(String, Fragment)>,
+    /// Healthy workers at planning time: owners and retry targets.
+    urls: Vec<String>,
+    /// In partition order.
+    fragments: Vec<Assigned>,
     properties: Arc<PlanProperties>,
 }
 
+#[derive(Debug, Clone)]
+struct Assigned {
+    /// Index into `urls` of the worker that owns it.
+    worker: usize,
+    fragment: Fragment,
+    bytes: u64,
+}
+
 impl RemoteScanExec {
-    /// Splits `files` round-robin over the workers (empty fragments are
-    /// not sent).
+    /// Assigns `files` (path, size in bytes) to `urls` by bytes (ADR
+    /// 0060): largest first, each to the least-loaded worker (LPT), so
+    /// one huge file does not land beside many others. Unknown sizes
+    /// count as one byte. Empty fragments are not sent.
     pub fn new(
         schema: SchemaRef,
         workers: Arc<Workers>,
         urls: &[String],
         metadata_location: &str,
         snapshot_id: Option<i64>,
-        files: Vec<String>,
+        mut files: Vec<(String, Option<u64>)>,
         columns: Vec<String>,
     ) -> Self {
-        let n = urls.len().max(1);
-        let mut split: Vec<Vec<String>> = vec![Vec::new(); n];
-        for (i, f) in files.into_iter().enumerate() {
-            split[i % n].push(f);
+        files.sort_by(|a, b| {
+            b.1.unwrap_or(1)
+                .cmp(&a.1.unwrap_or(1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let mut load: Vec<(u64, Vec<String>)> = vec![(0, Vec::new()); urls.len()];
+        for (path, size) in files {
+            let Some((bytes, owned)) = load.iter_mut().min_by_key(|(b, _)| *b) else {
+                break;
+            };
+            *bytes += size.unwrap_or(1);
+            owned.push(path);
         }
-        let fragments: Vec<(String, Fragment)> = urls
-            .iter()
-            .zip(split)
-            .filter(|(_, files)| !files.is_empty())
-            .map(|(url, files)| {
-                (
-                    url.clone(),
-                    Fragment {
-                        metadata_location: metadata_location.to_owned(),
-                        snapshot_id,
-                        files,
-                        columns: columns.clone(),
-                    },
-                )
+        let fragments: Vec<Assigned> = load
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (_, files))| !files.is_empty())
+            .map(|(worker, (bytes, files))| Assigned {
+                worker,
+                bytes,
+                fragment: Fragment {
+                    metadata_location: metadata_location.to_owned(),
+                    snapshot_id,
+                    files,
+                    columns: columns.clone(),
+                },
             })
             .collect();
         let properties = Arc::new(PlanProperties::new(
@@ -194,18 +213,28 @@ impl RemoteScanExec {
         Self {
             schema,
             workers,
+            urls: urls.to_vec(),
             fragments,
             properties,
         }
+    }
+
+    /// (worker url, files, bytes) per fragment, in partition order.
+    pub fn assignments(&self) -> Vec<(String, usize, u64)> {
+        self.fragments
+            .iter()
+            .map(|a| (self.urls[a.worker].clone(), a.fragment.files.len(), a.bytes))
+            .collect()
     }
 }
 
 impl DisplayAs for RemoteScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        let files: usize = self.fragments.iter().map(|(_, fr)| fr.files.len()).sum();
+        let files: usize = self.fragments.iter().map(|a| a.fragment.files.len()).sum();
+        let bytes: Vec<u64> = self.fragments.iter().map(|a| a.bytes).collect();
         write!(
             f,
-            "RemoteScanExec: fragments={} files={files}",
+            "RemoteScanExec: fragments={} files={files} bytes={bytes:?}",
             self.fragments.len()
         )
     }
@@ -247,25 +276,138 @@ impl ExecutionPlan for RemoteScanExec {
     ) -> Result<SendableRecordBatchStream> {
         let tag = ctx.session_config().get_extension::<QueryTag>();
         let schema = self.schema.clone();
-        let Some((url, fragment)) = self.fragments.get(partition).cloned() else {
+        let Some(assigned) = self.fragments.get(partition).cloned() else {
             // No files at all: an empty partition.
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 schema,
                 stream::empty(),
             )));
         };
-        let workers = self.workers.clone();
-        let body = stream::once(open(workers, url, fragment, tag))
-            .flat_map(|r| match r {
-                Ok(s) => s,
-                Err(e) => stream::iter([Err(e)]).boxed(),
-            })
-            .boxed();
+        // The owner first, then one other healthy worker (ADR 0060).
+        let n = self.urls.len();
+        let targets: Vec<String> = (0..n.min(2))
+            .map(|i| self.urls[(assigned.worker + i) % n].clone())
+            .collect();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema.clone(),
-            decode(body, schema),
+            with_retry(
+                self.workers.clone(),
+                targets,
+                assigned.fragment,
+                tag,
+                schema,
+            ),
         )))
     }
+}
+
+/// A fragment request's failure, and whether another worker may be tried.
+#[derive(Debug)]
+struct WorkerError {
+    message: String,
+    /// Connection failures, 429 and 5xx: another worker may succeed. A
+    /// 4xx other than 429 (bad token, bad request) would fail there too.
+    retryable: bool,
+}
+
+impl fmt::Display for WorkerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for WorkerError {}
+
+fn worker_error(message: String, retryable: bool) -> DataFusionError {
+    DataFusionError::External(Box::new(WorkerError { message, retryable }))
+}
+
+/// Runs the fragment on `targets[0]`; if it fails before its first batch
+/// with a retryable error, once more on `targets[1]` (ADR 0060). Before
+/// the first batch nothing has been emitted, so a retry cannot duplicate
+/// rows; after it, any failure fails the query.
+fn with_retry(
+    workers: Arc<Workers>,
+    targets: Vec<String>,
+    fragment: Fragment,
+    tag: Option<Arc<QueryTag>>,
+    schema: SchemaRef,
+) -> BoxStream<'static, Result<RecordBatch>> {
+    struct Run {
+        workers: Arc<Workers>,
+        targets: VecDeque<String>,
+        fragment: Fragment,
+        tag: Option<Arc<QueryTag>>,
+        schema: SchemaRef,
+        current: Option<BoxStream<'static, Result<RecordBatch>>>,
+        emitted: bool,
+        first_failure: Option<String>,
+        done: bool,
+    }
+    let run = Run {
+        workers,
+        targets: targets.into(),
+        fragment,
+        tag,
+        schema,
+        current: None,
+        emitted: false,
+        first_failure: None,
+        done: false,
+    };
+    stream::unfold(run, |mut run| async move {
+        loop {
+            if run.done {
+                return None;
+            }
+            let Some(current) = run.current.as_mut() else {
+                let url = run.targets.pop_front()?;
+                let body = stream::once(open(
+                    run.workers.clone(),
+                    url,
+                    run.fragment.clone(),
+                    run.tag.clone(),
+                ))
+                .flat_map(|r| match r {
+                    Ok(s) => s,
+                    Err(e) => stream::iter([Err(e)]).boxed(),
+                })
+                .boxed();
+                run.current = Some(decode(body, run.schema.clone()));
+                continue;
+            };
+            match current.next().await {
+                Some(Ok(batch)) => {
+                    run.emitted = true;
+                    return Some((Ok(batch), run));
+                }
+                Some(Err(e)) => {
+                    let retryable = match &e {
+                        DataFusionError::External(inner) => inner
+                            .downcast_ref::<WorkerError>()
+                            .is_none_or(|w| w.retryable),
+                        // A stream that broke before any batch.
+                        _ => true,
+                    };
+                    if !run.emitted && retryable && !run.targets.is_empty() {
+                        run.first_failure = Some(e.to_string());
+                        run.current = None;
+                        continue;
+                    }
+                    run.done = true;
+                    let e = match run.first_failure.take() {
+                        Some(first) => DataFusionError::External(
+                            format!("{e} (after a retry; first attempt: {first})").into(),
+                        ),
+                        None => e,
+                    };
+                    return Some((Err(e), run));
+                }
+                None => return None,
+            }
+        }
+    })
+    .boxed()
 }
 
 /// POSTs the fragment; errors before the stream keep the worker's message.
@@ -275,7 +417,6 @@ async fn open(
     fragment: Fragment,
     tag: Option<Arc<QueryTag>>,
 ) -> Result<BoxStream<'static, Result<Bytes>>> {
-    let external = |m: String| DataFusionError::External(m.into());
     let mut request = workers
         .client
         .post(format!("{url}/v1/fragment"))
@@ -292,8 +433,9 @@ async fn open(
         if let Some(deadline) = tag.deadline {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(external(
+                return Err(worker_error(
                     "query deadline passed before a fragment was sent".into(),
+                    false,
                 ));
             }
             request = request.header("x-plimsoll-deadline-ms", left.as_millis().to_string());
@@ -303,18 +445,25 @@ async fn open(
         .body(fragment.to_json().to_string())
         .send()
         .await
-        .map_err(|e| external(format!("worker {url}: {e}")))?;
+        .map_err(|e| worker_error(format!("worker {url}: {e}"), true))?;
     if !response.status().is_success() {
         let status = response.status();
+        let retryable = status.as_u16() == 429 || status.is_server_error();
         let text = response.text().await.unwrap_or_default();
-        return Err(external(format!("worker {url} answered {status}: {text}")));
+        return Err(worker_error(
+            format!("worker {url} answered {status}: {text}"),
+            retryable,
+        ));
     }
     let url = Arc::new(url);
     Ok(response
         .bytes_stream()
-        .map(move |b| b.map_err(|e| external(format!("worker {url}: {e}"))))
+        .map(move |b| b.map_err(|e| worker_error(format!("worker {url}: {e}"), true)))
         .boxed())
 }
+
+/// Arrow IPC's end-of-stream marker: continuation, then a zero length.
+const END_OF_STREAM: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
 
 /// Arrow IPC bytes -> batches with `schema` (the coordinator's field names
 /// and metadata). A stream that ends without its end-of-stream marker (a
@@ -329,6 +478,9 @@ fn decode(
         ready: VecDeque<RecordBatch>,
         done: bool,
         schema: SchemaRef,
+        /// The last 8 bytes seen: must be the end-of-stream marker when
+        /// the body ends.
+        tail: Vec<u8>,
     }
     let state = State {
         bytes,
@@ -336,6 +488,7 @@ fn decode(
         ready: VecDeque::new(),
         done: false,
         schema,
+        tail: Vec::with_capacity(16),
     };
     stream::unfold(state, |mut st| async move {
         loop {
@@ -349,6 +502,10 @@ fn decode(
             }
             match st.bytes.next().await {
                 Some(Ok(chunk)) => {
+                    st.tail
+                        .extend_from_slice(&chunk[chunk.len().saturating_sub(8)..]);
+                    let excess = st.tail.len().saturating_sub(8);
+                    st.tail.drain(..excess);
                     let mut buf = Buffer::from(chunk);
                     while !buf.is_empty() {
                         match st.decoder.decode(&mut buf) {
@@ -367,10 +524,16 @@ fn decode(
                 }
                 None => {
                     st.done = true;
-                    if let Err(e) = st.decoder.finish() {
+                    // `finish` accepts a stream cut at a message boundary;
+                    // only the explicit end-of-stream marker proves the
+                    // worker finished (ADR 0060). Without it, rows may be
+                    // missing.
+                    let finished = st.decoder.finish().is_ok() && st.tail == END_OF_STREAM;
+                    if !finished {
                         return Some((
-                            Err(DataFusionError::External(
-                                format!("worker stream ended early: {e}").into(),
+                            Err(worker_error(
+                                "worker stream ended without its end-of-stream marker".into(),
+                                true,
                             )),
                             st,
                         ));
@@ -400,5 +563,59 @@ mod tests {
         let w = Workers::new(vec!["http://w1/".into()], "secret".into()).unwrap();
         assert_eq!(w.urls(), ["http://w1"]);
         assert!(!format!("{w:?}").contains("secret"));
+    }
+
+    #[test]
+    fn fragments_balance_by_bytes() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let urls = vec!["http://w1".to_owned(), "http://w2".to_owned()];
+        let w = Arc::new(Workers::new(urls.clone(), "t".repeat(16)).unwrap());
+        let mb = |n: u64| Some(n << 20);
+        // Round-robin would give w1 {100, 1, 1} and w2 {90, 1}: by bytes,
+        // the 100 MiB file sits alone and the rest join the 90.
+        let files = vec![
+            ("a".into(), mb(100)),
+            ("b".into(), mb(90)),
+            ("c".into(), mb(1)),
+            ("d".into(), mb(1)),
+            ("e".into(), None),
+        ];
+        let plan = RemoteScanExec::new(schema, w, &urls, "m", None, files, vec!["id".into()]);
+        let a = plan.assignments();
+        assert_eq!(a[0], ("http://w1".into(), 1, 100 << 20));
+        assert_eq!(a[1].1, 4);
+        assert_eq!(a[1].2, (92 << 20) + 1);
+    }
+
+    /// Arrow's decoder accepts a stream cut cleanly at a message boundary;
+    /// only the end-of-stream marker proves the worker finished (ADR 0060).
+    #[tokio::test]
+    async fn a_stream_without_its_end_marker_is_an_error() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::ipc::writer::StreamWriter;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1]))])
+            .unwrap();
+        let mut w = StreamWriter::try_new(Vec::new(), &schema).unwrap();
+        w.write(&batch).unwrap();
+        let cut = std::mem::take(w.get_mut());
+        w.finish().unwrap();
+        let marker = std::mem::take(w.get_mut());
+        assert_eq!(marker, END_OF_STREAM);
+        let read = |chunks: Vec<Vec<u8>>| async {
+            let bytes = stream::iter(chunks.into_iter().map(|c| Ok(Bytes::from(c)))).boxed();
+            decode(bytes, schema.clone()).collect::<Vec<_>>().await
+        };
+        let out = read(vec![cut.clone()]).await;
+        assert!(out[0].is_ok(), "the batch itself decodes");
+        let err = out.last().unwrap().as_ref().unwrap_err().to_string();
+        assert!(err.contains("end-of-stream marker"), "{err}");
+        // Complete, even with the marker split across chunks.
+        let (a, b) = marker.split_at(3);
+        let out = read(vec![cut, a.to_vec(), b.to_vec()]).await;
+        assert_eq!(out.len(), 1);
+        assert!(out[0].is_ok());
     }
 }

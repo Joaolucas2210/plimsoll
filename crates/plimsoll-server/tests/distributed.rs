@@ -3,6 +3,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
+
+use futures::StreamExt;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
@@ -257,7 +259,7 @@ async fn fragments_carry_the_query_identity() {
         &[url],
         "file:///t/metadata/v1.metadata.json",
         Some(1),
-        vec!["file:///t/data/a.parquet".into()],
+        vec![("file:///t/data/a.parquet".into(), Some(10))],
         vec!["id".into()],
     ));
     let tag = |deadline: Duration| QueryTag {
@@ -293,4 +295,119 @@ async fn fragments_carry_the_query_identity() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("deadline"), "{err}");
+}
+
+/// How a fake worker answers (ADR 0060 retry tests).
+#[derive(Clone, Copy)]
+enum Fake {
+    Ok,
+    Status(u16),
+    /// One batch, then the connection drops (no end-of-stream marker).
+    Partial,
+}
+
+/// A fake worker; returns its URL and a request counter.
+async fn fake(behaviour: Fake) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use plimsoll_core::datafusion::arrow::array::Int64Array;
+    use plimsoll_core::datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use plimsoll_core::datafusion::arrow::ipc::writer::StreamWriter;
+    use plimsoll_core::datafusion::arrow::record_batch::RecordBatch;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let app = axum::Router::new().route(
+        "/v1/fragment",
+        axum::routing::post(move || {
+            let counter = counter.clone();
+            async move {
+                use axum::response::IntoResponse;
+                counter.fetch_add(1, Ordering::SeqCst);
+                let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+                let batch =
+                    RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![7]))])
+                        .unwrap();
+                let mut w = StreamWriter::try_new(Vec::new(), &schema).unwrap();
+                w.write(&batch).unwrap();
+                match behaviour {
+                    Fake::Status(code) => axum::http::StatusCode::from_u16(code)
+                        .unwrap()
+                        .into_response(),
+                    Fake::Ok => {
+                        w.finish().unwrap();
+                        w.into_inner().unwrap().into_response()
+                    }
+                    Fake::Partial => {
+                        // Not `into_inner`: that would write the marker.
+                        let first = std::mem::take(w.get_mut());
+                        // The batch reaches the coordinator first; only then
+                        // does the worker die.
+                        let body =
+                            futures::stream::once(async move { Ok::<_, std::io::Error>(first) })
+                                .chain(futures::stream::once(async {
+                                    tokio::time::sleep(Duration::from_millis(300)).await;
+                                    Err(std::io::Error::other("worker died"))
+                                }));
+                        axum::body::Body::from_stream(body).into_response()
+                    }
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, hits)
+}
+
+/// A fragment that fails before its first batch is retried once on
+/// another worker; after a batch, or for a non-retryable answer, never.
+#[tokio::test]
+async fn fragments_retry_once_before_the_first_batch() {
+    use plimsoll_core::datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use plimsoll_core::datafusion::physical_plan::{ExecutionPlan, collect};
+    use std::sync::atomic::Ordering;
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let run = async |first: Fake| {
+        let (a, a_hits) = fake(first).await;
+        let (b, b_hits) = fake(Fake::Ok).await;
+        let urls = vec![a, b];
+        let workers = Arc::new(Workers::new(urls.clone(), TOKEN.into()).unwrap());
+        // One file: it belongs to the first worker.
+        let plan = Arc::new(plimsoll_connectors::remote::RemoteScanExec::new(
+            schema.clone(),
+            workers,
+            &urls,
+            "m",
+            None,
+            vec![("f".into(), Some(1))],
+            vec!["id".into()],
+        ));
+        let ctx = plimsoll_core::datafusion::prelude::SessionContext::new();
+        let out = collect(plan as Arc<dyn ExecutionPlan>, ctx.task_ctx()).await;
+        let rows = out.map(|b| b.iter().map(|b| b.num_rows()).sum::<usize>());
+        (
+            rows,
+            a_hits.load(Ordering::SeqCst),
+            b_hits.load(Ordering::SeqCst),
+        )
+    };
+    for code in [503, 429] {
+        let (rows, a, b) = run(Fake::Status(code)).await;
+        assert_eq!(
+            (rows.unwrap(), a, b),
+            (1, 1, 1),
+            "{code}: retried on the other worker"
+        );
+    }
+    // Not retryable: the other worker would refuse the same way.
+    let (rows, a, b) = run(Fake::Status(401)).await;
+    assert!(rows.unwrap_err().to_string().contains("401"));
+    assert_eq!((a, b), (1, 0));
+    // A batch was already emitted: a retry could duplicate rows.
+    let (rows, a, b) = run(Fake::Partial).await;
+    assert!(rows.is_err(), "{rows:?} hits {a} {b}");
+    assert_eq!((a, b), (1, 0));
+    // Healthy first worker: no second request.
+    let (rows, a, b) = run(Fake::Ok).await;
+    assert_eq!((rows.unwrap(), a, b), (1, 1, 0));
 }

@@ -896,7 +896,8 @@ impl TableProvider for IcebergTable {
                     None => self.schema.clone(),
                 };
                 let columns = schema.fields().iter().map(|f| f.name().clone()).collect();
-                let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+                let paths: Vec<(String, Option<u64>)> =
+                    files.iter().map(|f| (f.path.clone(), f.size)).collect();
                 Arc::new(crate::remote::RemoteScanExec::new(
                     schema,
                     workers,
