@@ -345,6 +345,92 @@ pub(super) async fn orphans(
     Ok(out)
 }
 
+/// The maintenance lease's object under a table's location (ADR 0101):
+/// hidden, so neither this nor Iceberg's orphan removal takes it.
+pub const LEASE: &str = ".plimsoll-maintenance";
+
+/// Claims `location`'s table for `ttl_ms` of scheduled maintenance (ADR
+/// 0101), for coordinators sharing a catalog: `false` when another holds
+/// an unexpired claim. Taken with a conditional write, so of two
+/// coordinators claiming at once one wins.
+pub(crate) async fn claim(
+    location: &str,
+    holder: &str,
+    ttl_ms: i64,
+    env: &RuntimeEnv,
+    scoped: Option<&ScopedStore>,
+) -> Result<bool> {
+    let root = ListingTableUrl::parse(format!("{}/", location.trim_end_matches('/')))?;
+    let store = env.object_store(store_url(&root, scoped))?;
+    let path = root.prefix().clone().join(LEASE);
+    claim_in(store.as_ref(), &path, holder, now_ms(), ttl_ms)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+async fn claim_in(
+    store: &dyn datafusion::object_store::ObjectStore,
+    path: &datafusion::object_store::path::Path,
+    holder: &str,
+    now_ms: i64,
+    ttl_ms: i64,
+) -> Result<bool, datafusion::object_store::Error> {
+    use datafusion::object_store::{Error, PutMode, UpdateVersion};
+    let body = || json!({"holder": holder, "until_ms": now_ms + ttl_ms}).to_string();
+    let create = || async {
+        match store
+            .put_opts(path, body().into(), PutMode::Create.into())
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(Error::AlreadyExists { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    };
+    if create().await? {
+        return Ok(true);
+    }
+    let held = match store.get(path).await {
+        Ok(held) => held,
+        // Removed between the two calls: one more try.
+        Err(Error::NotFound { .. }) => return create().await,
+        Err(e) => return Err(e),
+    };
+    let version = UpdateVersion {
+        e_tag: held.meta.e_tag.clone(),
+        version: held.meta.version.clone(),
+    };
+    let lease: Json = serde_json::from_slice(&held.bytes().await?).unwrap_or_default();
+    // An unreadable lease counts as expired: it guards nothing.
+    if lease["until_ms"]
+        .as_i64()
+        .is_some_and(|until| until > now_ms)
+    {
+        return Ok(false);
+    }
+    // Expired: taken over only if nobody did since it was read.
+    match store
+        .put_opts(path, body().into(), PutMode::Update(version).into())
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(Error::Precondition { .. } | Error::AlreadyExists { .. }) => Ok(false),
+        // ponytail: a local filesystem has no compare-and-swap; delete and
+        // create races only between coordinators sharing one machine's disk.
+        Err(Error::NotImplemented { .. }) => {
+            store.delete(path).await?;
+            create().await
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Deletes one object; an already-missing one is fine.
 async fn delete_one(
     (store, path): (
@@ -388,6 +474,31 @@ async fn remove(paths: &[String], env: &RuntimeEnv, scoped: Option<&ScopedStore>
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn one_claim_holds_until_it_expires() {
+        use datafusion::object_store::{local::LocalFileSystem, memory::InMemory, path::Path};
+        let dir = std::env::temp_dir().join(format!("plimsoll-lease-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let local = LocalFileSystem::new_with_prefix(&dir).unwrap();
+        // In memory: compare-and-swap; on disk: the delete-and-create fallback.
+        let stores: [&dyn datafusion::object_store::ObjectStore; 2] = [&InMemory::new(), &local];
+        for store in stores {
+            let path = Path::from(format!("t/{LEASE}"));
+            assert!(claim_in(store, &path, "a", 1_000, 100).await.unwrap());
+            // Held until 1100, by anyone's account.
+            assert!(!claim_in(store, &path, "b", 1_050, 100).await.unwrap());
+            assert!(!claim_in(store, &path, "a", 1_099, 100).await.unwrap());
+            // Expired: taken over, and held by the new claim.
+            assert!(claim_in(store, &path, "b", 1_100, 100).await.unwrap());
+            assert!(!claim_in(store, &path, "a", 1_150, 100).await.unwrap());
+            let lease: Json =
+                serde_json::from_slice(&store.get(&path).await.unwrap().bytes().await.unwrap())
+                    .unwrap();
+            assert_eq!(lease, json!({"holder": "b", "until_ms": 1_200}));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn heads_recent_and_last_ancestors_are_kept() {

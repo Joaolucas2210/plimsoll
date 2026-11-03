@@ -342,6 +342,26 @@ impl IcebergConnector {
         .await?)
     }
 
+    /// Claims the table for `ttl_ms` of scheduled maintenance by
+    /// `holder`; `false` when another coordinator holds it (ADR 0101).
+    pub async fn claim_maintenance(
+        &self,
+        state: &dyn Session,
+        holder: &str,
+        ttl_ms: i64,
+    ) -> Result<bool, ConnectorError> {
+        let sink = self.table.writable("maintain")?;
+        self.table.register_scoped(state);
+        Ok(expire::claim(
+            &sink.location,
+            holder,
+            ttl_ms,
+            state.runtime_env(),
+            self.table.scoped.as_ref(),
+        )
+        .await?)
+    }
+
     /// Finds (and unless `dry_run`, deletes) files under the table
     /// location that nothing references (ADR 0080).
     pub async fn remove_orphans(

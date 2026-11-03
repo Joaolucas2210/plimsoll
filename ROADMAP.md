@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Several coordinators: query ids from random per-node ranges, scheduled maintenance claimed per table with a conditional-write lease in the table's location (ADR 0101)
 - [x] OTLP metrics: the `/metrics` series pushed to `<endpoint>/v1/metrics` as JSON every `OTEL_METRIC_EXPORT_INTERVAL`, flushed on shutdown (ADR 0100)
 - [x] In-process TLS (rotating certificates, private CA for workers) and a broadcast build-side limit with a local-join fallback; column-less broadcast results fixed (ADR 0099)
 - [x] Joins with filters on workers: the residual filter shipped as SQL over `f0…` columns mapped to each side, checked by equivalence after simplification; shuffled, broadcast and gathered joins (ADR 0098)
@@ -158,9 +159,9 @@ aggregation keys, so shuffled and broadcast joins take them too.
 - Cheaper recovery: one re-run of a lost map serving every reducer;
   more than one retry per step (ADR 0072).
 - Postgres (federated) scans stay on the coordinator.
-- Coordinator high availability (several coordinators sharing
-  workers); SRV-based discovery; TLS to workers discovered by IP
-  (ADR 0070).
+- A cluster-wide query list and cancel across coordinators; global
+  admission (ADR 0101); SRV-based discovery; TLS to workers discovered
+  by IP (ADR 0070).
 
 **Planning and performance**
 - Column statistics from manifests (bounds, null counts) and filter

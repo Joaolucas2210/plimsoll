@@ -85,7 +85,8 @@ token with grants on every table, and decide per table what to run.
 **Negative (accepted debt)**
 - **One coordinator should run it.** With several, passes race. Commits
   stay safe (conflict checks and retries), but the work is duplicated.
-  Coordinator HA would add a lease.
+  Coordinator HA would add a lease. Resolved by ADR 0101 (a lease per
+  table, per interval).
 - **Tables are visited serially**, and every table is loaded on every
   pass to read its properties.
 - **No per-step schedule.** Compaction cannot run hourly while

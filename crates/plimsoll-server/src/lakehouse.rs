@@ -412,6 +412,21 @@ pub async fn expire_snapshots(
         .map_err(DataFusionError::from)
 }
 
+/// Claims `table` for `ttl_ms` of scheduled maintenance (ADR 0101);
+/// `false` when another coordinator holds it.
+pub async fn claim_maintenance(
+    ctx: &SessionContext,
+    table: &str,
+    holder: &str,
+    ttl_ms: i64,
+) -> Result<bool> {
+    maintained(ctx, table)
+        .await?
+        .claim_maintenance(&ctx.state(), holder, ttl_ms)
+        .await
+        .map_err(DataFusionError::from)
+}
+
 /// Finds (and unless `dry_run`, deletes) `table`'s orphan files (ADR
 /// 0080).
 pub async fn remove_orphans(
@@ -981,7 +996,18 @@ mod tests {
             for _ in 0..2 {
                 text(&format!("INSERT INTO {p} VALUES (50, 'eu')")).await;
             }
-            assert!(crate::schedule::pass(engine.context(), catalog.as_ref(), None).await >= 1);
+            let hour = std::time::Duration::from_secs(3600);
+            let pass = |holder| {
+                crate::schedule::pass(
+                    engine.context(),
+                    catalog.as_ref(),
+                    None,
+                    Some((holder, hour)),
+                )
+            };
+            assert!(pass("a").await >= 1);
+            // ADR 0101: another coordinator finds every table claimed.
+            assert_eq!(pass("b").await, 0);
             let meta = catalog
                 .load_table(&TableIdent::new(Namespace::new(&["bronze"]), &parted))
                 .await

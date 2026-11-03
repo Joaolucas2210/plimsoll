@@ -146,6 +146,12 @@ impl QueryRegistry {
         }
     }
 
+    /// The id the first registered query gets (the default is 1).
+    pub fn starting_at(self, first: QueryId) -> Self {
+        self.next_id.store(first, Ordering::Relaxed);
+        self
+    }
+
     /// Asks a queued or running query to stop. Who may cancel what is the
     /// caller's decision (the server allows owners and operators).
     pub fn cancel(&self, id: QueryId) -> CancelOutcome {
@@ -777,6 +783,14 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_millis(10), fut).await;
         assert_eq!(adm.registry().snapshot()[0].state, QueryState::Cancelled);
         assert_eq!(adm.load(), (0, 0));
+    }
+
+    #[test]
+    fn ids_start_where_the_node_says() {
+        let reg = QueryRegistry::new(10).starting_at(7 << 32 | 1);
+        assert_eq!(reg.register(&req("a")), 7 << 32 | 1);
+        assert_eq!(reg.register(&req("b")), 7 << 32 | 2);
+        assert_eq!(QueryRegistry::new(10).register(&req("a")), 1);
     }
 
     #[test]

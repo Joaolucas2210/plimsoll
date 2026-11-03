@@ -49,7 +49,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Validated now so a bad catalog config fails at boot, not at first query.
     let catalog = CatalogConfig::from_lookup(|k| std::env::var(k).ok())?;
 
-    let registry = Arc::new(QueryRegistry::new(RETAINED_QUERIES));
+    let registry = Arc::new(QueryRegistry::new(RETAINED_QUERIES).starting_at(first_query_id()));
     let admission = Admission::new(cfg.admission, registry);
 
     // The Plimsoll line: one pool for the whole process. 1/8 is kept for
@@ -146,6 +146,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 catalog.clone(),
                 admission.clone(),
                 cfg.maintenance_interval,
+                // Who holds maintenance claims (ADR 0101), for whoever
+                // reads a lease object.
+                format!(
+                    "{}/{}",
+                    std::env::var("HOSTNAME").unwrap_or_else(|_| "plimsoll".into()),
+                    std::process::id()
+                ),
             ));
         }
         if !cfg.catalog_refresh.is_zero() {
@@ -361,4 +368,18 @@ async fn shutdown_signal(state: Arc<AppState>, delay: std::time::Duration) {
     );
     app::drain(&state, delay).await;
     log::emit(Level::Info, "closing_listener", json!({}));
+}
+
+/// Where this node's query ids start (ADR 0101): a random multiple of 2^32
+/// below 2^53, so coordinators behind one load balancer hand out ids that
+/// do not meet (a cancel cannot reach another's query), and ids stay exact
+/// as JSON numbers.
+fn first_query_id() -> u64 {
+    use ring::rand::SecureRandom;
+    let mut bytes = [0u8; 8];
+    // Only a broken OS fails here; 1 is still a valid start.
+    if ring::rand::SystemRandom::new().fill(&mut bytes).is_err() {
+        return 1;
+    }
+    ((u64::from_le_bytes(bytes) & 0x1F_FFFF) << 32) | 1
 }

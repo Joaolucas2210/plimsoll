@@ -17,7 +17,7 @@
 //! | `plimsoll.maintenance.orphan-age-ms` | 3 days, never under 1 hour |
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use plimsoll_connectors::iceberg::expire::{
     DEFAULT_MAX_AGE_MS, DEFAULT_RETAIN_LAST, ExpireOptions, OrphanOptions,
@@ -99,12 +99,15 @@ impl Policy {
 /// `catalog` (the ones served as schemas). Each step of each table logs a
 /// `scheduled_maintenance` line; a failure moves on to the next step's
 /// table. With `admission`, each table holds a slot while it runs, so
-/// maintenance queues behind queries like any other work. Returns how
-/// many tables were maintained.
+/// maintenance queues behind queries like any other work. With `lease`
+/// (holder, how long), a table is skipped while another coordinator's
+/// claim on it holds, and claimed for that long otherwise (ADR 0101).
+/// Returns how many tables were maintained.
 pub async fn pass(
     ctx: &SessionContext,
     catalog: &dyn Catalog,
     admission: Option<&Admission>,
+    lease: Option<(&str, Duration)>,
 ) -> usize {
     let warn = |what: &str, table: &str, e: String| {
         log::emit(
@@ -130,7 +133,7 @@ pub async fn pass(
             }
         };
         for ident in tables {
-            if run_table(ctx, catalog, admission, &ident).await {
+            if run_table(ctx, catalog, admission, lease, &ident).await {
                 maintained += 1;
             }
         }
@@ -142,6 +145,7 @@ async fn run_table(
     ctx: &SessionContext,
     catalog: &dyn Catalog,
     admission: Option<&Admission>,
+    lease: Option<(&str, Duration)>,
     ident: &TableIdent,
 ) -> bool {
     let table = ident.to_string();
@@ -185,6 +189,30 @@ async fn run_table(
         },
         None => None,
     };
+    // Claimed once a slot is held, so the claim covers the work, not the
+    // wait for it.
+    if let Some((holder, ttl)) = lease {
+        let ttl_ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
+        match crate::lakehouse::claim_maintenance(ctx, &table, holder, ttl_ms).await {
+            Ok(true) => {}
+            Ok(false) => {
+                log::emit(
+                    Level::Info,
+                    "scheduled_maintenance",
+                    json!({"table": table, "step": "claim", "skipped": "held by another coordinator"}),
+                );
+                return false;
+            }
+            Err(e) => {
+                log::emit(
+                    Level::Warn,
+                    "scheduled_maintenance",
+                    json!({"table": table, "step": "claim", "error": e.to_string()}),
+                );
+                return false;
+            }
+        }
+    }
     let step = |name: &'static str, started: Instant, outcome: Result<Value, String>| {
         let ms = (started.elapsed().as_micros() as f64) / 1e3;
         match outcome {
@@ -244,17 +272,25 @@ async fn run_table(
 }
 
 /// Runs [`pass`] every `every`, the next one starting `every` after the
-/// last ended (passes never overlap).
+/// last ended (passes never overlap). Each table is claimed for `every`
+/// as `holder`: of several coordinators, one maintains it per interval.
 pub async fn every(
     ctx: SessionContext,
     catalog: Arc<dyn Catalog>,
     admission: Admission,
-    every: std::time::Duration,
+    every: Duration,
+    holder: String,
 ) {
     loop {
         tokio::time::sleep(every).await;
         let started = Instant::now();
-        let tables = pass(&ctx, catalog.as_ref(), Some(&admission)).await;
+        let tables = pass(
+            &ctx,
+            catalog.as_ref(),
+            Some(&admission),
+            Some((&holder, every)),
+        )
+        .await;
         log::emit(
             Level::Info,
             "scheduled_maintenance_pass",
