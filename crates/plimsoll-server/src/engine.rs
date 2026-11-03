@@ -20,7 +20,6 @@ use plimsoll_core::datafusion::error::DataFusionError;
 use plimsoll_core::datafusion::execution::SendableRecordBatchStream;
 use plimsoll_core::datafusion::object_store::Error as ObjectStoreError;
 use plimsoll_core::datafusion::parquet::errors::ParquetError;
-use plimsoll_core::datafusion::physical_plan::execute_stream;
 use plimsoll_core::engine::{AccessDenied, Engine, QueryResult, TableRead};
 use plimsoll_core::plan_trace::{self, PlanEvent};
 
@@ -227,14 +226,20 @@ impl QueryEngine for CoreEngine {
         .await
         .map_err(|e| fail(e.into()))?;
         let table = connector.source();
-        // Partial aggregation (ADR 0061), built on the provider directly
-        // (`read_table`): no SQL, and nothing registered in the catalog
-        // the worker's users share.
+        // Built on the provider directly (`read_table`): no SQL statement,
+        // and nothing registered in the catalog the worker's users share.
+        // The worker's own ceiling and runtime apply, as for any scan.
+        use plimsoll_core::datafusion::prelude::{SessionContext, ident, lit};
+        let ctx = SessionContext::new_with_state(state);
+        let mut df = ctx.read_table(table).map_err(fail)?;
+        // Row filters (ADR 0062) first, then projection or aggregation.
+        for sql in &f.filters {
+            let filter = df.parse_sql_expr(sql).map_err(fail)?;
+            df = df.filter(filter).map_err(fail)?;
+        }
+        // Partial aggregation (ADR 0061).
         if let Some(spec) = &f.aggregate {
             use plimsoll_core::datafusion::functions_aggregate::expr_fn::{count, max, min, sum};
-            use plimsoll_core::datafusion::prelude::{SessionContext, ident, lit};
-            let ctx = SessionContext::new_with_state(state);
-            let df = ctx.read_table(table).map_err(fail)?;
             let groups = spec.group_by.iter().map(ident).collect::<Vec<_>>();
             let aggregates = spec
                 .aggregates
@@ -263,22 +268,11 @@ impl QueryEngine for CoreEngine {
                     Ok(e.alias(format!("a{i}")))
                 })
                 .collect::<Result<Vec<_>, EngineError>>()?;
-            let df = df.aggregate(groups, aggregates).map_err(fail)?;
-            return df.execute_stream().await.map_err(fail);
+            df = df.aggregate(groups, aggregates).map_err(fail)?;
+        } else {
+            df = df.select(f.columns.iter().map(ident)).map_err(fail)?;
         }
-        let schema = table.schema();
-        let projection = f
-            .columns
-            .iter()
-            .map(|c| schema.index_of(c))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| fail(e.into()))?;
-        // The worker's own ceiling and runtime apply, as for any scan.
-        let plan = table
-            .scan(&state, Some(&projection), &[], None)
-            .await
-            .map_err(fail)?;
-        execute_stream(plan, state.task_ctx()).map_err(fail)
+        df.execute_stream().await.map_err(fail)
     }
 
     async fn execute(

@@ -132,14 +132,23 @@ async fn distributed_scans_match_local_ones() {
                 ),
                 true,
             ),
-            // Not pushed: a filter above the scan, an expression key. (DataFusion
-            // plans count(DISTINCT id) as GROUP BY id under a count: that
-            // inner grouping is pushed, workers return their distinct ids
-            // and the coordinator dedups.)
+            // Row filters travel with the fragment (ADR 0062), so the
+            // filtered aggregation is pushed too.
             (
                 format!("SELECT count(*), sum(id) FROM {t} WHERE id > 3"),
-                false,
+                true,
             ),
+            (
+                format!(
+                    "SELECT {group}, count(*) FROM {t} \
+                     WHERE {group} IS NOT NULL AND id % 2 = 0 GROUP BY {group} ORDER BY {group}"
+                ),
+                true,
+            ),
+            // Not pushed: an expression key. (DataFusion plans
+            // count(DISTINCT id) as GROUP BY id under a count: that inner
+            // grouping is pushed, workers return their distinct ids and the
+            // coordinator dedups.)
             (format!("SELECT count(DISTINCT id) FROM {t}"), true),
             (
                 format!("SELECT id % 3, count(*) FROM {t} GROUP BY id % 3 ORDER BY 1"),
@@ -152,7 +161,26 @@ async fn distributed_scans_match_local_ones() {
             assert!(plan.contains("RemoteScanExec"), "{sql}: {plan}");
             assert_eq!(plan.contains("aggregate=["), pushed, "{sql}: {plan}");
             assert_eq!(got, want, "{sql}");
+            if sql.contains("WHERE") {
+                // Applied by the scan, here and on the workers.
+                assert!(plan.contains("filters=["), "{sql}: {plan}");
+                assert!(!plan.contains("FilterExec"), "{sql}: {plan}");
+            }
         }
+        // The local scan's own filtering, checked against a filter it
+        // never sees (an aggregate's FILTER clause).
+        let (filtered, plan) = run(
+            &local,
+            &format!("SELECT count(*) AS n, sum(id) AS s FROM {t} WHERE id > 3"),
+        )
+        .await;
+        assert!(plan.contains("FilterExec"), "{plan}");
+        let (reference, _) = run(
+            &local,
+            &format!("SELECT count(*) FILTER (WHERE id > 3) AS n, sum(id) FILTER (WHERE id > 3) AS s FROM {t}"),
+        )
+        .await;
+        assert_eq!(filtered, reference);
     }
     // A worker that is down fails the query; it never returns less.
     let dead = Engine::new(Arc::new(CeilingPool::new(64 << 20, 0).unwrap()), None).unwrap();

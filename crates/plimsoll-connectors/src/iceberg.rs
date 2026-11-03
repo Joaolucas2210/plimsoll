@@ -38,6 +38,7 @@ use datafusion::parquet::arrow::arrow_reader::RowSelection;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{PhysicalExpr, PhysicalExprRef};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::filter::FilterExecBuilder;
 use datafusion::physical_plan::joins::{HashJoinExecBuilder, PartitionMode};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::union::UnionExec;
@@ -53,6 +54,7 @@ mod deletes;
 mod field_ids;
 mod files;
 pub mod meta;
+mod portable;
 mod prune;
 use deletes::{DeleteFile, EqualityDelete};
 use prune::{PartitionField, Prim, Pruner, Summary};
@@ -791,14 +793,19 @@ impl TableProvider for IcebergTable {
     /// scan enforces them per file, so no `FilterExec` is needed above it.
     /// Everything else is re-checked by DataFusion.
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Result<Vec<Pushdown>> {
+        let schema = DFSchema::try_from(self.schema.as_ref().clone())?;
         Ok(filters
             .iter()
-            .map(
-                |f| match prune::Exact::new(f, &self.columns, &self.identity) {
-                    Some(_) => Pushdown::Exact,
-                    None => Pushdown::Inexact,
-                },
-            )
+            .map(|f| {
+                // Exact by partition (ADR 0055) or by row (ADR 0062).
+                if prune::Exact::new(f, &self.columns, &self.identity).is_some()
+                    || portable::sql(f, &schema).is_some()
+                {
+                    Pushdown::Exact
+                } else {
+                    Pushdown::Inexact
+                }
+            })
             .collect())
     }
 
@@ -833,14 +840,20 @@ impl TableProvider for IcebergTable {
                 ("manifest_cache_hits", stats.manifest_cache_hits.to_string()),
             ],
         );
-        // Exact filters (ADR 0055) are this scan's to enforce: decided per
-        // file from its partition tuple. The rest go to Parquet and are
+        // Exact filters are this scan's to enforce: partition ones (ADR
+        // 0055) decided per file from its partition tuple, row ones (ADR
+        // 0062) applied to the rows read, here or on the workers. All but
+        // partition ones also go to Parquet for pruning; inexact ones are
         // re-checked above the scan.
-        let (mut exact, mut inexact) = (Vec::new(), Vec::new());
+        let table_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        let (mut exact, mut inexact, mut rows) = (Vec::new(), Vec::new(), Vec::new());
         for f in filters {
             match prune::Exact::new(f, &self.columns, &self.identity) {
                 Some(e) => exact.push(e),
-                None => inexact.push(f.clone()),
+                None => {
+                    rows.extend(portable::sql(f, &table_schema));
+                    inexact.push(f.clone());
+                }
             }
         }
         let filters = inexact.as_slice();
@@ -898,17 +911,38 @@ impl TableProvider for IcebergTable {
                 let columns = schema.fields().iter().map(|f| f.name().clone()).collect();
                 let paths: Vec<(String, Option<u64>)> =
                     files.iter().map(|f| (f.path.clone(), f.size)).collect();
-                Arc::new(crate::remote::RemoteScanExec::new(
-                    schema,
-                    workers,
-                    &urls,
-                    &self.metadata_path,
-                    self.snapshot_id,
-                    paths,
-                    columns,
-                ))
+                Arc::new(
+                    crate::remote::RemoteScanExec::new(
+                        schema,
+                        workers,
+                        &urls,
+                        &self.metadata_path,
+                        self.snapshot_id,
+                        paths,
+                        columns,
+                    )
+                    .with_filters(rows.iter().map(|(_, sql)| sql.clone()).collect()),
+                )
             }
             None => {
+                // Row filters need their columns read, and the limit
+                // applied after them, not inside the Parquet scan.
+                let requested = projection;
+                let widened = projection.filter(|_| !rows.is_empty()).map(|p| {
+                    let mut p = p.clone();
+                    for (f, _) in &rows {
+                        for c in f.column_refs() {
+                            if let Ok(i) = self.schema.index_of(&c.name) {
+                                if !p.contains(&i) {
+                                    p.push(i);
+                                }
+                            }
+                        }
+                    }
+                    p
+                });
+                let projection = widened.as_ref().or(projection);
+                let limit = limit.filter(|_| rows.is_empty());
                 // Files sharing the same equality delete sets scan together; a group
                 // with sets is anti-joined against their keys (ADR 0016).
                 let mut groups: BTreeMap<&[usize], Vec<&DataFile>> = BTreeMap::new();
@@ -963,7 +997,21 @@ impl TableProvider for IcebergTable {
                     }
                     plans.push(plan);
                 }
-                UnionExec::try_new(plans)?
+                let union = UnionExec::try_new(plans)?;
+                match conjunction(rows.iter().map(|(f, _)| f.clone())) {
+                    None => union,
+                    Some(predicate) => {
+                        let schema = DFSchema::try_from(union.schema().as_ref().clone())?;
+                        let predicate = state.create_physical_expr(predicate, &schema)?;
+                        // Back to the requested columns, dropping the
+                        // filter-only ones appended above.
+                        Arc::new(
+                            FilterExecBuilder::new(predicate, union)
+                                .apply_projection(requested.map(|p| (0..p.len()).collect()))?
+                                .build()?,
+                        )
+                    }
+                }
             }
         };
         // Exact row count from the manifests (ADR 0054), when it is exact:

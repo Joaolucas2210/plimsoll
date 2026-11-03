@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Row filters on workers: portable filters (SQL round trip) are exact, enforced by the scan locally and on workers; filtered aggregations pushed (ADR 0062)
 - [x] Partial aggregation on workers: count/sum/min/max and column GROUP BY return partial states, not rows (ADR 0061)
 - [x] Coordinator/worker step 3: fragments balanced by bytes (LPT), one retry on another worker before the first batch, end-of-stream marker required (ADR 0060)
 - [x] Coordinator/worker step 2: fragments under worker admission (`fragments` group), deadline, query id/user/trace propagated, worker health with local fallback (ADR 0059)
@@ -94,11 +95,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Filters and projections on workers**: push inexact filters (as SQL via
-DataFusion's unparser, re-parsed and re-planned on the worker) and
-expression projections into fragments, so filtered aggregations and
-`GROUP BY <expr>` also return partial states, and filtered scans move
-fewer rows.
+**Expression projections on workers**: push computed columns and
+`GROUP BY <expr>` keys into fragments with the same SQL round trip as
+filters (ADR 0062), so they also return partial states.
 
 ## Later
 

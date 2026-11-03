@@ -113,6 +113,9 @@ pub struct Fragment {
     pub columns: Vec<String>,
     /// Aggregate on the worker and return partial states (ADR 0061).
     pub aggregate: Option<AggregateSpec>,
+    /// Row filters as SQL over the table's columns, all to be applied
+    /// before projecting or aggregating (ADR 0062).
+    pub filters: Vec<String>,
 }
 
 /// `<aggregates> GROUP BY <group_by>` over the fragment: what a worker
@@ -132,6 +135,7 @@ impl Fragment {
             "snapshot_id": self.snapshot_id,
             "files": self.files,
             "columns": self.columns,
+            "filters": self.filters,
             "aggregate": self.aggregate.as_ref().map(|a| json!({
                 "group_by": a.group_by,
                 "aggregates": a.aggregates.iter().map(|(f, c)| json!({"fn": f, "column": c})).collect::<Vec<_>>(),
@@ -140,6 +144,26 @@ impl Fragment {
     }
 
     pub fn from_json(v: &Json) -> Result<Self, String> {
+        // A field this worker does not know could change the answer (a
+        // filter it would skip): refuse it rather than ignore it.
+        const KNOWN: [&str; 6] = [
+            "metadata_location",
+            "snapshot_id",
+            "files",
+            "columns",
+            "filters",
+            "aggregate",
+        ];
+        if let Some(unknown) = v
+            .as_object()
+            .ok_or("a fragment is a JSON object")?
+            .keys()
+            .find(|k| !KNOWN.contains(&k.as_str()))
+        {
+            return Err(format!(
+                "unknown fragment field `{unknown}`: worker version mismatch?"
+            ));
+        }
         let strings = |key: &str| -> Result<Vec<String>, String> {
             v[key]
                 .as_array()
@@ -160,6 +184,10 @@ impl Fragment {
             snapshot_id: v["snapshot_id"].as_i64(),
             files: strings("files")?,
             columns: strings("columns")?,
+            filters: match &v["filters"] {
+                Json::Null => Vec::new(),
+                _ => strings("filters")?,
+            },
             aggregate: match &v["aggregate"] {
                 Json::Null => None,
                 a => Some(AggregateSpec {
@@ -246,6 +274,7 @@ impl RemoteScanExec {
                     files,
                     columns: columns.clone(),
                     aggregate: None,
+                    filters: Vec::new(),
                 },
             })
             .collect();
@@ -262,6 +291,14 @@ impl RemoteScanExec {
             fragments,
             properties,
         }
+    }
+
+    /// Every fragment applies `filters` (SQL, ADR 0062) on its worker.
+    pub fn with_filters(mut self, filters: Vec<String>) -> Self {
+        for a in &mut self.fragments {
+            a.fragment.filters = filters.clone();
+        }
+        self
     }
 
     /// The same fragments, each aggregated on its worker into the partial
@@ -316,9 +353,16 @@ impl DisplayAs for RemoteScanExec {
                     .collect();
                 format!(" aggregate=[{}] group_by={:?}", aggs.join(", "), a.group_by)
             });
+        let filters = self
+            .fragments
+            .first()
+            .filter(|a| !a.fragment.filters.is_empty())
+            .map_or(String::new(), |a| {
+                format!(" filters={:?}", a.fragment.filters)
+            });
         write!(
             f,
-            "RemoteScanExec: fragments={} files={files} bytes={bytes:?}{aggregate}",
+            "RemoteScanExec: fragments={} files={files} bytes={bytes:?}{filters}{aggregate}",
             self.fragments.len()
         )
     }
@@ -776,9 +820,15 @@ mod tests {
                 group_by: vec!["re\"gion".into()],
                 aggregates: vec![("count".into(), None), ("sum".into(), Some("id".into()))],
             }),
+            filters: vec!["id > 3".into()],
         };
         assert_eq!(Fragment::from_json(&f.to_json()).unwrap(), f);
         assert!(Fragment::from_json(&json!({"files": []})).is_err());
+        // A newer coordinator's field is refused, never silently skipped.
+        let mut newer = f.to_json();
+        newer["sample"] = json!(0.1);
+        let e = Fragment::from_json(&newer).unwrap_err();
+        assert!(e.contains("unknown fragment field `sample`"), "{e}");
         let w = Workers::new(vec!["http://w1/".into()], "secret".into()).unwrap();
         assert_eq!(w.urls(), ["http://w1"]);
         assert!(!format!("{w:?}").contains("secret"));
