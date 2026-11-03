@@ -638,7 +638,7 @@ async fn files_without_ids_resolve_through_the_name_mapping() {
 /// Nested Iceberg types map to Arrow nested types (ADR 0041); a history
 /// that renamed a nested child is refused (children resolve by name).
 #[tokio::test]
-async fn nested_types_map_and_nested_renames_are_refused() {
+async fn nested_types_map_and_nested_renames_are_accepted() {
     let nested = |b: &str| {
         json!([
             {"id": 1, "name": "id", "required": true, "type": "long"},
@@ -681,18 +681,15 @@ async fn nested_types_map_and_nested_renames_are_refused() {
         DataType::Map(..)
     ));
 
-    let err = IcebergConnector::from_metadata(
+    // A renamed nested field resolves by id in the scan (ADR 0088).
+    IcebergConnector::from_metadata(
         "n",
         "mem://n",
         &meta(json!([
             {"schema-id": 0, "type": "struct", "fields": nested("bb")},
             {"schema-id": 1, "type": "struct", "fields": nested("b")}])),
     )
-    .unwrap_err();
-    assert!(
-        err.to_string().contains("nested field \"b\" was renamed"),
-        "{err}"
-    );
+    .unwrap();
 }
 
 #[tokio::test]

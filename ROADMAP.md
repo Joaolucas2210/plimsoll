@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Nested field evolution: nested fields resolve by id in the scan (renamed, moved and re-added fields read right); `ALTER TABLE … ADD | RENAME | DROP COLUMN a.b` in Spark's syntax (ADR 0088)
 - [x] Writes to nested columns: field ids at every level (struct fields, list elements, map keys and values), no statistics under a nested column's id; `CREATE TABLE` / `ADD COLUMN` with `STRUCT` and `ARRAY`; read by Spark and pyiceberg (ADR 0087)
 - [x] Scheduled maintenance: `PLIMSOLL_MAINTENANCE_INTERVAL_MS` passes over catalog tables that opt in through properties (`plimsoll.maintenance.*`, Iceberg's `history.expire.*`): compaction, expiration and optional orphan removal under admission (ADR 0086)
 - [x] Partition evolution: `ALTER TABLE … ADD | DROP PARTITION FIELD` (field ids and specs reused); position deletes written in their data file's spec, one manifest per content and spec; compaction moves old-spec files to the current spec (ADR 0085)
@@ -120,11 +121,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Nested field evolution** — resolve nested fields by id in the scan,
-so tables whose nested fields another engine renamed, moved or re-added
-read (and write) instead of being refused; then nested `ALTER TABLE`
-(`ADD COLUMN s.b`, `RENAME COLUMN s.a TO b`) and leaf statistics for
-fields inside structs.
+**`DROP TABLE`** — under its own grant (`PLIMSOLL_AUTH_DROP_GRANTS`),
+through the catalog's `dropTable`, with `PURGE` deleting the table's
+files; the last common DDL statement missing.
 
 ## Missing
 
@@ -135,7 +134,8 @@ fields inside structs.
   tables.
 - Maintenance: a per-table lease for several coordinators, per-step
   schedules, metrics.
-- DDL: nested field evolution, `DROP TABLE` under its own grant, and
+- DDL: `DROP TABLE` (above), nested promotions and leaf statistics for
+  nested fields, and
   one-commit `CREATE TABLE … AS SELECT`.
 
 **Distribution**

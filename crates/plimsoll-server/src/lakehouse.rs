@@ -482,6 +482,8 @@ mod tests {
     /// fixtures stay as other live tests expect them.
     #[tokio::test]
     #[ignore = "needs PLIMSOLL_CATALOG_URI (iceberg-rest-fixture) and its warehouse's storage"]
+    /// Its debug-build futures need more than the default 2 MiB test
+    /// stack: CI runs it with `RUST_MIN_STACK=8388608`.
     async fn writes_through_the_rest_catalog() {
         use plimsoll_control::catalog::CatalogConfig;
         use plimsoll_control::rest::RestCatalog;
@@ -963,6 +965,28 @@ mod tests {
             .await;
             assert!(rows.contains("| 2  | 2 | [z]  |"), "{rows}");
             assert!(!rows.contains("| 1  |"), "{rows}");
+            // Nested evolution (ADR 0088): a field renamed, one dropped and
+            // re-added (a new id, so NULL in old files), one added; old
+            // files read by id.
+            for change in [
+                "RENAME COLUMN s.a TO alpha",
+                "DROP COLUMN s.tags",
+                "ADD COLUMN s.tags VARCHAR",
+                "ADD COLUMN s.b DOUBLE",
+            ] {
+                text(&format!("ALTER TABLE {n} {change}")).await;
+            }
+            text(&format!(
+                "INSERT INTO {n} VALUES (3, named_struct('alpha', 3, 'tags', 't', 'b', 0.5))"
+            ))
+            .await;
+            let rows = text(&format!(
+                "SELECT id, s['alpha'] AS alpha, s['tags'] AS tags, s['b'] AS b FROM {n} ORDER BY id"
+            ))
+            .await;
+            for row in ["| 2  | 2     |      |     |", "| 3  | 3     | t    | 0.5 |"] {
+                assert!(rows.contains(row), "{rows}");
+            }
         })
         .await;
         for t in [name, parted, nested] {

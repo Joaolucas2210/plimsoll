@@ -101,6 +101,8 @@ jobs:
         env:
           PLIMSOLL_PG_URL: postgres://postgres:plimsoll@localhost:5432/postgres
           PLIMSOLL_CATALOG_URI: http://localhost:8181
+          # The write test's debug-build futures outgrow the 2 MiB default.
+          RUST_MIN_STACK: "8388608"
           AWS_ENDPOINT: http://localhost:8333
           AWS_ALLOW_HTTP: "true"
           AWS_ACCESS_KEY_ID: admin

@@ -167,6 +167,62 @@ pub fn alter_updates(
                 }
                 continue;
             }
+            Alteration::AddNestedField { parent, field } => {
+                let Some(children) = struct_at(&mut fields, parent) else {
+                    return plan(format!("{} is not a struct", parent.join(".")));
+                };
+                if children.iter().any(|f| f["name"] == field.name().as_str()) {
+                    return plan(format!(
+                        "field {}.{} already exists",
+                        parent.join("."),
+                        field.name()
+                    ));
+                }
+                last += 1;
+                let id = last;
+                let Some(ty) = field_type(field.data_type(), &mut last) else {
+                    return plan(format!("type {} for Iceberg", field.data_type()));
+                };
+                children
+                    .push(json!({"id": id, "name": field.name(), "required": false, "type": ty}));
+            }
+            Alteration::RenameNestedField { path, to } => {
+                let Some((leaf, parent)) = path.split_last() else {
+                    return plan("an empty field path".into());
+                };
+                let Some(children) = struct_at(&mut fields, parent) else {
+                    return plan(format!("{} is not a struct", parent.join(".")));
+                };
+                if children.iter().any(|f| f["name"] == to.as_str()) {
+                    return plan(format!("field {}.{to} already exists", parent.join(".")));
+                }
+                let Some(f) = children.iter_mut().find(|f| f["name"] == leaf.as_str()) else {
+                    return plan(format!("no field {}", path.join(".")));
+                };
+                f["name"] = json!(to);
+            }
+            Alteration::DropNestedField { path } => {
+                let Some((leaf, parent)) = path.split_last() else {
+                    return plan("an empty field path".into());
+                };
+                let Some(children) = struct_at(&mut fields, parent) else {
+                    return plan(format!("{} is not a struct", parent.join(".")));
+                };
+                let Some(i) = children.iter().position(|f| f["name"] == leaf.as_str()) else {
+                    return plan(format!("no field {}", path.join(".")));
+                };
+                let id = children[i]["id"].as_i64().unwrap_or(-1);
+                if partitioned.contains(&id) || identifier.contains(&id) {
+                    return plan(format!(
+                        "field {} is a partition source or identifier field",
+                        path.join(".")
+                    ));
+                }
+                if children.len() == 1 {
+                    return plan(format!("field {} is its struct's last", path.join(".")));
+                }
+                children.remove(i);
+            }
             Alteration::AddPartitionField {
                 transform,
                 column,
@@ -304,6 +360,33 @@ pub fn alter_updates(
     Ok((!updates.is_empty()).then_some((requirements, updates)))
 }
 
+/// The fields of the struct at `path` (a top-level column, then struct
+/// field names, `element` of a list, `key` / `value` of a map).
+fn struct_at<'a>(fields: &'a mut [Value], path: &[String]) -> Option<&'a mut Vec<Value>> {
+    let (first, rest) = path.split_first()?;
+    let column = fields.iter_mut().find(|f| f["name"] == first.as_str())?;
+    struct_in(&mut column["type"], rest)
+}
+
+fn struct_in<'a>(ty: &'a mut Value, path: &[String]) -> Option<&'a mut Vec<Value>> {
+    let Some((step, rest)) = path.split_first() else {
+        return (ty["type"] == "struct").then(|| ty["fields"].as_array_mut())?;
+    };
+    let next = match (ty["type"].as_str(), step.as_str()) {
+        (Some("struct"), name) => {
+            let f = ty["fields"]
+                .as_array_mut()?
+                .iter_mut()
+                .find(|f| f["name"] == name)?;
+            &mut f["type"]
+        }
+        (Some("list"), "element") => &mut ty["element"],
+        (Some("map"), k @ ("key" | "value")) => &mut ty[k],
+        _ => return None,
+    };
+    struct_in(next, rest)
+}
+
 /// Iceberg's allowed type promotions.
 fn promotes(from: &str, to: &str) -> bool {
     let decimal = |t: &str| {
@@ -340,6 +423,66 @@ mod tests {
                 {"id": 4, "name": "note", "required": false, "type": "string"},
             ]}],
         })
+    }
+
+    #[test]
+    fn nested_fields_are_added_renamed_and_dropped_by_path() {
+        let mut meta = meta();
+        meta["schemas"][0]["fields"][3] = json!({"id": 4, "name": "s", "required": false,
+            "type": {"type": "struct", "fields": [
+                {"id": 5, "name": "a", "required": false, "type": "int"},
+                {"id": 6, "name": "l", "required": false, "type": {"type": "list",
+                    "element-id": 7, "element-required": false, "element": {"type": "struct",
+                    "fields": [{"id": 8, "name": "x", "required": false, "type": "int"},
+                               {"id": 9, "name": "y", "required": false, "type": "int"}]}}}]}});
+        meta["last-column-id"] = json!(9);
+        let path = |p: &str| p.split('.').map(str::to_owned).collect::<Vec<_>>();
+        let changes = [
+            Alteration::AddNestedField {
+                parent: path("s"),
+                field: Field::new("b", DataType::Utf8, true),
+            },
+            Alteration::RenameNestedField {
+                path: path("s.a"),
+                to: "alpha".into(),
+            },
+            Alteration::DropNestedField {
+                path: path("s.l.element.y"),
+            },
+        ];
+        let (_, upd) = alter_updates(&meta, &changes).unwrap().unwrap();
+        assert_eq!(
+            upd[0]["schema"]["fields"][3]["type"]["fields"],
+            json!([
+                {"id": 5, "name": "alpha", "required": false, "type": "int"},
+                {"id": 6, "name": "l", "required": false, "type": {"type": "list",
+                    "element-id": 7, "element-required": false, "element": {"type": "struct",
+                    "fields": [{"id": 8, "name": "x", "required": false, "type": "int"}]}}},
+                {"id": 10, "name": "b", "required": false, "type": "string"},
+            ])
+        );
+        assert_eq!(upd[0]["last-column-id"], 10);
+        for bad in [
+            Alteration::AddNestedField {
+                parent: path("s.a"),
+                field: Field::new("b", DataType::Utf8, true),
+            },
+            Alteration::RenameNestedField {
+                path: path("s.a"),
+                to: "l".into(),
+            },
+            Alteration::DropNestedField {
+                path: path("s.nope"),
+            },
+            Alteration::DropNestedField {
+                path: path("s.l.element.x.z"),
+            },
+        ] {
+            assert!(
+                alter_updates(&meta, std::slice::from_ref(&bad)).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

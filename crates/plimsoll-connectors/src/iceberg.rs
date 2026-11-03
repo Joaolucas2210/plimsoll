@@ -345,6 +345,8 @@ struct IcebergTable {
     names: Arc<HashMap<i64, String>>,
     /// Some column was renamed or re-added in the table's history.
     renamed: bool,
+    /// Nested columns with every nested field's id (ADR 0088).
+    nested_ids: Arc<HashMap<String, datafusion::arrow::datatypes::FieldRef>>,
     /// `schema.name-mapping.default`, for files without field ids (ADR 0042).
     name_mapping: Option<Arc<field_ids::NameMapping>>,
     /// Identity partition sources common to every spec (ADR 0055).
@@ -433,31 +435,16 @@ impl IcebergTable {
             None => schemas.first().copied().ok_or_else(|| err("no schema"))?,
         };
         let renamed = renamed_columns(path, &schemas)?;
-        // Nested children resolve by name inside their parent (only
-        // top-level columns resolve by id, ADR 0040): refuse histories
-        // where that would read the wrong child (ADR 0041).
+        // Nested children resolve by field id in the scan (ADR 0088), so
+        // renamed, moved or re-added nested fields read right.
         let mut nested = Vec::new();
         for s in &schemas {
             for f in s["fields"].as_array().into_iter().flatten() {
                 nested_fields(&f["type"], f["id"].as_i64().unwrap_or(-1), &mut nested);
             }
         }
-        let mut by_id: HashMap<i64, (i64, &str)> = HashMap::new();
-        let mut by_name: HashMap<(i64, &str), i64> = HashMap::new();
-        for (parent, f) in &nested {
-            let (Some(id), Some(name)) = (f["id"].as_i64(), f["name"].as_str()) else {
-                return Err(err("nested field without id/name"));
-            };
-            let moved = by_id
-                .insert(id, (*parent, name))
-                .is_some_and(|p| p != (*parent, name));
-            let reused = by_name.insert((*parent, name), id).is_some_and(|i| i != id);
-            if moved || reused {
-                return Err(unsupported(
-                    path,
-                    format!("nested field {name:?} was renamed, moved or re-added"),
-                ));
-            }
+        for (_, f) in &nested {
+            let name = f["name"].as_str().unwrap_or_default();
             if !f["initial-default"].is_null() {
                 return Err(unsupported(
                     path,
@@ -482,6 +469,14 @@ impl IcebergTable {
             ));
         }
         let schema = arrow_schema(path, current)?;
+        let nested_ids: Arc<HashMap<String, datafusion::arrow::datatypes::FieldRef>> = Arc::new(
+            arrow_write_schema(path, current)?
+                .fields()
+                .iter()
+                .filter(|f| f.data_type().is_nested())
+                .map(|f| (f.name().clone(), f.clone()))
+                .collect(),
+        );
 
         let snapshot_id = meta["current-snapshot-id"].as_i64().filter(|id| *id != -1);
         let manifest_list = match snapshot_id {
@@ -561,6 +556,7 @@ impl IcebergTable {
             unpartitioned,
             names,
             renamed,
+            nested_ids,
             name_mapping,
             identity,
             metadata_path: path.to_owned(),
@@ -1519,6 +1515,7 @@ impl IcebergTable {
             self.renamed,
             self.name_mapping.clone(),
             &self.name,
+            self.nested_ids.clone(),
         ))))
         .build();
         Ok(DataSourceExec::from_data_source(config))

@@ -74,6 +74,22 @@ pub enum Alteration {
         transform: String,
         column: String,
     },
+    /// `ADD COLUMN s.b INT` (ADR 0088): a nullable field added to the
+    /// struct at `parent` (a column, then struct fields, `element` of a
+    /// list, `key` or `value` of a map).
+    AddNestedField {
+        parent: Vec<String>,
+        field: Field,
+    },
+    /// `RENAME COLUMN s.a TO b`: the field at `path` renamed.
+    RenameNestedField {
+        path: Vec<String>,
+        to: String,
+    },
+    /// `DROP COLUMN s.b`.
+    DropNestedField {
+        path: Vec<String>,
+    },
 }
 
 impl Alteration {
@@ -83,10 +99,15 @@ impl Alteration {
             Self::DropColumn { name, .. } => Some(name),
             Self::RenameColumn { from, .. } => Some(from),
             Self::DropNotNull(c) | Self::SetType { column: c, .. } => Some(c),
+            // The top-level column the nested field lives in.
+            Self::RenameNestedField { path, .. } | Self::DropNestedField { path } => {
+                path.first().map(String::as_str)
+            }
             Self::AddColumn { .. }
             | Self::SetProperties(_)
             | Self::AddPartitionField { .. }
-            | Self::DropPartitionField { .. } => None,
+            | Self::DropPartitionField { .. }
+            | Self::AddNestedField { .. } => None,
         }
     }
 }
@@ -143,6 +164,9 @@ fn refuse<T>(why: impl Into<String>) -> Result<T> {
 pub(crate) async fn plan(ctx: &SessionContext, sql: &str) -> Result<Planned> {
     let state = ctx.state();
     if let Some(planned) = partition_change(ctx, sql) {
+        return planned;
+    }
+    if let Some(planned) = nested_change(ctx, sql).await {
         return planned;
     }
     let dialect = state.config_options().sql_parser.dialect;
@@ -379,6 +403,109 @@ fn partition_change(ctx: &SessionContext, sql: &str) -> Option<Result<Planned>> 
     Some(planned)
 }
 
+/// `ALTER TABLE [IF EXISTS] t ADD COLUMN a.b type`, `… RENAME COLUMN
+/// a.b TO c` or `… DROP COLUMN a.b` (Spark's syntax for nested fields,
+/// ADR 0088), which the SQL parser refuses (a column name is one
+/// identifier); `None` when `sql` is not one.
+async fn nested_change(ctx: &SessionContext, sql: &str) -> Option<Result<Planned>> {
+    // Parsed first, synchronously: the parser is not `Send`.
+    let (name, if_exists, parsed) = parse_nested_change(sql)?;
+    let planned = async {
+        let change = match parsed? {
+            Nested::Add(path, data_type) => {
+                let mut parent = path;
+                let leaf = parent.pop().unwrap_or_default();
+                let def = ColumnDef {
+                    name: Ident::with_quote('"', leaf),
+                    data_type,
+                    options: Vec::new(),
+                };
+                Alteration::AddNestedField {
+                    parent,
+                    field: field(ctx, def).await?.with_nullable(true),
+                }
+            }
+            Nested::Rename(path, to) => Alteration::RenameNestedField { path, to },
+            Nested::Drop(path) => Alteration::DropNestedField { path },
+        };
+        let table = served(ctx, TableReference::from(name.as_str()))?;
+        Ok(Planned::Alter {
+            table,
+            changes: vec![change],
+            if_exists,
+        })
+    };
+    Some(planned.await)
+}
+
+/// A nested field change as parsed.
+enum Nested {
+    Add(Vec<String>, datafusion::sql::sqlparser::ast::DataType),
+    Rename(Vec<String>, String),
+    Drop(Vec<String>),
+}
+
+/// The table, `IF EXISTS`, and the change of a nested `ALTER TABLE`.
+#[allow(clippy::type_complexity)]
+fn parse_nested_change(sql: &str) -> Option<(String, bool, Result<Nested>)> {
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
+    use datafusion::sql::sqlparser::keywords::Keyword;
+    use datafusion::sql::sqlparser::parser::Parser;
+    use datafusion::sql::sqlparser::tokenizer::Token;
+    let dialect = GenericDialect {};
+    let mut p = Parser::new(&dialect).try_with_sql(sql).ok()?;
+    if !p.parse_keywords(&[Keyword::ALTER, Keyword::TABLE]) {
+        return None;
+    }
+    let if_exists = p.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+    let name = p.parse_object_name(false).ok()?.to_string();
+    let verb = p.parse_one_of_keywords(&[Keyword::ADD, Keyword::RENAME, Keyword::DROP])?;
+    if !p.parse_keyword(Keyword::COLUMN) {
+        return None;
+    }
+    let normalize = |i: Ident| match i.quote_style {
+        Some(_) => i.value,
+        None => i.value.to_lowercase(),
+    };
+    let path: Vec<String> = p
+        .parse_object_name(false)
+        .ok()?
+        .0
+        .into_iter()
+        .filter_map(|part| part.as_ident().cloned())
+        .map(normalize)
+        .collect();
+    if path.len() < 2 {
+        return None; // a top-level column: the regular parser's
+    }
+    let mut rest = || -> Result<Nested> {
+        let plan_err = |e: datafusion::sql::sqlparser::parser::ParserError| {
+            DataFusionError::Plan(e.to_string())
+        };
+        let change = match verb {
+            Keyword::ADD => Nested::Add(path.clone(), p.parse_data_type().map_err(plan_err)?),
+            Keyword::RENAME => {
+                p.expect_keyword(Keyword::TO).map_err(plan_err)?;
+                Nested::Rename(
+                    path.clone(),
+                    normalize(p.parse_identifier().map_err(plan_err)?),
+                )
+            }
+            _ => Nested::Drop(path.clone()),
+        };
+        let _ = p.consume_token(&Token::SemiColon);
+        if p.peek_token().token != Token::EOF {
+            return refuse(format!(
+                "unexpected {} after the nested field",
+                p.peek_token()
+            ));
+        }
+        Ok(change)
+    };
+    let parsed = rest();
+    Some((name, if_exists, parsed))
+}
+
 /// A column definition as DataFusion's `CREATE TABLE` would type it.
 async fn field(ctx: &SessionContext, def: ColumnDef) -> Result<Field> {
     let create = CreateTableBuilder::new(ObjectName::from(vec![Ident::new("t")]))
@@ -539,6 +666,50 @@ mod tests {
         }
         assert!(
             is_ddl("  create table t (x int)") && is_ddl("ALTER table t") && !is_ddl("SELECT 1")
+        );
+    }
+
+    #[tokio::test]
+    async fn plans_nested_field_changes() {
+        let ctx = served();
+        let changes = |sql: &'static str| {
+            let ctx = ctx.clone();
+            async move {
+                match plan(&ctx, sql).await.unwrap() {
+                    Planned::Alter { changes, .. } => changes,
+                    p => panic!("{p:?}"),
+                }
+            }
+        };
+        assert_eq!(
+            changes("ALTER TABLE bronze.t ADD COLUMN s.Inner.b BIGINT").await,
+            [Alteration::AddNestedField {
+                parent: vec!["s".into(), "inner".into()],
+                field: Field::new("b", DataType::Int64, true),
+            }]
+        );
+        assert_eq!(
+            changes("ALTER TABLE bronze.t RENAME COLUMN s.a TO \"Alpha\"").await,
+            [Alteration::RenameNestedField {
+                path: vec!["s".into(), "a".into()],
+                to: "Alpha".into()
+            }]
+        );
+        assert_eq!(
+            changes("ALTER TABLE bronze.t DROP COLUMN l.element.x;").await,
+            [Alteration::DropNestedField {
+                path: vec!["l".into(), "element".into(), "x".into()]
+            }]
+        );
+        // A top-level column still goes through the regular parser.
+        assert!(matches!(
+            changes("ALTER TABLE bronze.t DROP COLUMN x").await[..],
+            [Alteration::DropColumn { .. }]
+        ));
+        assert!(
+            plan(&ctx, "ALTER TABLE bronze.t RENAME COLUMN s.a TO b c")
+                .await
+                .is_err()
         );
     }
 

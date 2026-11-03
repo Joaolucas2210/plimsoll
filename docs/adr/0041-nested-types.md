@@ -1,6 +1,6 @@
 # ADR 0041 — Nested types
 
-- Status: Accepted
+- Status: Accepted (amended by ADR 0088: nested fields resolve by id; renamed, moved and re-added nested fields are read, not refused)
 - Date: 2026-11-02
 - Owner: JoaoLucas2210
 - Related: ADR 0005 (correctness first), ADR 0007 (read path; nested types were refused), ADR 0040 (field ids)
