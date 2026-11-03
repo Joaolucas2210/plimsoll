@@ -219,6 +219,27 @@ pub(super) struct IcebergSink {
     pub(super) base: Option<i64>,
 }
 
+impl IcebergSink {
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The table's Arrow schema rows are written in.
+    pub(super) fn schema_ref(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    /// Commits position deletes and new data files together (`UPDATE`,
+    /// `MERGE INTO`; ADR 0081, 0082).
+    pub(super) async fn commit_overwrite(
+        &self,
+        files: &[Written],
+        env: &datafusion::execution::runtime_env::RuntimeEnv,
+    ) -> Result<()> {
+        self.commit(files, Change::Overwrite, None, env).await
+    }
+}
+
 impl fmt::Debug for IcebergSink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IcebergSink")
@@ -253,7 +274,7 @@ struct Open {
 }
 
 /// A data file written and not yet committed.
-struct Written {
+pub(super) struct Written {
     path: String,
     rows: u64,
     bytes: u64,
@@ -279,6 +300,11 @@ pub(super) enum Change {
     /// Position deletes for changed rows plus data files with their new
     /// values (`UPDATE`, ADR 0081).
     Overwrite,
+}
+
+/// See [`unique`]: for the sibling modules (ADR 0082).
+pub(super) fn unique_id() -> u64 {
+    unique()
 }
 
 /// A unique-enough id for files and snapshots: time, process and a counter.
@@ -419,7 +445,7 @@ impl DataSink for IcebergSink {
 
 impl IcebergSink {
     /// Writes `data` as data files, routed by partition (ADR 0076).
-    async fn write_rows(
+    pub(super) async fn write_rows(
         &self,
         mut data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
@@ -981,7 +1007,7 @@ impl datafusion::physical_plan::ExecutionPlan for IcebergDeleteExec {
 
 /// Positions a [`datafusion::parquet::arrow::arrow_reader::RowSelection`]
 /// keeps, as sorted half-open ranges.
-fn kept_ranges(
+pub(super) fn kept_ranges(
     selection: &datafusion::parquet::arrow::arrow_reader::RowSelection,
 ) -> Vec<(u64, u64)> {
     let mut at = 0u64;
@@ -999,7 +1025,7 @@ fn kept_ranges(
 /// Whether `pos` survived earlier deletes, given the kept ranges (`None`:
 /// all rows). Positions must be asked in increasing order: `range` walks
 /// forward with them.
-fn alive(kept: Option<&[(u64, u64)]>, pos: u64, range: &mut usize) -> bool {
+pub(super) fn alive(kept: Option<&[(u64, u64)]>, pos: u64, range: &mut usize) -> bool {
     let Some(kept) = kept else { return true };
     while *range < kept.len() && kept[*range].1 <= pos {
         *range += 1;
@@ -1107,7 +1133,7 @@ impl IcebergSink {
 
     /// One position delete file: `(file_path, pos)` rows, sorted, with
     /// Iceberg's reserved field ids.
-    async fn position_deletes(
+    pub(super) async fn position_deletes(
         &self,
         target: &Target,
         positions: Vec<i64>,

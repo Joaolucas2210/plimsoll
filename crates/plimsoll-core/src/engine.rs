@@ -318,9 +318,14 @@ impl Engine {
                 only_own_predicates(&dml.input, &dml.table_name)?;
                 Some(dml.table_name.clone())
             }
+            // The plan's input is the source; the target is read by the
+            // provider, outside any scan the checks below see (ADR 0082).
+            LogicalPlan::Dml(dml) if matches!(dml.op, WriteOp::MergeInto(_)) => {
+                Some(dml.table_name.clone())
+            }
             LogicalPlan::Dml(_) | LogicalPlan::Copy(_) => {
                 return Err(DataFusionError::Plan(
-                    "only SELECT, INSERT INTO ..., UPDATE ... and DELETE FROM ... are allowed; \
+                    "only SELECT, INSERT INTO, UPDATE, DELETE FROM and MERGE INTO are allowed; \
                      the query API is otherwise read-only"
                         .into(),
                 ));
@@ -335,7 +340,25 @@ impl Engine {
                 &options.catalog.default_schema,
             );
             if let Some(target) = &target {
-                access.check_write(&target.clone().resolve(catalog, schema))?;
+                let table = target.clone().resolve(catalog, schema);
+                access.check_write(&table)?;
+                if let LogicalPlan::Dml(dml) = &plan
+                    && matches!(dml.op, WriteOp::MergeInto(_))
+                {
+                    // MERGE reads every target row and column: a principal
+                    // with a row filter or a denied column would merge rows
+                    // it cannot see. ponytail: refused, not filtered.
+                    access.check(&table)?;
+                    let schema = dml.target.schema();
+                    let columns: Vec<&str> =
+                        schema.fields().iter().map(|f| f.name().as_str()).collect();
+                    access.check_columns(&table, &columns)?;
+                    if access.row_filter(&table).is_some() {
+                        return Err(DataFusionError::Plan(format!(
+                            "MERGE INTO {table} is not allowed under a row filter"
+                        )));
+                    }
+                }
             }
             plan.apply_with_subqueries(|node| {
                 if let LogicalPlan::TableScan(scan) = node {
@@ -861,6 +884,42 @@ mod tests {
         )
         .await
         .unwrap();
+        // MERGE (ADR 0082): the write grant, reading the source, and
+        // reading the whole target (gold is write-granted, not readable).
+        let merge = "MERGE INTO {t} USING (SELECT x FROM {s}) src ON {t}.x = src.x \
+                     WHEN MATCHED THEN DELETE";
+        for (t, s, grant) in [
+            ("silver.s", "bronze.b", "bronze"),
+            ("bronze.b", "gold.g", "bronze"),
+            ("gold.g", "bronze.b", "gold"),
+        ] {
+            let sql = merge.replace("{t}", t).replace("{s}", s);
+            let err = e
+                .sql_with(&sql, &[], Arc::new(Writes(grant)))
+                .await
+                .unwrap_err();
+            assert!(denied(&err), "{sql}: {err}");
+        }
+        // ...and refused under a row filter, which MERGE would bypass.
+        struct Filtered;
+        impl TableAccess for Filtered {
+            fn check(&self, _: &ResolvedTableReference) -> Result<()> {
+                Ok(())
+            }
+            fn check_write(&self, _: &ResolvedTableReference) -> Result<()> {
+                Ok(())
+            }
+            fn row_filter(&self, _: &ResolvedTableReference) -> Option<String> {
+                Some("x = 1".into())
+            }
+        }
+        let sql = merge.replace("{t}", "bronze.b").replace("{s}", "silver.s");
+        let err = e.sql_with(&sql, &[], Arc::new(Filtered)).await.unwrap_err();
+        assert!(err.to_string().contains("row filter"), "{err}");
+        // Granted: it reaches the provider (a MemTable cannot merge).
+        let sql = merge.replace("{t}", "bronze.b").replace("{s}", "silver.s");
+        let err = e.sql_with(&sql, &[], bronze.clone()).await.unwrap_err();
+        assert!(err.to_string().contains("MERGE INTO operation"), "{err}");
         // Granted and well-formed: the provider deletes.
         let out = e
             .sql_with("DELETE FROM bronze.b WHERE x = 3", &[], bronze.clone())

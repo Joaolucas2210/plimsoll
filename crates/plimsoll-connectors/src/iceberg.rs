@@ -56,6 +56,7 @@ mod files;
 pub mod meta;
 
 pub mod expire;
+mod merge;
 mod prune;
 pub mod write;
 use deletes::{DeleteFile, EqualityDelete};
@@ -930,6 +931,159 @@ impl TableProvider for IcebergTable {
         Ok(Arc::new(exec))
     }
 
+    /// `MERGE INTO t USING s ON … WHEN …` (ADR 0082): every target file
+    /// is probed against the source, hashed on the `ON` equalities; the
+    /// first `WHEN` clause that holds decides each row.
+    async fn merge_into(
+        &self,
+        state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        merge_schema: datafusion::common::DFSchemaRef,
+        on: Expr,
+        clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion::logical_expr::dml::MergeIntoAction;
+        use datafusion::logical_expr::utils::split_conjunction;
+        use datafusion::logical_expr::{BinaryExpr, Operator};
+        let refuse = |why: String| {
+            Err(DataFusionError::Plan(format!(
+                "cannot merge into {}: {why}",
+                self.name
+            )))
+        };
+        let (sink, targets, _, _) = self.rows_of("merge into", state, vec![]).await?;
+        let width = self.schema.fields().len();
+        let row = merge::Merge::row_schema(&merge_schema);
+        // The merged row, every field nullable (one side is NULL for
+        // unmatched rows), with the statement's qualifiers.
+        let fields = merge_schema
+            .iter()
+            .map(|(q, f)| (q.cloned(), Arc::new(f.as_ref().clone().with_nullable(true))))
+            .collect::<Vec<_>>();
+        let merged = DFSchema::new_with_metadata(fields, HashMap::new())?;
+        let compile = |e: Expr| state.create_physical_expr(e, &merged);
+        // Which side an expression reads: target, source.
+        let side = |e: &Expr| -> (bool, bool) {
+            let mut sides = (false, false);
+            for c in e.column_refs() {
+                match merged.index_of_column(c) {
+                    Ok(i) if i < width => sides.0 = true,
+                    Ok(_) => sides.1 = true,
+                    Err(_) => {}
+                }
+            }
+            sides
+        };
+        let (mut target_keys, mut source_keys, mut rest) = (Vec::new(), Vec::new(), Vec::new());
+        for conjunct in split_conjunction(&on) {
+            if let Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::Eq,
+                right,
+            }) = conjunct
+            {
+                match (side(left), side(right)) {
+                    ((true, false), (false, true)) => {
+                        target_keys.push(compile(*left.clone())?);
+                        source_keys.push(compile(*right.clone())?);
+                        continue;
+                    }
+                    ((false, true), (true, false)) => {
+                        target_keys.push(compile(*right.clone())?);
+                        source_keys.push(compile(*left.clone())?);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            rest.push(conjunct.clone());
+        }
+        if target_keys.is_empty() {
+            return refuse("ON needs an equality between a target and a source expression".into());
+        }
+        let residual = conjunction(rest).map(compile).transpose()?;
+        let target_fields = self.schema.fields();
+        let (mut matched, mut not_matched, mut by_source) = (Vec::new(), Vec::new(), Vec::new());
+        for clause in clauses {
+            use datafusion::logical_expr::dml::MergeIntoClauseKind as Kind;
+            let predicate = clause.predicate.map(compile).transpose()?;
+            let kind = clause.kind.canonical();
+            let action = match clause.action {
+                MergeIntoAction::Delete => merge::Action::Delete,
+                MergeIntoAction::Update(assignments) => {
+                    let mut set: HashMap<String, Expr> = assignments.into_iter().collect();
+                    let row = target_fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| match set.remove(f.name()) {
+                            Some(e) => compile(e),
+                            None => Ok(Arc::new(Column::new(f.name(), i)) as Arc<dyn PhysicalExpr>),
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    if let Some(name) = set.keys().next() {
+                        return refuse(format!("no column {name}"));
+                    }
+                    merge::Action::Update(row)
+                }
+                MergeIntoAction::Insert { columns, values } => {
+                    let columns: Vec<String> = if columns.is_empty() {
+                        target_fields.iter().map(|f| f.name().clone()).collect()
+                    } else {
+                        columns
+                    };
+                    if columns.len() != values.len() {
+                        return refuse("INSERT needs one value per column".into());
+                    }
+                    let mut set: HashMap<String, Expr> = columns.into_iter().zip(values).collect();
+                    let row = target_fields
+                        .iter()
+                        .map(|f| match set.remove(f.name()) {
+                            Some(e) => compile(e),
+                            None => Ok(datafusion::physical_expr::expressions::lit(
+                                datafusion::common::ScalarValue::try_from(f.data_type())?,
+                            )),
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    if let Some(name) = set.keys().next() {
+                        return refuse(format!("no column {name}"));
+                    }
+                    merge::Action::Insert(row)
+                }
+            };
+            let fits = matches!(
+                (&kind, &action),
+                (
+                    Kind::Matched | Kind::NotMatchedBySource,
+                    merge::Action::Update(_) | merge::Action::Delete
+                ) | (Kind::NotMatchedByTarget, merge::Action::Insert(_))
+            );
+            if !fits {
+                return refuse(
+                    "WHEN MATCHED takes UPDATE or DELETE; WHEN NOT MATCHED, INSERT".into(),
+                );
+            }
+            let clause = merge::Clause { predicate, action };
+            match kind {
+                Kind::Matched => matched.push(clause),
+                Kind::NotMatchedBySource => by_source.push(clause),
+                _ => not_matched.push(clause),
+            }
+        }
+        let merge = merge::Merge {
+            target_keys,
+            source_keys,
+            residual,
+            matched,
+            not_matched,
+            not_matched_by_source: by_source,
+            row,
+            width,
+        };
+        Ok(Arc::new(merge::IcebergMergeExec::new(
+            sink, targets, source, merge,
+        )))
+    }
+
     /// `UPDATE t SET … WHERE …` (ADR 0081): the rows a `DELETE` with the
     /// same WHERE would remove are deleted by position and written back
     /// with their new values, in one `overwrite` snapshot.
@@ -1376,6 +1530,27 @@ impl IcebergTable {
         state: &dyn Session,
         filters: Vec<Expr>,
     ) -> Result<(write::IcebergDeleteExec, DFSchema)> {
+        let (sink, targets, predicate, schema) = self.rows_of(verb, state, filters).await?;
+        Ok((
+            write::IcebergDeleteExec::new(sink, targets, predicate),
+            schema,
+        ))
+    }
+
+    /// See [`Self::row_change`]: the sink, the files to read and the
+    /// WHERE as a physical predicate.
+    #[allow(clippy::type_complexity)]
+    async fn rows_of(
+        &self,
+        verb: &str,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> Result<(
+        write::IcebergSink,
+        Vec<write::Target>,
+        Arc<dyn PhysicalExpr>,
+        DFSchema,
+    )> {
         let sink = self.writable(verb)?;
         let filters = filters
             .into_iter()
@@ -1416,10 +1591,7 @@ impl IcebergTable {
                 plan,
             });
         }
-        Ok((
-            write::IcebergDeleteExec::new(sink, targets, predicate),
-            schema,
-        ))
+        Ok((sink, targets, predicate, schema))
     }
 
     /// See [`IcebergConnector::compact`]. A partition is rewritten when it

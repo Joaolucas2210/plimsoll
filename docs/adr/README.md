@@ -89,6 +89,7 @@ are allowed in place.
 | [0079](0079-expire-snapshots.md) | Snapshot expiration | Accepted | 2026-11-03 | `POST /v1/maintenance/expire-snapshots` (read + write grants, admission; defaults 5 days, keep 1): keeps branch and tag heads, each branch's last N and recent ancestors and recent strays; commits `remove-snapshots` with retry, then deletes manifest lists, manifests, data and delete files only expired snapshots reached (DELETED entries skipped) | 0078, 0075, 0077, 0028, 0029 |
 | [0080](0080-remove-orphan-files.md) | Orphan file removal | Accepted | 2026-11-03 | `POST /v1/maintenance/remove-orphans` (grants, admission; dry run; window default 3 days, never under 1 hour) lists the table location and deletes files no snapshot reaches (DELETED entries and statistics files count as referenced), never the catalog's metadata files or hidden files | 0079, 0075, 0024 |
 | [0081](0081-update-iceberg.md) | `UPDATE` Iceberg tables (merge-on-read overwrite) | Accepted | 2026-11-03 | `UPDATE` is allowed under the write grant (no subqueries in WHERE or SET); the rows a DELETE would choose are deleted by position and rewritten with SET applied through the partitioned writer; one `overwrite` snapshot with a data manifest and a delete manifest; retries only over appends | 0077, 0075, 0076, 0078, 0024 |
+| [0082](0082-merge-into-iceberg.md) | `MERGE INTO` Iceberg tables | Accepted | 2026-11-03 | `MERGE` is allowed under the write grant plus a read grant on every target column, refused under a row filter on the target; `ON` equalities hash the collected source, other conjuncts are a residual; target files are read as for DELETE, the first matching WHEN decides; position deletes and new rows in one `overwrite` snapshot; a target row matched twice is an error | 0081, 0077, 0076, 0024, 0045 |
 
 ## Reading order
 
@@ -97,7 +98,7 @@ are allowed in place.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
 - Federation: 0005 → 0006.
 - Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074.
-- Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081.
+- Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046.
 

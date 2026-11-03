@@ -612,6 +612,36 @@ mod tests {
             .clone();
         assert_eq!(last["summary"]["operation"], "overwrite");
         assert_eq!(last["summary"]["added-position-deletes"], "1");
+        // MERGE INTO (ADR 0082): an insert, then a delete of it with an
+        // update of a row the source does not match; rows end as before.
+        assert!(
+            deleted(format!(
+                "MERGE INTO {p} t USING (SELECT 20 AS id, 'eu' AS region) s ON t.id = s.id \
+                 WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.region)"
+            ))
+            .await
+            .contains("| 1 ")
+        );
+        assert!(
+            deleted(format!(
+                "MERGE INTO {p} t USING (SELECT 20 AS id) s ON t.id = s.id \
+                 WHEN MATCHED THEN DELETE \
+                 WHEN NOT MATCHED BY SOURCE AND t.id = 3 THEN UPDATE SET region = 'us'"
+            ))
+            .await
+            .contains("| 2 ")
+        );
+        let duplicate = engine
+            .sql(&format!(
+                "MERGE INTO {p} t USING (SELECT 3 AS id UNION ALL SELECT 3) s \
+                 ON t.id = s.id WHEN MATCHED THEN DELETE"
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            duplicate.to_string().contains("more than one"),
+            "{duplicate}"
+        );
         // Compaction (ADR 0078): the partition with deletes, and the one
         // with small files, rewritten; the rows unchanged; the position
         // deletes gone with the files they referenced.
