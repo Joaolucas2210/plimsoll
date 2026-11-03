@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Shuffle visibility: spilled buckets in `spilled_bytes` and a `shuffle_spill` line; worker requests classified by kind in the `fragment` log and span; temp-dir limit verified (ADR 0069)
 - [x] Streaming shuffle reducers: buckets are opened as streams and read by the merge or join as a streaming table, no buffering outside operators (ADR 0068)
 - [x] Shuffle buckets spill to disk: maps account every batch before keeping it and spill buckets the pool refuses to the spill directory (ADR 0067)
 - [x] Broadcast joins on workers: small build sides (now sized by manifest row counts) are collected once and sent with each probe fragment; inner/right/right semi/anti only; shuffles never replace ordered nodes (ADR 0066)
@@ -101,13 +102,12 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Shuffle spill visibility**: count shuffle spill files in
-`spilled_bytes` and the temp-directory limit (ADR 0067/0068), and expose
-per-query shuffle bytes in the `fragment` log and trace.
+**Worker discovery**: workers register with the coordinator (or a
+DNS/headless-service list is re-resolved) instead of a static
+`PLIMSOLL_WORKERS`, so a pool can grow and shrink without restarts.
 
 ## Later
 
 - Spans below planning (per-operator, per-fetch) via `tracing` +
   `opentelemetry-otlp`, and OTLP metrics (ADR 0031/0056 upgrade path).
 
-- Coordinator/worker: worker discovery.

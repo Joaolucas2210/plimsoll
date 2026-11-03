@@ -176,6 +176,12 @@ impl Engine {
         self.spilled_total.load(Ordering::Relaxed)
     }
 
+    /// Counts bytes spilled outside a query plan's operators (shuffle
+    /// buckets, ADR 0069) in [`Self::spilled_bytes_total`].
+    pub fn record_spill(&self, bytes: u64) {
+        self.spilled_total.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     /// Runs one statement. Dropping the returned future cancels execution
     /// (the stream and its reservations are dropped with it).
     pub async fn sql(&self, sql: &str) -> Result<QueryResult> {

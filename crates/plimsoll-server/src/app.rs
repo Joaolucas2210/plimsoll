@@ -426,6 +426,16 @@ async fn fragment(
             return ApiError::of(&e).respond(st, &e, query_id);
         }
     };
+    // What this request is, so shuffle traffic stands apart in logs and
+    // traces (ADR 0069).
+    let kind = match &task {
+        Task::Scan(f) if f.bucket.is_some() => "shuffle_map",
+        Task::Scan(f) if f.broadcast.is_some() => "broadcast_probe",
+        Task::Scan(f) if f.aggregate.is_some() => "partial_aggregate",
+        Task::Scan(_) => "scan",
+        Task::Reduce(r) if r.join.is_some() => "join_reduce",
+        Task::Reduce(_) => "aggregate_reduce",
+    };
     let files = match &task {
         Task::Scan(f) => f.files.len(),
         Task::Reduce(r) => r.maps.iter().map(|(_, f)| f.files.len()).sum(),
@@ -437,6 +447,7 @@ async fn fragment(
         started,
         query_id,
         user,
+        kind,
         files,
         rows: 0,
         bytes: 0,
@@ -533,6 +544,7 @@ struct FragmentReport {
     started: Instant,
     query_id: Option<u64>,
     user: String,
+    kind: &'static str,
     files: usize,
     rows: u64,
     bytes: u64,
@@ -556,6 +568,7 @@ impl Drop for FragmentReport {
                 "query_id": self.query_id,
                 "user": self.user,
                 "trace_id": self.ctx.trace_id,
+                "kind": self.kind,
                 "files": self.files,
                 "rows": self.rows,
                 "bytes": self.bytes,
@@ -571,6 +584,8 @@ impl Drop for FragmentReport {
                 self.wall + elapsed,
                 vec![
                     ("plimsoll.query_id", json!(self.query_id)),
+                    ("plimsoll.fragment_kind", json!(self.kind)),
+                    ("plimsoll.bytes", json!(self.bytes)),
                     ("plimsoll.files", json!(self.files)),
                     ("plimsoll.rows", json!(self.rows)),
                 ],

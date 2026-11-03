@@ -487,6 +487,7 @@ impl CoreEngine {
         };
         let partitions = bucket.partitions;
         let keys = bucket.keys.clone();
+        let (shuffle, map) = (bucket.shuffle.clone(), bucket.map);
         let map = cell
             .get_or_init(|| async move {
                 let fail = |e: DataFusionError| classify(&e).to_string();
@@ -522,6 +523,23 @@ impl CoreEngine {
                     })
                     .collect::<Result<Vec<_>, String>>()?;
                 let parts = futures::future::try_join_all(parts).await?;
+                // Spilled buckets count as spill, and say so (ADR 0069).
+                for (index, part) in parts.iter().enumerate() {
+                    if let Kept::Disk(file) = part {
+                        let bytes = file.size().unwrap_or(0);
+                        self.0.record_spill(bytes);
+                        crate::log::emit(
+                            crate::log::Level::Info,
+                            "shuffle_spill",
+                            serde_json::json!({
+                                "shuffle": shuffle,
+                                "map": map,
+                                "bucket": index,
+                                "bytes": bytes,
+                            }),
+                        );
+                    }
+                }
                 Ok(Arc::new(std::sync::Mutex::new(ShuffleMap {
                     schema,
                     buckets: parts.into_iter().map(Some).collect(),
@@ -1063,6 +1081,23 @@ mod tests {
         .collect()
         .await;
         assert_eq!(back, batches);
+        // The spill directory's size limit applies to shuffle buckets too:
+        // past it, the map fails rather than fill the disk.
+        let small = Arc::new(
+            plimsoll_core::datafusion::execution::DiskManager::builder()
+                .with_max_temp_directory_size(1024)
+                .build()
+                .unwrap(),
+        );
+        let pool = Arc::new(CeilingPool::new(1024, 0).unwrap());
+        let memory = Arc::new(std::sync::Mutex::new(
+            pool.register("shuffle-map", ConsumerKind::Spillable),
+        ));
+        let stream = MemoryStream::try_new(batches.clone(), schema.clone(), None).unwrap();
+        let Err(e) = keep(Box::pin(stream), memory, small).await else {
+            panic!("expected the temp directory limit");
+        };
+        assert!(e.contains("max_temp_directory_size"), "{e}");
     }
 
     #[tokio::test]

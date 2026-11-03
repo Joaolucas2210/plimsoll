@@ -71,8 +71,8 @@ even where the operator reading them (DataFusion's aggregation) can.
 - **Join build sides do not spill.** That is DataFusion's hash join
   limitation; a refused build fails the query, as it would on a single
   node.
-- **Shuffle spill files are not counted** in spill metrics or
-  temp-directory limits (ADR 0067).
+- **Shuffle spill files are not counted** in spill metrics (ADR 0067).
+  *(Fixed by ADR 0069.)*
 - **A slow map stalls its reducer.** That is inherent to pulling; there
   is no speculative re-fetch, and no retry (ADR 0064).
 

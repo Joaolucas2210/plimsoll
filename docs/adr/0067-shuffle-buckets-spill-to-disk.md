@@ -68,9 +68,10 @@ spill directory instead.
   reducer's share is 1/W of the data, and a refused reservation fails
   the query. Streaming fetched buckets straight into the merge or join
   is the next step.
-- **Spill files are not counted** in DataFusion's temp-directory limit
-  or in Plimsoll's spill metrics (`spilled_bytes`). They are deleted when
-  their bucket is served or the map expires.
+- **Spill files are not counted** in Plimsoll's spill metrics
+  (`spilled_bytes`). They are deleted when their bucket is served or the
+  map expires. *(Corrected by ADR 0069: the temp-directory limit did
+  apply, through the spill writer, and `spilled_bytes` now counts them.)*
 - **The first refusal spills the bucket that asked**, not the largest
   one. A skewed map may spill small buckets while a large one stays in
   memory. That is simple and correct; it is not optimal.
