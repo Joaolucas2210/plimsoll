@@ -270,8 +270,9 @@ struct IcebergTable {
     metadata_path: String,
     /// Where `INSERT INTO` commits (ADR 0075); `None`: not writable.
     committer: Option<Arc<dyn write::Committer>>,
-    /// Why this table cannot take an append, if it cannot.
-    unwritable: Option<String>,
+    /// How appended rows are laid out, or why this table cannot take an
+    /// append (ADR 0075, 0076).
+    layout: std::result::Result<write::Layout, String>,
     /// `current-schema-id`, which appended files are written against.
     schema_id: i64,
     /// A worker's fragment: only these data files (ADR 0058).
@@ -478,7 +479,7 @@ impl IcebergTable {
             identity,
             metadata_path: path.to_owned(),
             committer: None,
-            unwritable: write::unwritable(meta),
+            layout: write::Layout::of(meta),
             schema_id: meta["current-schema-id"].as_i64().unwrap_or(0),
             only_files: None,
         })
@@ -832,9 +833,10 @@ impl TableProvider for IcebergTable {
         if self.name.contains('@') {
             return refuse("a snapshot or branch reference is read-only");
         }
-        if let Some(why) = &self.unwritable {
-            return refuse(why);
-        }
+        let layout = match &self.layout {
+            Ok(layout) => layout.clone(),
+            Err(why) => return refuse(why),
+        };
         let Some(location) = &self.location else {
             return refuse("the table has no location");
         };
@@ -845,6 +847,7 @@ impl TableProvider for IcebergTable {
             scoped: self.scoped.clone(),
             committer: committer.clone(),
             schema_id: self.schema_id,
+            layout,
         };
         Ok(Arc::new(datafusion::datasource::sink::DataSinkExec::new(
             input,

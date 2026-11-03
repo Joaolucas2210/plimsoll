@@ -51,6 +51,21 @@ impl Prim {
         })
     }
 
+    /// Comparable datum -> Iceberg single-value binary serialization (the
+    /// inverse of [`Self::decode`]), for bounds a writer records (ADR 0076).
+    pub(super) fn encode(self, d: &Datum) -> Option<Vec<u8>> {
+        Some(match (self, d) {
+            (Self::Bool, Datum::Int(v)) => vec![u8::from(*v != 0)],
+            (Self::Int | Self::Date, Datum::Int(v)) => {
+                i32::try_from(*v).ok()?.to_le_bytes().to_vec()
+            }
+            (Self::Long | Self::Timestamp, Datum::Int(v)) => v.to_le_bytes().to_vec(),
+            (Self::String, Datum::Bytes(b)) => b.clone(),
+            (Self::Decimal(_), Datum::Big(v)) => min_be_bytes(*v),
+            _ => return None,
+        })
+    }
+
     /// Iceberg single-value binary serialization -> comparable datum.
     fn decode(self, bytes: &[u8]) -> Option<Datum> {
         Some(match self {
@@ -74,8 +89,8 @@ impl Prim {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd)]
-enum Datum {
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
+pub(super) enum Datum {
     Int(i64),
     /// UTF-8 bytes; Iceberg and Arrow both order strings bytewise.
     Bytes(Vec<u8>),
@@ -128,7 +143,7 @@ struct Pred {
 
 /// Monotonic partition transforms (non-decreasing in the source value).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Transform {
+pub(super) enum Transform {
     Identity,
     Year,
     Month,
@@ -145,8 +160,8 @@ pub(super) type Summary = (Option<Vec<u8>>, Option<Vec<u8>>);
 
 #[derive(Debug, Clone)]
 pub(super) struct PartitionField {
-    source_id: i64,
-    transform: Transform,
+    pub(super) source_id: i64,
+    pub(super) transform: Transform,
 }
 
 /// `partition-specs[].fields` -> per position, `None` when not prunable
@@ -480,6 +495,18 @@ fn transformed(p: &Pred, t: Transform) -> Option<(Op, Datum, Prim)> {
     };
     // Temporal partition values are serialized as `int`.
     Some((op, Datum::Int(tv), Prim::Int))
+}
+
+/// A source value's partition value under `t`, and its type (ADR 0076):
+/// the same transform the pruner maps predicates with.
+pub(super) fn partition_value(prim: Prim, value: &Datum, t: Transform) -> Option<(Datum, Prim)> {
+    let pred = Pred {
+        field_id: 0,
+        prim,
+        op: Op::Eq,
+        value: value.clone(),
+    };
+    transformed(&pred, t).map(|(_, v, p)| (v, p))
 }
 
 /// Iceberg's bucket function: 32-bit Murmur3 (x86, seed 0) of the value's

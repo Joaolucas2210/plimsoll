@@ -424,16 +424,60 @@ mod tests {
                 .await
                 .is_err()
         );
-        // Partitioned tables are refused before anything is written.
-        let err = engine
-            .sql("INSERT INTO bronze.events SELECT * FROM bronze.events")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("partitioned"), "{err}");
-        let _ = http
-            .delete(format!("{base}/{name}?purgeRequested=true"))
+        // Partitioned (ADR 0076): rows routed by `identity(region)`, and
+        // column bounds recorded, so both prune the new files.
+        let parted = format!("{name}_p");
+        let created = http
+            .post(&base)
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "name": parted,
+                    "schema": {"type": "struct", "schema-id": 0, "fields": [
+                        {"id": 1, "name": "id", "required": true, "type": "long"},
+                        {"id": 2, "name": "region", "required": false, "type": "string"},
+                    ]},
+                    "partition-spec": {"spec-id": 0, "fields": [
+                        {"source-id": 2, "field-id": 1000, "name": "region", "transform": "identity"},
+                    ]},
+                    "properties": {"format-version": "2"},
+                })
+                .to_string(),
+            )
             .send()
-            .await;
+            .await
+            .unwrap();
+        assert!(
+            created.status().is_success(),
+            "{}",
+            created.text().await.unwrap()
+        );
+        let p = format!("bronze.{parted}");
+        text(&format!(
+            "INSERT INTO {p} VALUES (1, 'eu'), (2, 'eu'), (3, 'us')"
+        ))
+        .await;
+        text(&format!("INSERT INTO {p} VALUES (10, 'us')")).await;
+        for filter in ["region = 'eu'", "id = 10"] {
+            let plan = text(&format!("EXPLAIN SELECT id FROM {p} WHERE {filter}")).await;
+            // One file read: by the manifest list's partition summaries,
+            // the files' partition values or their column bounds.
+            assert!(plan.contains(" files=1/"), "{filter}: {plan}");
+        }
+        let rows = text(&format!(
+            "SELECT region, count(*) AS n FROM {p} GROUP BY region ORDER BY region"
+        ))
+        .await;
+        assert!(
+            rows.contains("| eu     | 2 |") && rows.contains("| us     | 2 |"),
+            "{rows}"
+        );
+        for t in [name, parted] {
+            let _ = http
+                .delete(format!("{base}/{t}?purgeRequested=true"))
+                .send()
+                .await;
+        }
     }
 
     #[tokio::test]
