@@ -87,6 +87,70 @@ async fn run(engine: &Engine, sql: &str) -> (String, String) {
 }
 
 #[tokio::test]
+#[ignore = "needs PLIMSOLL_ICEBERG_{MOR,DV} from scripts/spark_mor_fixture.sh"]
+async fn shuffles_survive_a_lost_worker() {
+    let tables: Vec<String> = ["MOR", "DV"]
+        .iter()
+        .filter_map(|t| std::env::var(format!("PLIMSOLL_ICEBERG_{t}")).ok())
+        .collect();
+    if tables.is_empty() {
+        return;
+    }
+    // Two live workers and one that is gone. No health checks run, so the
+    // dead one is planned in: it owns maps, a reduce and scan fragments.
+    let urls = vec![
+        worker().await,
+        worker().await,
+        "http://127.0.0.1:9".to_owned(),
+    ];
+    let pool = || Arc::new(CeilingPool::new(256 << 20, 8 << 20).unwrap());
+    let local = Engine::new(pool(), None).unwrap();
+    let coordinator = Engine::new(pool(), None).unwrap();
+    coordinate(&coordinator, Workers::new(urls, TOKEN.into()).unwrap());
+    {
+        let state = coordinator.context().state_ref();
+        let mut state = state.write();
+        let optimizer = &mut state.config_mut().options_mut().optimizer;
+        optimizer.hash_join_single_partition_threshold = 0;
+        optimizer.hash_join_single_partition_threshold_rows = 0;
+    }
+    for (i, location) in tables.iter().enumerate() {
+        let t = format!("t{i}");
+        for e in [&local, &coordinator] {
+            IcebergConnector::try_new(t.clone(), location, &e.context().state())
+                .await
+                .unwrap()
+                .register(e.context())
+                .unwrap();
+        }
+        for (sql, shuffled) in [
+            (
+                format!("SELECT id % 7 AS k, count(*), sum(id) FROM {t} GROUP BY k ORDER BY k"),
+                "shuffled aggregate",
+            ),
+            (
+                format!("SELECT id, count(*) FROM {t} GROUP BY id ORDER BY id"),
+                "shuffled aggregate",
+            ),
+            (
+                format!(
+                    "SELECT a.id, b.id AS b FROM {t} a JOIN {t} b ON a.id = b.id ORDER BY a.id"
+                ),
+                "shuffled Inner join",
+            ),
+        ] {
+            let (want, _) = run(&local, &sql).await;
+            let (got, plan) = run(&coordinator, &sql).await;
+            assert!(
+                plan.contains(shuffled) && plan.contains("partitions=3"),
+                "{sql}: {plan}"
+            );
+            assert_eq!(got, want, "{sql}");
+        }
+    }
+}
+
+#[tokio::test]
 #[ignore = "needs PLIMSOLL_ICEBERG_{MOR,EQ,DV} from scripts/spark_mor_fixture.sh"]
 async fn distributed_scans_match_local_ones() {
     let tables: Vec<(&str, String)> = ["MOR", "EQ", "DV"]

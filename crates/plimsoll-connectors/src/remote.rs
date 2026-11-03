@@ -38,6 +38,9 @@ use plimsoll_core::engine::QueryTag;
 use plimsoll_core::memory::AccountedExec;
 use serde_json::{Value as Json, json};
 
+/// How long a worker connection may take to open.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Worker endpoints and the shared secret they accept, set as a session
 /// config extension on coordinators.
 #[derive(Clone)]
@@ -89,7 +92,13 @@ impl Workers {
         Ok(Self {
             seeds,
             token,
-            client: reqwest::Client::builder().build()?,
+            // A dead host often drops the connection attempt instead of
+            // refusing it: without a bound, a lost worker would hold the
+            // query until its deadline instead of failing over (ADR 0072).
+            // ponytail: fixed; a knob if workers sit behind slow links.
+            client: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .build()?,
             members: Arc::new(std::sync::RwLock::new(members)),
         })
     }
@@ -223,6 +232,9 @@ pub struct Bucket {
     pub index: usize,
     /// Output columns hashed (by position): group keys or join keys.
     pub keys: Vec<usize>,
+    /// Keep only bucket `index`, dropping the rest as the map runs: a map
+    /// re-run for one reducer (ADR 0072).
+    pub only: bool,
 }
 
 /// A shuffle reduce (ADR 0064, 0065): fetch bucket `partition` (of
@@ -237,6 +249,9 @@ pub struct Reduce {
     pub partitions: usize,
     pub maps: Vec<(String, Fragment)>,
     pub join: Option<JoinSpec>,
+    /// A retried reduce (ADR 0072): every map runs again for this bucket
+    /// only, under this reduce's own shuffle id.
+    pub only: bool,
 }
 
 /// An equi-join of two shuffled sides, on columns of their fragments.
@@ -305,6 +320,7 @@ impl Reduce {
             "shuffle": self.shuffle,
             "partition": self.partition,
             "partitions": self.partitions,
+            "only": self.only,
             "maps": maps_json(&self.maps),
             "join": self.join.as_ref().map(|j| json!({
                 "join_type": j.join_type,
@@ -349,6 +365,7 @@ impl Reduce {
             partitions,
             maps,
             join,
+            only: r["only"].as_bool().unwrap_or(false),
         })
     }
 }
@@ -390,7 +407,7 @@ impl Fragment {
             "columns": self.columns,
             "filters": self.filters,
             "bucket": self.bucket.as_ref().map(|b| json!({
-                "shuffle": b.shuffle, "map": b.map, "partitions": b.partitions, "index": b.index, "keys": b.keys,
+                "shuffle": b.shuffle, "map": b.map, "partitions": b.partitions, "index": b.index, "keys": b.keys, "only": b.only,
             })),
             "broadcast": self.broadcast.as_ref().map(|b| json!({
                 "join_type": b.join_type,
@@ -490,6 +507,7 @@ impl Fragment {
                             .iter()
                             .map(|k| count(k, "bucket.keys[]"))
                             .collect::<Result<_, _>>()?,
+                        only: b["only"].as_bool().unwrap_or(false),
                     })
                 }
             },
@@ -638,6 +656,7 @@ impl RemoteScanExec {
                         partitions,
                         maps: maps.clone(),
                         join: None,
+                        only: false,
                     },
                 )
             })
@@ -775,16 +794,11 @@ impl RemoteScanExec {
             body.push(b'\n');
             body.extend_from_slice(&attachment);
         }
+        let body = Bytes::from(body);
         let targets = (0..n.min(2))
-            .map(|i| self.urls[(assigned.worker + i) % n].clone())
+            .map(|i| (self.urls[(assigned.worker + i) % n].clone(), body.clone()))
             .collect();
-        with_retry(
-            self.workers.clone(),
-            targets,
-            Bytes::from(body),
-            tag,
-            self.schema.clone(),
-        )
+        with_retry(self.workers.clone(), targets, tag, self.schema.clone())
     }
 
     /// The same fragments, each joined on its worker with a build side
@@ -1044,15 +1058,26 @@ impl ExecutionPlan for RemoteReduceExec {
                 stream::empty(),
             )));
         };
+        // A lost reducer took its buckets with it: the retry, on the next
+        // reducer's worker, is a fresh shuffle for this one bucket (ADR
+        // 0072), so it never asks for a bucket already handed out.
+        let mut targets = vec![(url.clone(), Bytes::from(reduce.to_json().to_string()))];
+        let n = self.reduces.len();
+        if let Some((other, _)) = self
+            .reduces
+            .get((partition + 1) % n)
+            .filter(|(u, _)| u != url)
+        {
+            let retry = Reduce {
+                shuffle: format!("{}~r{partition}", reduce.shuffle),
+                only: true,
+                ..reduce.clone()
+            };
+            targets.push((other.clone(), Bytes::from(retry.to_json().to_string())));
+        }
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema.clone(),
-            with_retry(
-                self.workers.clone(),
-                vec![url.clone()],
-                Bytes::from(reduce.to_json().to_string()),
-                tag,
-                schema,
-            ),
+            with_retry(self.workers.clone(), targets, tag, schema),
         )))
     }
 }
@@ -1298,6 +1323,7 @@ fn shuffle_join(node: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>>
                     partitions,
                     maps: maps.clone(),
                     join: Some(spec.clone()),
+                    only: false,
                 },
             )
         })
@@ -1453,25 +1479,36 @@ impl fmt::Display for WorkerError {
 
 impl std::error::Error for WorkerError {}
 
+/// Whether a failed worker request may succeed on another worker
+/// (ADR 0060): connection failures, 429 and 5xx, and streams that broke
+/// on the way; not a worker's refusal (4xx).
+pub fn retryable(e: &DataFusionError) -> bool {
+    match e {
+        DataFusionError::External(inner) => inner
+            .downcast_ref::<WorkerError>()
+            .is_none_or(|w| w.retryable),
+        _ => true,
+    }
+}
+
 fn worker_error(message: String, retryable: bool) -> DataFusionError {
     DataFusionError::External(Box::new(WorkerError { message, retryable }))
 }
 
-/// Runs the fragment on `targets[0]`; if it fails before its first batch
-/// with a retryable error, once more on `targets[1]` (ADR 0060). Before
+/// Runs the task on `targets[0]`; if it fails before its first batch
+/// with a retryable error, once more on `targets[1]` (ADR 0060), each with
+/// its own body (a retried reduce is a different task, ADR 0072). Before
 /// the first batch nothing has been emitted, so a retry cannot duplicate
 /// rows; after it, any failure fails the query.
 fn with_retry(
     workers: Arc<Workers>,
-    targets: Vec<String>,
-    body: Bytes,
+    targets: Vec<(String, Bytes)>,
     tag: Option<Arc<QueryTag>>,
     schema: SchemaRef,
 ) -> BoxStream<'static, Result<RecordBatch>> {
     struct Run {
         workers: Arc<Workers>,
-        targets: VecDeque<String>,
-        body: Bytes,
+        targets: VecDeque<(String, Bytes)>,
         tag: Option<Arc<QueryTag>>,
         schema: SchemaRef,
         current: Option<BoxStream<'static, Result<RecordBatch>>>,
@@ -1482,7 +1519,6 @@ fn with_retry(
     let run = Run {
         workers,
         targets: targets.into(),
-        body,
         tag,
         schema,
         current: None,
@@ -1496,18 +1532,13 @@ fn with_retry(
                 return None;
             }
             let Some(current) = run.current.as_mut() else {
-                let url = run.targets.pop_front()?;
-                let body = stream::once(open(
-                    run.workers.clone(),
-                    url,
-                    run.body.clone(),
-                    run.tag.clone(),
-                ))
-                .flat_map(|r| match r {
-                    Ok(s) => s,
-                    Err(e) => stream::iter([Err(e)]).boxed(),
-                })
-                .boxed();
+                let (url, body) = run.targets.pop_front()?;
+                let body = stream::once(open(run.workers.clone(), url, body, run.tag.clone()))
+                    .flat_map(|r| match r {
+                        Ok(s) => s,
+                        Err(e) => stream::iter([Err(e)]).boxed(),
+                    })
+                    .boxed();
                 run.current = Some(decode(body, run.schema.clone()));
                 continue;
             };
@@ -1517,13 +1548,7 @@ fn with_retry(
                     return Some((Ok(batch), run));
                 }
                 Some(Err(e)) => {
-                    let retryable = match &e {
-                        DataFusionError::External(inner) => inner
-                            .downcast_ref::<WorkerError>()
-                            .is_none_or(|w| w.retryable),
-                        // A stream that broke before any batch.
-                        _ => true,
-                    };
+                    let retryable = retryable(&e);
                     if !run.emitted && retryable && !run.targets.is_empty() {
                         run.first_failure = Some(e.to_string());
                         run.current = None;
@@ -1795,6 +1820,7 @@ mod tests {
                 partitions: 2,
                 index: 0,
                 keys: vec![0],
+                only: true,
             }),
             broadcast: Some(Broadcast {
                 join_type: "RightSemi".into(),
@@ -1819,6 +1845,7 @@ mod tests {
                 ("http://w2".into(), f.clone()),
             ],
             join: None,
+            only: true,
         };
         assert_eq!(
             Task::from_json(&r.to_json()).unwrap(),

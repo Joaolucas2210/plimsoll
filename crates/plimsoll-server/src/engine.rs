@@ -319,11 +319,16 @@ fn project(
 /// among the shuffle's maps, hashed by `keys`), opened concurrently, as a
 /// table with one partition per map that streams as the reduce reads it
 /// (ADR 0064, 0065, 0068).
+///
+/// A map whose worker cannot be reached (a retryable failure before the
+/// bucket's schema) runs again on another of `peers`, for this bucket
+/// only, under its own shuffle id (ADR 0072): nothing of it was read yet.
 async fn open_side(
     r: &Reduce,
     maps: &[(String, Fragment)],
     offset: usize,
     keys: impl Fn(&Fragment) -> Result<Vec<usize>, EngineError>,
+    peers: &[String],
     token: &str,
     tag: &Option<Arc<QueryTag>>,
 ) -> Result<Arc<StreamingTable>, EngineError> {
@@ -331,16 +336,43 @@ async fn open_side(
         .iter()
         .enumerate()
         .map(|(i, (url, f))| {
+            let map = offset + i;
             let mut f = f.clone();
-            f.bucket = Some(Bucket {
+            let bucket = Bucket {
                 shuffle: r.shuffle.clone(),
-                map: offset + i,
+                map,
                 partitions: r.partitions,
                 index: r.partition,
                 keys: keys(&f)?,
-            });
+                only: r.only,
+            };
+            let retry = Bucket {
+                shuffle: format!("{}~m{map}r{}", r.shuffle, r.partition),
+                only: true,
+                ..bucket.clone()
+            };
+            let others: Vec<&String> = peers.iter().filter(|p| *p != url).collect();
+            let fallback = (!others.is_empty()).then(|| others[map % others.len()].clone());
+            f.bucket = Some(bucket);
             let (url, tag) = (url.clone(), tag.clone());
-            Ok(async move { open_bucket(url, token, &f, tag).await })
+            Ok(async move {
+                match open_bucket(url, token, &f, tag.clone()).await {
+                    Err(e) if plimsoll_connectors::remote::retryable(&e) => {
+                        let Some(fallback) = fallback else {
+                            return Err(e);
+                        };
+                        f.bucket = Some(retry);
+                        open_bucket(fallback, token, &f, tag)
+                            .await
+                            .map_err(|again| {
+                                DataFusionError::External(
+                                    format!("{again} (map re-run; first attempt: {e})").into(),
+                                )
+                            })
+                    }
+                    other => other,
+                }
+            })
         })
         .collect::<Result<Vec<_>, EngineError>>()?;
     let opened = futures::future::try_join_all(opens)
@@ -519,6 +551,7 @@ impl CoreEngine {
         let partitions = bucket.partitions;
         let keys = bucket.keys.clone();
         let (shuffle, map) = (bucket.shuffle.clone(), bucket.map);
+        let (only, wanted_index) = (bucket.only, bucket.index);
         let map = cell
             .get_or_init(|| async move {
                 let fail = |e: DataFusionError| classify(&e).to_string();
@@ -549,14 +582,26 @@ impl CoreEngine {
                 let disk = task.runtime_env().disk_manager.clone();
                 let parts = (0..partitions)
                     .map(|i| {
-                        let stream = plan.execute(i, task.clone()).map_err(fail)?;
-                        Ok(keep(stream, memory.clone(), disk.clone()))
+                        let mut stream = plan.execute(i, task.clone()).map_err(fail)?;
+                        let (memory, disk) = (memory.clone(), disk.clone());
+                        // A map re-run for one reducer (ADR 0072) keeps
+                        // that reducer's bucket and drops the rest.
+                        let wanted = !only || i == wanted_index;
+                        Ok(async move {
+                            if wanted {
+                                return keep(stream, memory, disk).await.map(Some);
+                            }
+                            while let Some(b) = stream.next().await {
+                                b.map_err(|e| e.to_string())?;
+                            }
+                            Ok(None)
+                        })
                     })
                     .collect::<Result<Vec<_>, String>>()?;
                 let parts = futures::future::try_join_all(parts).await?;
                 // Spilled buckets count as spill, and say so (ADR 0069).
                 for (index, part) in parts.iter().enumerate() {
-                    if let Kept::Disk(file) = part {
+                    if let Some(Kept::Disk(file)) = part {
                         let bytes = file.size().unwrap_or(0);
                         self.0.record_spill(bytes);
                         crate::log::emit(
@@ -573,7 +618,7 @@ impl CoreEngine {
                 }
                 Ok(Arc::new(std::sync::Mutex::new(ShuffleMap {
                     schema,
-                    buckets: parts.into_iter().map(Some).collect(),
+                    buckets: parts,
                     memory,
                 })))
             })
@@ -736,16 +781,29 @@ impl QueryEngine for CoreEngine {
         };
         let groups =
             |f: &Fragment| Ok((0..f.aggregate.as_ref().map_or(0, |a| a.group_by.len())).collect());
+        // Every worker holding a map: where a lost map may run again.
+        let mut peers: Vec<String> = r
+            .maps
+            .iter()
+            .chain(r.join.iter().flat_map(|j| &j.right))
+            .map(|(url, _)| url.clone())
+            .collect();
+        peers.sort();
+        peers.dedup();
         let (left, right) = match &r.join {
-            None => (open_side(&r, &r.maps, 0, groups, token, &tag).await?, None),
+            None => (
+                open_side(&r, &r.maps, 0, groups, &peers, token, &tag).await?,
+                None,
+            ),
             Some(j) => {
                 let (l, r) = futures::future::try_join(
-                    open_side(&r, &r.maps, 0, positions(&j.left_keys), token, &tag),
+                    open_side(&r, &r.maps, 0, positions(&j.left_keys), &peers, token, &tag),
                     open_side(
                         &r,
                         &j.right,
                         r.maps.len(),
                         positions(&j.right_keys),
+                        &peers,
                         token,
                         &tag,
                     ),
