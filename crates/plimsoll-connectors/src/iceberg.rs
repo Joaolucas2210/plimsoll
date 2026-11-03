@@ -48,13 +48,13 @@ use plimsoll_core::memory::AccountedExec;
 use plimsoll_core::storage::{ScopedStore, scoped_s3_store};
 use serde_json::Value as Json;
 
-use crate::{Connector, ConnectorError};
+use crate::{Connector, ConnectorError, portable};
 
 mod deletes;
 mod field_ids;
 mod files;
 pub mod meta;
-mod portable;
+
 mod prune;
 use deletes::{DeleteFile, EqualityDelete};
 use prune::{PartitionField, Prim, Pruner, Summary};

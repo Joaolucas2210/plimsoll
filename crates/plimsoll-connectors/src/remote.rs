@@ -25,7 +25,7 @@ use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_expr::expressions::{Column, Literal};
+use datafusion::physical_expr::expressions::Literal;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -119,9 +119,10 @@ pub struct Fragment {
 }
 
 /// `<aggregates> GROUP BY <group_by>` over the fragment: what a worker
-/// computes for a partial aggregation (ADR 0061). Each
-/// aggregate is (`count` | `sum` | `min` | `max`, column), `count` with no
-/// column meaning `count(*)`.
+/// computes for a partial aggregation (ADR 0061). Keys and arguments are
+/// SQL expressions over the table's columns (ADR 0063). Each aggregate is
+/// (`count` | `sum` | `min` | `max`, argument), `count` with no argument
+/// meaning `count(*)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AggregateSpec {
     pub group_by: Vec<String>,
@@ -433,9 +434,9 @@ impl ExecutionPlan for RemoteScanExec {
 ///
 /// Matches `AggregateExec(Partial)` whose input is, through pass-through
 /// nodes only (repartition, coalesce), an `AccountedExec` over a
-/// [`RemoteScanExec`], and whose group keys are plain columns and whose
-/// aggregates are `count(*)` or `count`/`sum`/`min`/`max` of a column
-/// (no DISTINCT, FILTER, ORDER BY). Such an aggregate's partial state per
+/// [`RemoteScanExec`], whose group keys are portable expressions (ADR
+/// 0063) and whose aggregates are `count(*)` or `count`/`sum`/`min`/`max`
+/// of one (no DISTINCT, FILTER, ORDER BY). Such an aggregate's partial state per
 /// partition *is* the value computed over that partition's rows, so each
 /// worker returns it for its fragment and the coordinator's `Final`
 /// merges. Anything else is left as it is: rows travel, as before.
@@ -446,10 +447,10 @@ impl PhysicalOptimizerRule for PartialAggregatePushdown {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         plan.transform_down(|node| {
-            Ok(match push_partial(&node)? {
+            Ok(match push_partial(&node, config)? {
                 Some(pushed) => Transformed::yes(pushed),
                 None => Transformed::no(node),
             })
@@ -466,7 +467,10 @@ impl PhysicalOptimizerRule for PartialAggregatePushdown {
     }
 }
 
-fn push_partial(node: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+fn push_partial(
+    node: &Arc<dyn ExecutionPlan>,
+    config: &ConfigOptions,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     let Some(agg) = node.as_ref().downcast_ref::<AggregateExec>() else {
         return Ok(None);
     };
@@ -476,14 +480,16 @@ fn push_partial(node: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn Executio
     {
         return Ok(None);
     }
-    let column = |e: &Arc<dyn datafusion::physical_expr::PhysicalExpr>| {
-        e.as_ref()
-            .downcast_ref::<Column>()
-            .map(|c| c.name().to_owned())
+    // Keys and arguments travel as SQL that plans back to the same
+    // expression on the worker (ADR 0063); they read the scan's columns,
+    // since only pass-through nodes sit in between (checked below).
+    let schema = agg.input().schema();
+    let sql = |e: &Arc<dyn datafusion::physical_expr::PhysicalExpr>| {
+        crate::portable::physical_sql(e, &schema, config)
     };
     let mut group_by = Vec::new();
     for (e, _) in agg.group_expr().expr() {
-        let Some(c) = column(e) else { return Ok(None) };
+        let Some(c) = sql(e) else { return Ok(None) };
         group_by.push(c);
     }
     let mut aggregates = Vec::new();
@@ -502,7 +508,7 @@ fn push_partial(node: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn Executio
             {
                 None
             }
-            ("count" | "sum" | "min" | "max", [e]) => match column(e) {
+            ("count" | "sum" | "min" | "max", [e]) => match sql(e) {
                 Some(c) => Some(c),
                 None => return Ok(None),
             },

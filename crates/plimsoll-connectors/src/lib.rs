@@ -10,6 +10,7 @@ use plimsoll_core::federation::{FederationFilterGuard, PushdownPolicy};
 
 pub mod iceberg;
 pub mod parquet;
+mod portable;
 pub mod postgres;
 pub mod remote;
 

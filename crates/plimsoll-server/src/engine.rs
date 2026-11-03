@@ -240,16 +240,21 @@ impl QueryEngine for CoreEngine {
         // Partial aggregation (ADR 0061).
         if let Some(spec) = &f.aggregate {
             use plimsoll_core::datafusion::functions_aggregate::expr_fn::{count, max, min, sum};
-            let groups = spec.group_by.iter().map(ident).collect::<Vec<_>>();
+            // Keys and arguments are SQL over the table (ADR 0063).
+            let parse = |sql: &str| df.parse_sql_expr(sql).map_err(fail);
+            let groups = spec
+                .group_by
+                .iter()
+                .map(|g| parse(g))
+                .collect::<Result<Vec<_>, _>>()?;
             let aggregates = spec
                 .aggregates
                 .iter()
                 .enumerate()
                 .map(|(i, (f, c))| {
-                    let arg = || {
-                        c.as_deref()
-                            .map(ident)
-                            .ok_or_else(|| EngineError::InvalidQuery(format!("{f} needs a column")))
+                    let arg = || match c.as_deref() {
+                        Some(c) => parse(c),
+                        None => Err(EngineError::InvalidQuery(format!("{f} needs an argument"))),
                     };
                     let e = match f.as_str() {
                         "count" => match c {

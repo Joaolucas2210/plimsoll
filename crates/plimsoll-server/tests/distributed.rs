@@ -145,15 +145,28 @@ async fn distributed_scans_match_local_ones() {
                 ),
                 true,
             ),
-            // Not pushed: an expression key. (DataFusion plans
-            // count(DISTINCT id) as GROUP BY id under a count: that inner
-            // grouping is pushed, workers return their distinct ids and the
-            // coordinator dedups.)
+            // DataFusion plans count(DISTINCT id) as GROUP BY id under a
+            // count: that inner grouping is pushed, workers return their
+            // distinct ids and the coordinator dedups.
             (format!("SELECT count(DISTINCT id) FROM {t}"), true),
+            // Expression keys and arguments travel as SQL (ADR 0063).
             (
                 format!("SELECT id % 3, count(*) FROM {t} GROUP BY id % 3 ORDER BY 1"),
-                false,
+                true,
             ),
+            (
+                format!(
+                    "SELECT lower({group}) AS g, sum(id * 2), max(-id), count(id + 1) \
+                     FROM {t} GROUP BY lower({group}) ORDER BY g"
+                ),
+                true,
+            ),
+            (
+                format!("SELECT CAST(id AS INT) % 2 AS k, sum(id) FROM {t} GROUP BY k ORDER BY k"),
+                true,
+            ),
+            // Not pushed: avg's partial state (count, sum) is not its value.
+            (format!("SELECT avg(id) FROM {t}"), false),
         ] {
             let (want, plan) = run(&local, &sql).await;
             assert!(!plan.contains("RemoteScanExec"), "{plan}");
