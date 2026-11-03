@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use plimsoll_connectors::remote::Fragment;
+use plimsoll_connectors::remote::{Bucket, Fragment, Reduce, fetch_bucket};
 use plimsoll_connectors::{Connector, ConnectorError, IcebergConnector};
 use plimsoll_control::catalog::CatalogError;
 use plimsoll_core::datafusion::arrow::ipc::writer::StreamWriter;
@@ -20,7 +20,7 @@ use plimsoll_core::datafusion::error::DataFusionError;
 use plimsoll_core::datafusion::execution::SendableRecordBatchStream;
 use plimsoll_core::datafusion::object_store::Error as ObjectStoreError;
 use plimsoll_core::datafusion::parquet::errors::ParquetError;
-use plimsoll_core::engine::{AccessDenied, Engine, QueryResult, TableRead};
+use plimsoll_core::engine::{AccessDenied, Engine, QueryResult, QueryTag, TableRead};
 use plimsoll_core::plan_trace::{self, PlanEvent};
 
 use crate::auth::Viewer;
@@ -148,6 +148,18 @@ pub trait QueryEngine: Send + Sync {
         Err(EngineError::Unsupported("scan fragments".into()))
     }
 
+    /// A worker's shuffle reduce (ADR 0064), as a stream. `token` is the
+    /// worker token it was called with, presented to its peers. Default:
+    /// not a worker.
+    async fn reduce(
+        &self,
+        _reduce: Reduce,
+        _token: &str,
+        _tag: Option<Arc<QueryTag>>,
+    ) -> Result<SendableRecordBatchStream, EngineError> {
+        Err(EngineError::Unsupported("shuffle reduces".into()))
+    }
+
     /// Runs `sql`, sending the result to `tx` as it is produced. `tx` is
     /// bounded: a slow reader slows the query instead of buffering it.
     /// Default: [`Self::execute`], then the whole result as one chunk.
@@ -212,6 +224,127 @@ fn each_row(
 
 pub struct CoreEngine(pub Arc<Engine>);
 
+/// Shuffle maps kept on this worker until every bucket is fetched, or
+/// until they expire (ADR 0064). Keyed by (shuffle, map), so workers that
+/// share a process (tests) never collide.
+type MapCell = tokio::sync::OnceCell<Result<Arc<std::sync::Mutex<ShuffleMap>>, String>>;
+type Maps = std::collections::HashMap<(String, usize), (Instant, Arc<MapCell>)>;
+static MAPS: std::sync::LazyLock<std::sync::Mutex<Maps>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// ponytail: fixed; tie it to the query deadline if abandoned shuffles
+/// pin worker memory for too long.
+const SHUFFLE_TTL: Duration = Duration::from_secs(300);
+
+struct ShuffleMap {
+    schema: plimsoll_core::datafusion::arrow::datatypes::SchemaRef,
+    /// `None` once fetched.
+    buckets: Vec<Option<Vec<RecordBatch>>>,
+    memory: Reservation,
+}
+
+impl CoreEngine {
+    /// Runs the aggregated fragment `df` once per (shuffle, map), keeps its
+    /// output hash-partitioned by the first `keys` columns (the group keys)
+    /// and hands out bucket `bucket.index`, each bucket once.
+    async fn map_bucket(
+        &self,
+        df: plimsoll_core::datafusion::prelude::DataFrame,
+        keys: usize,
+        bucket: Bucket,
+    ) -> Result<SendableRecordBatchStream, EngineError> {
+        use plimsoll_core::datafusion::physical_expr::expressions::Column;
+        use plimsoll_core::datafusion::physical_plan::memory::MemoryStream;
+        use plimsoll_core::datafusion::physical_plan::repartition::RepartitionExec;
+        use plimsoll_core::datafusion::physical_plan::{Partitioning, collect_partitioned};
+        let lock = || MAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (bucket.shuffle.clone(), bucket.map);
+        let cell = {
+            let mut maps = lock();
+            let now = Instant::now();
+            maps.retain(|_, (expires, _)| *expires > now);
+            maps.entry(key.clone())
+                .or_insert_with(|| (now + SHUFFLE_TTL, Arc::default()))
+                .1
+                .clone()
+        };
+        let partitions = bucket.partitions;
+        let map = cell
+            .get_or_init(|| async move {
+                let fail = |e: DataFusionError| classify(&e).to_string();
+                let task = df.task_ctx();
+                let plan = df.create_physical_plan().await.map_err(fail)?;
+                let schema = plan.schema();
+                let hash = (0..keys)
+                    .map(|i| Arc::new(Column::new(schema.field(i).name(), i)) as _)
+                    .collect();
+                // Hash-partitioned after DataFusion's optimizer, so it stays
+                // as asked. Its hash is seeded with a constant: every
+                // worker sends a group to the same bucket.
+                let plan = RepartitionExec::try_new(plan, Partitioning::Hash(hash, partitions))
+                    .map_err(fail)?;
+                let parts = collect_partitioned(Arc::new(plan), Arc::new(task))
+                    .await
+                    .map_err(fail)?;
+                let memory = self
+                    .0
+                    .pool()
+                    .reserve(
+                        "shuffle-map",
+                        ConsumerKind::Output,
+                        parts
+                            .iter()
+                            .flatten()
+                            .map(RecordBatch::get_array_memory_size)
+                            .sum(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(Arc::new(std::sync::Mutex::new(ShuffleMap {
+                    schema,
+                    buckets: parts.into_iter().map(Some).collect(),
+                    memory,
+                })))
+            })
+            .await
+            .clone()
+            .map_err(EngineError::Internal)?;
+        let (schema, batches, done) = {
+            let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
+            if m.buckets.len() != partitions {
+                return Err(EngineError::InvalidQuery(format!(
+                    "shuffle {} has {} buckets, not {partitions}",
+                    bucket.shuffle,
+                    m.buckets.len()
+                )));
+            }
+            let batches = m.buckets.get_mut(bucket.index).and_then(Option::take);
+            let size = batches
+                .iter()
+                .flatten()
+                .map(RecordBatch::get_array_memory_size)
+                .sum();
+            m.memory.shrink(size);
+            (
+                m.schema.clone(),
+                batches,
+                m.buckets.iter().all(Option::is_none),
+            )
+        };
+        if done {
+            lock().remove(&key);
+        }
+        let batches = batches.ok_or_else(|| {
+            EngineError::InvalidQuery(format!(
+                "bucket {} of shuffle {} map {} was already fetched",
+                bucket.index, bucket.shuffle, bucket.map
+            ))
+        })?;
+        Ok(Box::pin(
+            MemoryStream::try_new(batches, schema, None).map_err(|e| classify(&e))?,
+        ))
+    }
+}
+
 #[async_trait]
 impl QueryEngine for CoreEngine {
     async fn fragment(&self, f: Fragment) -> Result<SendableRecordBatchStream, EngineError> {
@@ -274,10 +407,98 @@ impl QueryEngine for CoreEngine {
                 })
                 .collect::<Result<Vec<_>, EngineError>>()?;
             df = df.aggregate(groups, aggregates).map_err(fail)?;
+            if let Some(bucket) = f.bucket {
+                return self.map_bucket(df, spec.group_by.len(), bucket).await;
+            }
         } else {
             df = df.select(f.columns.iter().map(ident)).map_err(fail)?;
         }
         df.execute_stream().await.map_err(fail)
+    }
+
+    async fn reduce(
+        &self,
+        r: Reduce,
+        token: &str,
+        tag: Option<Arc<QueryTag>>,
+    ) -> Result<SendableRecordBatchStream, EngineError> {
+        use plimsoll_core::datafusion::datasource::MemTable;
+        use plimsoll_core::datafusion::functions_aggregate::expr_fn::{max, min, sum};
+        use plimsoll_core::datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use plimsoll_core::datafusion::prelude::{Expr, SessionContext};
+        let fail = |e: DataFusionError| classify(&e);
+        let Some(spec) = r.maps.first().and_then(|(_, f)| f.aggregate.clone()) else {
+            return Err(EngineError::InvalidQuery("a reduce needs maps".into()));
+        };
+        // Bucket `partition` of every map, fetched concurrently.
+        let n = r.maps.len();
+        let fetches = r.maps.iter().enumerate().map(|(i, (url, f))| {
+            let mut f = f.clone();
+            f.bucket = Some(Bucket {
+                shuffle: r.shuffle.clone(),
+                map: i,
+                partitions: n,
+                index: r.partition,
+            });
+            let (url, tag) = (url.clone(), tag.clone());
+            async move { fetch_bucket(url, token, &f, tag).await }
+        });
+        let fetched = futures::future::try_join_all(fetches).await.map_err(fail)?;
+        let Some(schema) = fetched.first().map(|(s, _)| s.clone()) else {
+            return Err(EngineError::InvalidQuery("a reduce needs maps".into()));
+        };
+        let batches: Vec<RecordBatch> = fetched.into_iter().flat_map(|(_, b)| b).collect();
+        // Held until the merged stream ends.
+        let memory = self
+            .0
+            .pool()
+            .reserve(
+                "shuffle-reduce",
+                ConsumerKind::Output,
+                batches.iter().map(RecordBatch::get_array_memory_size).sum(),
+            )
+            .map_err(|e| EngineError::MemoryLimitExceeded(e.to_string()))?;
+        let table = MemTable::try_new(schema, vec![batches]).map_err(fail)?;
+        let ctx = SessionContext::new_with_state(self.0.context().state());
+        let df = ctx.read_table(Arc::new(table)).map_err(fail)?;
+        // Partial states merged: counts and sums add up, min and max
+        // compose. Each merged state is the aggregate's final value.
+        let column = |i: usize| Expr::Column(df.schema().columns()[i].clone());
+        let k = spec.group_by.len();
+        let groups = (0..k).map(column).collect();
+        let merges = spec
+            .aggregates
+            .iter()
+            .enumerate()
+            .map(|(i, (f, _))| {
+                let state = column(k + i);
+                Ok(match f.as_str() {
+                    "count" | "sum" => sum(state),
+                    "min" => min(state),
+                    "max" => max(state),
+                    other => {
+                        return Err(EngineError::InvalidQuery(format!(
+                            "aggregate {other} is not partial-safe"
+                        )));
+                    }
+                }
+                .alias(format!("a{i}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let stream = df
+            .aggregate(groups, merges)
+            .map_err(fail)?
+            .execute_stream()
+            .await
+            .map_err(fail)?;
+        let schema = stream.schema();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream.map(move |b| {
+                let _held = &memory;
+                b
+            }),
+        )))
     }
 
     async fn execute(

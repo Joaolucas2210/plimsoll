@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Aggregation shuffle between workers: grouped partial states hash-partitioned, merged on workers, final rows to the coordinator (ADR 0064)
 - [x] Expression keys and arguments in worker aggregations (`GROUP BY id % 16`, `sum(price * qty)`), shipped as round-tripped SQL (ADR 0063)
 - [x] Row filters on workers: portable filters (SQL round trip) are exact, enforced by the scan locally and on workers; filtered aggregations pushed (ADR 0062)
 - [x] Partial aggregation on workers: count/sum/min/max and column GROUP BY return partial states, not rows (ADR 0061)
@@ -96,14 +97,13 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Shuffle across workers**: joins and final aggregations still run on the
-coordinator; partition partial states by key across workers so
-high-cardinality GROUP BY and large joins scale out too.
+**Join shuffle across workers**: hash-partition both join sides by key
+between workers and join there (aggregations shuffle since ADR 0064);
+spill shuffle buckets to local disk.
 
 ## Later
 
 - Spans below planning (per-operator, per-fetch) via `tracing` +
   `opentelemetry-otlp`, and OTLP metrics (ADR 0031/0056 upgrade path).
 
-- Coordinator/worker: shuffle-based joins and aggregations across
-  workers (step 1 distributes scans only); worker discovery.
+- Coordinator/worker: worker discovery.

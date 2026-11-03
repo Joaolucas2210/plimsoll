@@ -71,6 +71,7 @@ are allowed in place.
 | [0061](0061-partial-aggregation-on-workers.md) | Partial aggregation on workers | Accepted | 2026-11-02 | A coordinator physical rule replaces `AggregateExec(Partial)` over a remote scan (through pass-through nodes only) with fragments that aggregate on workers when keys are columns and aggregates are count(*)/count/sum/min/max; workers build it with the DataFrame API on the provider (nothing registered); results are cast to the partial-state schema the `Final` merges | 0058, 0059, 0060 |
 | [0062](0062-row-filters-on-workers.md) | Row filters enforced by the scan, on workers too | Accepted | 2026-11-02 | Filters whose SQL text parses back to the same expression are `Exact`: the scan applies them locally (widened projection, `FilterExec`) and sends them as SQL in `Fragment.filters`; workers filter with the DataFrame API; unknown fragment fields are refused (version skew fails); filtered aggregations reach workers | 0055, 0058, 0061, 0045 |
 | [0063](0063-expression-aggregations-on-workers.md) | Expression keys and arguments in worker aggregations | Accepted | 2026-11-02 | Physical keys/arguments (column, literal, binary, cast, not/negative/null tests, scalar functions) are mapped to logical exprs, unparsed to SQL and pushed only when re-planning under the session config gives an equal physical expr; `AggregateSpec` carries SQL parsed by the worker | 0061, 0062, 0004 |
+| [0064](0064-aggregation-shuffle-between-workers.md) | Aggregation shuffle between workers | Accepted | 2026-11-02 | Grouped final aggregations over pushable partials (count/sum/min/max, ≥2 fragments, partitioning unused above) become reduces: each fragment owner pulls its hash bucket from every map worker (maps run once, buckets kept in the pool, handed out once), merges states and returns final rows; bucket requests skip admission; reduces are not retried | 0058–0063 |
 
 ## Reading order
 
@@ -78,7 +79,7 @@ are allowed in place.
 - Shape of the system: 0001, 0002, 0004.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
 - Federation: 0005 → 0006.
-- Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063.
+- Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046.
 

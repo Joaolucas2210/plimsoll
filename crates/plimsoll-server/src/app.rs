@@ -12,6 +12,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use plimsoll_connectors::remote::Task;
 use plimsoll_control::governance::{
     Admission, AdmissionError, CancelOutcome, DEFAULT_GROUP, GovernedError, QueryRequest,
 };
@@ -355,10 +356,8 @@ async fn fragment(
         return StatusCode::NOT_FOUND.into_response();
     };
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    let presented = header("authorization")
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(crate::auth::token_digest);
-    if presented != Some(expected) {
+    let token = header("authorization").and_then(|v| v.strip_prefix("Bearer "));
+    if token.map(crate::auth::token_digest) != Some(expected) {
         return ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", false).respond(
             st,
             "invalid worker token",
@@ -367,8 +366,8 @@ async fn fragment(
     }
     let parsed = serde_json::from_slice(&body)
         .map_err(|e| e.to_string())
-        .and_then(|v| plimsoll_connectors::remote::Fragment::from_json(&v));
-    let fragment = match parsed {
+        .and_then(|v| plimsoll_connectors::remote::Task::from_json(&v));
+    let task = match parsed {
         Ok(f) => f,
         Err(e) => {
             return ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", false)
@@ -394,7 +393,18 @@ async fn fragment(
     } else {
         DEFAULT_GROUP
     };
-    let slot = match tokio::time::timeout_at(deadline, st.admission.acquire(&user, group)).await {
+    // A shuffle bucket request is part of a reduce that already holds a
+    // slot (ADR 0064): admitting it too could leave every slot held by
+    // reduces waiting on their own buckets.
+    let admit = !matches!(&task, Task::Scan(f) if f.bucket.is_some());
+    let slot = match tokio::time::timeout_at(deadline, async {
+        match admit {
+            true => st.admission.acquire(&user, group).await.map(Some),
+            false => Ok(None),
+        }
+    })
+    .await
+    {
         Ok(Ok(slot)) => slot,
         Ok(Err(e)) => {
             let e = GovernedError::<EngineError>::Rejected(e);
@@ -405,7 +415,10 @@ async fn fragment(
             return ApiError::of(&e).respond(st, &e, query_id);
         }
     };
-    let files = fragment.files.len();
+    let files = match &task {
+        Task::Scan(f) => f.files.len(),
+        Task::Reduce(r) => r.maps.iter().map(|(_, f)| f.files.len()).sum(),
+    };
     let mut report = FragmentReport {
         st: shared.clone(),
         ctx,
@@ -419,7 +432,22 @@ async fn fragment(
         error: None,
         _slot: slot,
     };
-    let stream = match st.engine.fragment(fragment).await {
+    let run = match task {
+        Task::Scan(f) => st.engine.fragment(f).await,
+        Task::Reduce(r) => {
+            // Peers see the query as this worker saw it.
+            let tag = query_id.map(|query_id| {
+                Arc::new(plimsoll_core::engine::QueryTag {
+                    query_id,
+                    user: report.user.clone(),
+                    traceparent: Some(report.ctx.traceparent()),
+                    deadline: Some(Instant::now() + budget),
+                })
+            });
+            st.engine.reduce(r, token.unwrap_or_default(), tag).await
+        }
+    };
+    let stream = match run {
         Ok(s) => s,
         Err(e) => {
             let e = GovernedError::Failed(e);
@@ -498,7 +526,8 @@ struct FragmentReport {
     rows: u64,
     bytes: u64,
     error: Option<String>,
-    _slot: plimsoll_control::governance::AdmissionSlot,
+    /// `None` for shuffle bucket requests (ADR 0064).
+    _slot: Option<plimsoll_control::governance::AdmissionSlot>,
 }
 
 impl Drop for FragmentReport {

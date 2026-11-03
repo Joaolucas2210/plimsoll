@@ -165,6 +165,17 @@ async fn distributed_scans_match_local_ones() {
                 format!("SELECT CAST(id AS INT) % 2 AS k, sum(id) FROM {t} GROUP BY k ORDER BY k"),
                 true,
             ),
+            // High cardinality: one group per row, merged on workers.
+            (
+                format!("SELECT id, count(*), max({group}) FROM {t} GROUP BY id ORDER BY id"),
+                true,
+            ),
+            (
+                format!(
+                    "SELECT id % 5 AS k, sum(id) FROM {t} GROUP BY k HAVING sum(id) > 10 ORDER BY k LIMIT 3"
+                ),
+                true,
+            ),
             // Not pushed: avg's partial state (count, sum) is not its value.
             (format!("SELECT avg(id) FROM {t}"), false),
         ] {
@@ -174,12 +185,28 @@ async fn distributed_scans_match_local_ones() {
             assert!(plan.contains("RemoteScanExec"), "{sql}: {plan}");
             assert_eq!(plan.contains("aggregate=["), pushed, "{sql}: {plan}");
             assert_eq!(got, want, "{sql}");
+            // Grouped aggregations over two fragments or more shuffle
+            // between workers (ADR 0064); count(DISTINCT) does not (its
+            // inner grouping feeds another aggregation).
+            let shuffles = pushed && sql.contains("GROUP BY") && !plan.contains("fragments=1 ");
+            assert_eq!(plan.contains(" shuffled"), shuffles, "{sql}: {plan}");
             if sql.contains("WHERE") {
                 // Applied by the scan, here and on the workers.
                 assert!(plan.contains("filters=["), "{sql}: {plan}");
                 assert!(!plan.contains("FilterExec"), "{sql}: {plan}");
             }
         }
+        // A grouped aggregation feeding a join: shuffled only where the
+        // join does not rely on its hash partitioning; same answers.
+        let join = format!(
+            "SELECT a.id, a.c, b.id AS b FROM (SELECT id, count(*) AS c FROM {t} GROUP BY id) a \
+             JOIN {t} b ON a.id = b.id ORDER BY a.id, b.id"
+        );
+        assert_eq!(
+            run(&coordinator, &join).await.0,
+            run(&local, &join).await.0,
+            "{join}"
+        );
         // The local scan's own filtering, checked against a filter it
         // never sees (an aggregate's FILTER clause).
         let (filtered, plan) = run(

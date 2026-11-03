@@ -28,6 +28,7 @@ use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::expressions::Literal;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -116,6 +117,86 @@ pub struct Fragment {
     /// Row filters as SQL over the table's columns, all to be applied
     /// before projecting or aggregating (ADR 0062).
     pub filters: Vec<String>,
+    /// Shuffle map (ADR 0064): hash-partition the aggregated fragment
+    /// into `partitions` buckets, keep them, and return bucket `index`.
+    pub bucket: Option<Bucket>,
+}
+
+/// Which bucket of which shuffle map a reducing worker asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bucket {
+    pub shuffle: String,
+    /// This map's position among the shuffle's maps.
+    pub map: usize,
+    pub partitions: usize,
+    pub index: usize,
+}
+
+/// A shuffle reduce (ADR 0064): fetch bucket `partition` of every map
+/// (aggregated fragments, each kept by the worker at its URL), merge the
+/// partial states and return final values for this bucket's groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reduce {
+    pub shuffle: String,
+    pub partition: usize,
+    pub maps: Vec<(String, Fragment)>,
+}
+
+impl Reduce {
+    pub fn to_json(&self) -> Json {
+        json!({"reduce": {
+            "shuffle": self.shuffle,
+            "partition": self.partition,
+            "maps": self.maps.iter().map(|(url, f)| json!({"url": url, "fragment": f.to_json()})).collect::<Vec<_>>(),
+        }})
+    }
+
+    pub fn from_json(v: &Json) -> Result<Self, String> {
+        let r = &v["reduce"];
+        let maps = r["maps"]
+            .as_array()
+            .ok_or("`reduce.maps` must be an array")?
+            .iter()
+            .map(|m| {
+                let url = m["url"].as_str().ok_or("`reduce.maps[].url`")?.to_owned();
+                let fragment = Fragment::from_json(&m["fragment"])?;
+                if fragment.aggregate.is_none() {
+                    return Err("a shuffle map must aggregate".to_owned());
+                }
+                Ok((url, fragment))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let partition = r["partition"]
+            .as_u64()
+            .and_then(|p| usize::try_from(p).ok())
+            .filter(|p| *p < maps.len())
+            .ok_or("`reduce.partition` must index `maps`")?;
+        Ok(Self {
+            shuffle: r["shuffle"]
+                .as_str()
+                .ok_or("`reduce.shuffle` is required")?
+                .to_owned(),
+            partition,
+            maps,
+        })
+    }
+}
+
+/// What `/v1/fragment` is asked to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Task {
+    Scan(Fragment),
+    Reduce(Reduce),
+}
+
+impl Task {
+    pub fn from_json(v: &Json) -> Result<Self, String> {
+        if v.get("reduce").is_some() {
+            Reduce::from_json(v).map(Self::Reduce)
+        } else {
+            Fragment::from_json(v).map(Self::Scan)
+        }
+    }
 }
 
 /// `<aggregates> GROUP BY <group_by>` over the fragment: what a worker
@@ -137,6 +218,9 @@ impl Fragment {
             "files": self.files,
             "columns": self.columns,
             "filters": self.filters,
+            "bucket": self.bucket.as_ref().map(|b| json!({
+                "shuffle": b.shuffle, "map": b.map, "partitions": b.partitions, "index": b.index,
+            })),
             "aggregate": self.aggregate.as_ref().map(|a| json!({
                 "group_by": a.group_by,
                 "aggregates": a.aggregates.iter().map(|(f, c)| json!({"fn": f, "column": c})).collect::<Vec<_>>(),
@@ -147,12 +231,13 @@ impl Fragment {
     pub fn from_json(v: &Json) -> Result<Self, String> {
         // A field this worker does not know could change the answer (a
         // filter it would skip): refuse it rather than ignore it.
-        const KNOWN: [&str; 6] = [
+        const KNOWN: [&str; 7] = [
             "metadata_location",
             "snapshot_id",
             "files",
             "columns",
             "filters",
+            "bucket",
             "aggregate",
         ];
         if let Some(unknown) = v
@@ -189,6 +274,29 @@ impl Fragment {
                 Json::Null => Vec::new(),
                 _ => strings("filters")?,
             },
+            bucket: match &v["bucket"] {
+                Json::Null => None,
+                b => {
+                    let n = |k: &str| {
+                        b[k].as_u64()
+                            .and_then(|n| usize::try_from(n).ok())
+                            .ok_or(format!("`bucket.{k}` must be a count"))
+                    };
+                    let (partitions, index) = (n("partitions")?, n("index")?);
+                    if index >= partitions {
+                        return Err("`bucket.index` must be below `bucket.partitions`".into());
+                    }
+                    Some(Bucket {
+                        shuffle: b["shuffle"]
+                            .as_str()
+                            .ok_or("`bucket.shuffle` is required")?
+                            .to_owned(),
+                        map: n("map")?,
+                        partitions,
+                        index,
+                    })
+                }
+            },
             aggregate: match &v["aggregate"] {
                 Json::Null => None,
                 a => Some(AggregateSpec {
@@ -224,6 +332,9 @@ pub struct RemoteScanExec {
     urls: Vec<String>,
     /// In partition order.
     fragments: Vec<Assigned>,
+    /// Shuffle id (ADR 0064): partition `i` is reduce `i`, run by the
+    /// owner of fragment `i` over bucket `i` of every fragment.
+    shuffle: Option<String>,
     properties: Arc<PlanProperties>,
 }
 
@@ -276,6 +387,7 @@ impl RemoteScanExec {
                     columns: columns.clone(),
                     aggregate: None,
                     filters: Vec::new(),
+                    bucket: None,
                 },
             })
             .collect();
@@ -290,6 +402,7 @@ impl RemoteScanExec {
             workers,
             urls: urls.to_vec(),
             fragments,
+            shuffle: None,
             properties,
         }
     }
@@ -305,18 +418,26 @@ impl RemoteScanExec {
     /// The same fragments, each aggregated on its worker into the partial
     /// states `schema` describes (ADR 0061).
     pub fn with_aggregate(&self, spec: AggregateSpec, schema: SchemaRef) -> Self {
-        let fragments = self
-            .fragments
-            .iter()
-            .cloned()
-            .map(|mut a| {
-                a.fragment.aggregate = Some(spec.clone());
-                a
-            })
-            .collect::<Vec<_>>();
+        let mut out = self.with_schema(schema);
+        for a in &mut out.fragments {
+            a.fragment.aggregate = Some(spec.clone());
+        }
+        out
+    }
+
+    /// The same aggregated fragments, shuffled between their workers by
+    /// group key and merged there (ADR 0064): each partition returns the
+    /// final values, in `schema`, of the groups hashed to it.
+    pub fn with_shuffle(&self, shuffle: String, schema: SchemaRef) -> Self {
+        let mut out = self.with_schema(schema);
+        out.shuffle = Some(shuffle);
+        out
+    }
+
+    fn with_schema(&self, schema: SchemaRef) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
-            Partitioning::UnknownPartitioning(fragments.len().max(1)),
+            Partitioning::UnknownPartitioning(self.fragments.len().max(1)),
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
@@ -324,9 +445,15 @@ impl RemoteScanExec {
             schema,
             workers: self.workers.clone(),
             urls: self.urls.clone(),
-            fragments,
+            fragments: self.fragments.clone(),
+            shuffle: self.shuffle.clone(),
             properties,
         }
+    }
+
+    /// Fragments, i.e. shuffle partitions when shuffled.
+    pub fn fragment_count(&self) -> usize {
+        self.fragments.len()
     }
 
     /// (worker url, files, bytes) per fragment, in partition order.
@@ -363,8 +490,13 @@ impl DisplayAs for RemoteScanExec {
             });
         write!(
             f,
-            "RemoteScanExec: fragments={} files={files} bytes={bytes:?}{filters}{aggregate}",
-            self.fragments.len()
+            "RemoteScanExec: fragments={} files={files} bytes={bytes:?}{filters}{aggregate}{}",
+            self.fragments.len(),
+            if self.shuffle.is_some() {
+                " shuffled"
+            } else {
+                ""
+            }
         )
     }
 }
@@ -412,17 +544,39 @@ impl ExecutionPlan for RemoteScanExec {
                 stream::empty(),
             )));
         };
-        // The owner first, then one other healthy worker (ADR 0060).
-        let n = self.urls.len();
-        let targets: Vec<String> = (0..n.min(2))
-            .map(|i| self.urls[(assigned.worker + i) % n].clone())
-            .collect();
+        let (body, targets) = match &self.shuffle {
+            // A reduce is not retried elsewhere: its buckets are consumed
+            // when fetched (ADR 0064).
+            Some(shuffle) => (
+                Reduce {
+                    shuffle: shuffle.clone(),
+                    partition,
+                    maps: self
+                        .fragments
+                        .iter()
+                        .map(|a| (self.urls[a.worker].clone(), a.fragment.clone()))
+                        .collect(),
+                }
+                .to_json(),
+                vec![self.urls[assigned.worker].clone()],
+            ),
+            // The owner first, then one other healthy worker (ADR 0060).
+            None => {
+                let n = self.urls.len();
+                (
+                    assigned.fragment.to_json(),
+                    (0..n.min(2))
+                        .map(|i| self.urls[(assigned.worker + i) % n].clone())
+                        .collect(),
+                )
+            }
+        };
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema.clone(),
             with_retry(
                 self.workers.clone(),
                 targets,
-                assigned.fragment,
+                Arc::new(body.to_string()),
                 tag,
                 schema,
             ),
@@ -449,6 +603,9 @@ impl PhysicalOptimizerRule for PartialAggregatePushdown {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Shuffles first (they consume the partial aggregations they
+        // replace), then partial pushdown where no shuffle applies.
+        let plan = shuffle(plan, true, config)?;
         plan.transform_down(|node| {
             Ok(match push_partial(&node, config)? {
                 Some(pushed) => Transformed::yes(pushed),
@@ -471,6 +628,17 @@ fn push_partial(
     node: &Arc<dyn ExecutionPlan>,
     config: &ConfigOptions,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    Ok(partial_remote(node, config)?.map(|pushed| {
+        Arc::new(AccountedExec::new("RemoteAggregate", Arc::new(pushed))) as Arc<dyn ExecutionPlan>
+    }))
+}
+
+/// The remote scan under `node`, aggregating on workers, if `node` is a
+/// pushable partial aggregation (see [`PartialAggregatePushdown`]).
+fn partial_remote(
+    node: &Arc<dyn ExecutionPlan>,
+    config: &ConfigOptions,
+) -> Result<Option<RemoteScanExec>> {
     let Some(agg) = node.as_ref().downcast_ref::<AggregateExec>() else {
         return Ok(None);
     };
@@ -545,11 +713,103 @@ fn push_partial(
         group_by,
         aggregates,
     };
-    let pushed = remote.with_aggregate(spec, agg.schema());
-    Ok(Some(Arc::new(AccountedExec::new(
-        "RemoteAggregate",
-        Arc::new(pushed),
-    ))))
+    Ok(Some(remote.with_aggregate(spec, agg.schema())))
+}
+
+/// Replaces a grouped final aggregation over a pushable partial one with
+/// a shuffle between the workers (ADR 0064), when nothing above depends
+/// on its partitioning (`free`). Recurses into the children otherwise.
+fn shuffle(
+    plan: Arc<dyn ExecutionPlan>,
+    free: bool,
+    config: &ConfigOptions,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if free {
+        if let Some(shuffled) = shuffle_final(&plan, config)? {
+            return Ok(shuffled);
+        }
+    }
+    // Children stay free below nodes that need no particular
+    // partitioning from them; joins, unions, windows, repartitions and
+    // aggregates are not among them.
+    let free = matches!(
+        plan.name(),
+        "CoalescePartitionsExec" | "SortPreservingMergeExec"
+    ) || (free
+        && matches!(
+            plan.name(),
+            "ProjectionExec"
+                | "SortExec"
+                | "SortExec(TopK)"
+                | "FilterExec"
+                | "CoalesceBatchesExec"
+                | "LocalLimitExec"
+                | "GlobalLimitExec"
+        ));
+    let children = plan
+        .children()
+        .into_iter()
+        .map(|c| shuffle(c.clone(), free, config))
+        .collect::<Result<Vec<_>>>()?;
+    datafusion::physical_plan::replace_children_if_necessary(plan, children)
+}
+
+fn shuffle_final(
+    node: &Arc<dyn ExecutionPlan>,
+    config: &ConfigOptions,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let Some(agg) = node.as_ref().downcast_ref::<AggregateExec>() else {
+        return Ok(None);
+    };
+    if !matches!(
+        agg.mode(),
+        AggregateMode::Final | AggregateMode::FinalPartitioned
+    ) || agg.group_expr().expr().is_empty()
+    {
+        return Ok(None);
+    }
+    let mut partial = agg.input().clone();
+    while matches!(
+        partial.name(),
+        "RepartitionExec" | "CoalesceBatchesExec" | "CoalescePartitionsExec"
+    ) {
+        let Some(c) = partial.children().first().map(|c| (*c).clone()) else {
+            return Ok(None);
+        };
+        partial = c;
+    }
+    let Some(remote) = partial_remote(&partial, config)? else {
+        return Ok(None);
+    };
+    // One state per aggregate (count/sum/min/max): merged, the state is
+    // the final value. Two fragments at least, or there is nothing to
+    // shuffle.
+    if partial.schema().fields().len() != agg.schema().fields().len() || remote.fragment_count() < 2
+    {
+        return Ok(None);
+    }
+    let id = {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        );
+        format!("{:016x}", h.finish())
+    };
+    let shuffled: Arc<dyn ExecutionPlan> = Arc::new(AccountedExec::new(
+        "RemoteShuffle",
+        Arc::new(remote.with_shuffle(id, agg.schema())),
+    ));
+    // Same partition count as the node replaced when that was one.
+    Ok(Some(
+        if agg.properties().output_partitioning().partition_count() == 1 {
+            Arc::new(CoalescePartitionsExec::new(shuffled))
+        } else {
+            shuffled
+        },
+    ))
 }
 
 /// A fragment request's failure, and whether another worker may be tried.
@@ -580,14 +840,14 @@ fn worker_error(message: String, retryable: bool) -> DataFusionError {
 fn with_retry(
     workers: Arc<Workers>,
     targets: Vec<String>,
-    fragment: Fragment,
+    body: Arc<String>,
     tag: Option<Arc<QueryTag>>,
     schema: SchemaRef,
 ) -> BoxStream<'static, Result<RecordBatch>> {
     struct Run {
         workers: Arc<Workers>,
         targets: VecDeque<String>,
-        fragment: Fragment,
+        body: Arc<String>,
         tag: Option<Arc<QueryTag>>,
         schema: SchemaRef,
         current: Option<BoxStream<'static, Result<RecordBatch>>>,
@@ -598,7 +858,7 @@ fn with_retry(
     let run = Run {
         workers,
         targets: targets.into(),
-        fragment,
+        body,
         tag,
         schema,
         current: None,
@@ -616,7 +876,7 @@ fn with_retry(
                 let body = stream::once(open(
                     run.workers.clone(),
                     url,
-                    run.fragment.clone(),
+                    run.body.clone(),
                     run.tag.clone(),
                 ))
                 .flat_map(|r| match r {
@@ -661,11 +921,12 @@ fn with_retry(
     .boxed()
 }
 
-/// POSTs the fragment; errors before the stream keep the worker's message.
+/// POSTs a task (fragment or reduce); errors before the stream keep the
+/// worker's message.
 async fn open(
     workers: Arc<Workers>,
     url: String,
-    fragment: Fragment,
+    body: Arc<String>,
     tag: Option<Arc<QueryTag>>,
 ) -> Result<BoxStream<'static, Result<Bytes>>> {
     let mut request = workers
@@ -693,7 +954,7 @@ async fn open(
         }
     }
     let response = request
-        .body(fragment.to_json().to_string())
+        .body(body.as_ref().clone())
         .send()
         .await
         .map_err(|e| worker_error(format!("worker {url}: {e}"), true))?;
@@ -711,6 +972,43 @@ async fn open(
         .bytes_stream()
         .map(move |b| b.map_err(|e| worker_error(format!("worker {url}: {e}"), true)))
         .boxed())
+}
+
+/// A shuffle bucket from the worker at `url` (ADR 0064), whole: its
+/// schema and batches as that worker typed them. `token` is the worker
+/// token the reducing worker was called with.
+pub async fn fetch_bucket(
+    url: String,
+    token: &str,
+    fragment: &Fragment,
+    tag: Option<Arc<QueryTag>>,
+) -> Result<(SchemaRef, Vec<RecordBatch>)> {
+    let workers = Arc::new(
+        Workers::new(Vec::new(), token.to_owned())
+            .map_err(|e| worker_error(e.to_string(), false))?,
+    );
+    let mut body = open(
+        workers,
+        url.clone(),
+        Arc::new(fragment.to_json().to_string()),
+        tag,
+    )
+    .await?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.next().await {
+        bytes.extend_from_slice(&chunk?);
+    }
+    if !bytes.ends_with(&END_OF_STREAM) {
+        return Err(worker_error(
+            format!("worker {url}: bucket ended without its end-of-stream marker"),
+            false,
+        ));
+    }
+    let reader =
+        datafusion::arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)?;
+    let schema = reader.schema();
+    let batches = reader.collect::<Result<Vec<_>, _>>()?;
+    Ok((schema, batches))
 }
 
 /// Arrow IPC's end-of-stream marker: continuation, then a zero length.
@@ -827,6 +1125,12 @@ mod tests {
                 aggregates: vec![("count".into(), None), ("sum".into(), Some("id".into()))],
             }),
             filters: vec!["id > 3".into()],
+            bucket: Some(Bucket {
+                shuffle: "s1".into(),
+                map: 1,
+                partitions: 2,
+                index: 0,
+            }),
         };
         assert_eq!(Fragment::from_json(&f.to_json()).unwrap(), f);
         assert!(Fragment::from_json(&json!({"files": []})).is_err());
@@ -835,6 +1139,22 @@ mod tests {
         newer["sample"] = json!(0.1);
         let e = Fragment::from_json(&newer).unwrap_err();
         assert!(e.contains("unknown fragment field `sample`"), "{e}");
+        let r = Reduce {
+            shuffle: "s1".into(),
+            partition: 1,
+            maps: vec![
+                ("http://w1".into(), f.clone()),
+                ("http://w2".into(), f.clone()),
+            ],
+        };
+        assert_eq!(
+            Task::from_json(&r.to_json()).unwrap(),
+            Task::Reduce(r.clone())
+        );
+        assert_eq!(Task::from_json(&f.to_json()).unwrap(), Task::Scan(f));
+        let mut bad = r.to_json();
+        bad["reduce"]["partition"] = json!(2);
+        assert!(Task::from_json(&bad).is_err());
         let w = Workers::new(vec!["http://w1/".into()], "secret".into()).unwrap();
         assert_eq!(w.urls(), ["http://w1"]);
         assert!(!format!("{w:?}").contains("secret"));
