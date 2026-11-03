@@ -60,21 +60,42 @@ pub(crate) fn physical_sql(
     }
     let text = expr_to_sql(&logical).ok()?.to_string();
     let schema = DFSchema::try_from(schema.clone()).ok()?;
+    let back = planned(&parse(&text, &schema)?, &schema, config)?;
+    (&back == expr).then_some(text)
+}
+
+/// [`physical_sql`] for an expression only evaluated, not claimed by a
+/// scan (a join's filter, ADR 0098): the SQL must plan back to `expr` once
+/// both are simplified alike (`a < b` comes back as `b > a`).
+pub(crate) fn physical_sql_equivalent(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+    config: &ConfigOptions,
+) -> Option<String> {
+    let logical = logical(expr)?;
+    if logical.is_volatile() {
+        return None;
+    }
+    let text = expr_to_sql(&logical).ok()?.to_string();
+    let schema = DFSchema::try_from(schema.clone()).ok()?;
+    let want = planned(&simplified(logical, &schema)?, &schema, config)?;
+    let back = planned(&parse(&text, &schema)?, &schema, config)?;
+    (back == want).then_some(text)
+}
+
+fn planned(e: &Expr, schema: &DFSchema, config: &ConfigOptions) -> Option<Arc<dyn PhysicalExpr>> {
     let mut props = ExecutionProps::new();
     props.config_options = Some(Arc::new(config.clone()));
-    let back = create_physical_expr(
-        &parse(&text, &schema)?,
-        &schema,
-        &props,
-        &PhysicalPlanningContext::default(),
-    )
-    .ok()?;
-    (&back == expr).then_some(text)
+    create_physical_expr(e, schema, &props, &PhysicalPlanningContext::default()).ok()
 }
 
 /// `text` parsed, coerced and simplified, as the optimizer leaves filters.
 pub(crate) fn parse(text: &str, schema: &DFSchema) -> Option<Expr> {
-    let parsed = PARSER.create_logical_expr(text, schema).ok()?;
+    simplified(PARSER.create_logical_expr(text, schema).ok()?, schema)
+}
+
+/// `e` coerced and simplified against `schema`.
+fn simplified(parsed: Expr, schema: &DFSchema) -> Option<Expr> {
     let context = SimplifyContext::builder()
         .with_schema(Arc::new(schema.clone()))
         .build();

@@ -398,12 +398,24 @@ fn broadcast_join(
         .and_then(|t| ctx.read_table(Arc::new(t)))
         .and_then(|df| df.alias("b"))
         .map_err(fail)?;
-    let on = spec.build_keys.iter().zip(&spec.probe_keys).map(|(a, b)| {
-        Expr::Column(Column::new(Some("b"), a)).eq(Expr::Column(Column::new(Some("p"), b)))
-    });
-    let df = build
-        .join_on(probe.alias("p").map_err(fail)?, run_as, on)
-        .map_err(fail)?;
+    let probe = probe.alias("p").map_err(fail)?;
+    let mut on: Vec<Expr> = spec
+        .build_keys
+        .iter()
+        .zip(&spec.probe_keys)
+        .map(|(a, b)| {
+            Expr::Column(Column::new(Some("b"), a)).eq(Expr::Column(Column::new(Some("p"), b)))
+        })
+        .collect();
+    if let Some(filter) = &spec.filter {
+        on.push(join_filter(
+            ctx,
+            filter,
+            ("b", build.schema()),
+            ("p", probe.schema()),
+        )?);
+    }
+    let df = build.join_on(probe, run_as, on).map_err(fail)?;
     if !spec.matched {
         return project(df, spec.projection.as_deref());
     }
@@ -438,6 +450,54 @@ fn broadcast_join(
     };
     kept.push(index);
     df.select(kept).map_err(fail)
+}
+
+/// A join's residual filter (ADR 0098) over sides aliased `left.0` and
+/// `right.0`: its SQL names columns `f0…`, each one of a side's columns.
+fn join_filter(
+    ctx: &plimsoll_core::datafusion::prelude::SessionContext,
+    filter: &plimsoll_connectors::remote::JoinFilter,
+    left: (&str, &plimsoll_core::datafusion::common::DFSchema),
+    right: (&str, &plimsoll_core::datafusion::common::DFSchema),
+) -> Result<plimsoll_core::datafusion::prelude::Expr, EngineError> {
+    use plimsoll_core::datafusion::arrow::datatypes::{Field, Schema};
+    use plimsoll_core::datafusion::common::tree_node::{Transformed, TreeNode};
+    use plimsoll_core::datafusion::common::{Column, DFSchema, TableReference};
+    use plimsoll_core::datafusion::prelude::Expr;
+    let fail = |e: DataFusionError| classify(&e);
+    let side = |is_left: bool| if is_left { left } else { right };
+    let mut fields = Vec::new();
+    for (i, (is_left, name)) in filter.columns.iter().enumerate() {
+        let (alias, schema) = side(*is_left);
+        let field = schema
+            .field_with_name(Some(&TableReference::bare(alias)), name)
+            .map_err(fail)?;
+        fields.push(Field::new(format!("f{i}"), field.data_type().clone(), true));
+    }
+    let named = DFSchema::try_from(Schema::new(fields)).map_err(fail)?;
+    let parsed = ctx
+        .state()
+        .create_logical_expr(&filter.sql, &named)
+        .map_err(fail)?;
+    parsed
+        .transform(|e| {
+            let Expr::Column(c) = &e else {
+                return Ok(Transformed::no(e));
+            };
+            let i = c
+                .name
+                .strip_prefix('f')
+                .and_then(|i| i.parse::<usize>().ok());
+            match i.and_then(|i| filter.columns.get(i)) {
+                Some((is_left, name)) => Ok(Transformed::yes(Expr::Column(Column::new(
+                    Some(side(*is_left).0),
+                    name,
+                )))),
+                None => Ok(Transformed::no(e)),
+            }
+        })
+        .map(|t| t.data)
+        .map_err(fail)
 }
 
 /// `batches` with a last `__b_row` column numbering their rows from 0, in
@@ -1168,10 +1228,23 @@ impl QueryEngine for CoreEngine {
                     left.alias("l").map_err(fail)?,
                     read(right)?.alias("r").map_err(fail)?,
                 );
-                let on = j.left_keys.iter().zip(&j.right_keys).map(|(a, b)| {
-                    Expr::Column(Column::new(Some("l"), a))
-                        .eq(Expr::Column(Column::new(Some("r"), b)))
-                });
+                let mut on: Vec<Expr> = j
+                    .left_keys
+                    .iter()
+                    .zip(&j.right_keys)
+                    .map(|(a, b)| {
+                        Expr::Column(Column::new(Some("l"), a))
+                            .eq(Expr::Column(Column::new(Some("r"), b)))
+                    })
+                    .collect();
+                if let Some(filter) = &j.filter {
+                    on.push(join_filter(
+                        &ctx,
+                        filter,
+                        ("l", l.schema()),
+                        ("r", rt.schema()),
+                    )?);
+                }
                 let join_type: JoinType = j.join_type.parse().map_err(fail)?;
                 let df = l.join_on(rt, join_type, on).map_err(fail)?;
                 project(df, j.projection.as_deref())?

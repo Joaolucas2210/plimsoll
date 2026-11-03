@@ -348,6 +348,8 @@ pub struct Broadcast {
     /// for full) and returns each output row's build row index as a last
     /// `__b_row` column; for semi and anti joins, only the indices.
     pub matched: bool,
+    /// The join's residual filter (ADR 0098).
+    pub filter: Option<JoinFilter>,
 }
 
 /// Which bucket of which shuffle map a reducing worker asks for.
@@ -395,6 +397,95 @@ pub struct JoinSpec {
     pub right_keys: Vec<String>,
     /// Output columns kept, by position in left ++ right.
     pub projection: Option<Vec<usize>>,
+    /// The join's residual filter (ADR 0098).
+    pub filter: Option<JoinFilter>,
+}
+
+/// A join's non-equi filter as a worker plans it (ADR 0098): portable SQL
+/// over columns named `f0…`, each a column of one side, by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinFilter {
+    pub sql: String,
+    /// Per `f{i}`: whether it is on the left (build, for a broadcast)
+    /// side, and its name there.
+    pub columns: Vec<(bool, String)>,
+}
+
+impl JoinFilter {
+    fn to_json(&self) -> Json {
+        json!({"sql": self.sql, "columns": self.columns.iter().map(|(l, n)| json!([l, n])).collect::<Vec<_>>()})
+    }
+
+    fn from_json(v: &Json) -> Result<Option<Self>, String> {
+        if v.is_null() {
+            return Ok(None);
+        }
+        let columns = v["columns"]
+            .as_array()
+            .ok_or("`filter.columns` must be an array")?
+            .iter()
+            .map(|c| match (c[0].as_bool(), c[1].as_str()) {
+                (Some(l), Some(n)) => Ok((l, n.to_owned())),
+                _ => Err("`filter.columns[]` is [left, name]".to_owned()),
+            })
+            .collect::<Result<_, String>>()?;
+        Ok(Some(Self {
+            sql: v["sql"]
+                .as_str()
+                .ok_or("`filter.sql` is required")?
+                .to_owned(),
+            columns,
+        }))
+    }
+}
+
+/// The join's filter for workers (ADR 0098): `Some(None)` without one,
+/// `None` when it does not travel exactly as SQL.
+fn join_filter(
+    join: &datafusion::physical_plan::joins::HashJoinExec,
+    config: &ConfigOptions,
+) -> Option<Option<JoinFilter>> {
+    use datafusion::arrow::datatypes::{Field, Schema};
+    use datafusion::common::JoinSide;
+    use datafusion::physical_expr::expressions::Column;
+    let Some(filter) = join.filter() else {
+        return Some(None);
+    };
+    let (ls, rs) = (join.left().schema(), join.right().schema());
+    let mut columns = Vec::new();
+    for c in filter.column_indices() {
+        let (left, schema) = match c.side {
+            JoinSide::Left => (true, &ls),
+            JoinSide::Right => (false, &rs),
+            JoinSide::None => return None,
+        };
+        columns.push((left, schema.fields().get(c.index)?.name().clone()));
+    }
+    let named = Arc::new(Schema::new(
+        filter
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| Field::new(format!("f{i}"), f.data_type().clone(), true))
+            .collect::<Vec<_>>(),
+    ));
+    let expr = filter
+        .expression()
+        .clone()
+        .transform(|e| {
+            Ok(match e.as_ref().downcast_ref::<Column>() {
+                Some(c) => {
+                    Transformed::yes(Arc::new(Column::new(&format!("f{}", c.index()), c.index()))
+                        as Arc<dyn datafusion::physical_expr::PhysicalExpr>)
+                }
+                None => Transformed::no(e),
+            })
+        })
+        .data()
+        .ok()?;
+    let sql = crate::portable::physical_sql_equivalent(&expr, &named, config)?;
+    Some(Some(JoinFilter { sql, columns }))
 }
 
 fn maps_json(maps: &[(String, Fragment)]) -> Json {
@@ -460,6 +551,7 @@ impl Reduce {
                 "left_keys": j.left_keys,
                 "right_keys": j.right_keys,
                 "projection": j.projection,
+                "filter": j.filter.as_ref().map(JoinFilter::to_json),
             })),
         }})
     }
@@ -478,6 +570,7 @@ impl Reduce {
                 left_keys: names(&j["left_keys"], "reduce.join.left_keys")?,
                 right_keys: names(&j["right_keys"], "reduce.join.right_keys")?,
                 projection: projection(&j["projection"], "reduce.join.projection")?,
+                filter: JoinFilter::from_json(&j["filter"])?,
             }),
         };
         if join.is_none() && maps.iter().any(|(_, f)| f.aggregate.is_none()) {
@@ -560,6 +653,7 @@ impl Fragment {
                 "probe_keys": b.probe_keys,
                 "projection": b.projection,
                 "matched": b.matched,
+                "filter": b.filter.as_ref().map(JoinFilter::to_json),
             })),
             "write": self.write.as_ref().map(WriteTo::to_json),
             "change": self.change.as_ref().map(|c| json!({"predicate": c.predicate, "update": c.update})),
@@ -647,6 +741,7 @@ impl Fragment {
                     probe_keys: names(&b["probe_keys"], "broadcast.probe_keys")?,
                     projection: projection(&b["projection"], "broadcast.projection")?,
                     matched: b["matched"].as_bool().unwrap_or(false),
+                    filter: JoinFilter::from_json(&b["filter"])?,
                 }),
             },
             bucket: match &v["bucket"] {
@@ -1775,7 +1870,7 @@ fn shuffle(
         if let Some(shuffled) = shuffle_final(&plan, config)? {
             return Ok(shuffled);
         }
-        if let Some(shuffled) = shuffle_join(&plan) {
+        if let Some(shuffled) = shuffle_join(&plan, config) {
             return Ok(shuffled);
         }
         if let Some(broadcast) = broadcast_join(&plan, config)? {
@@ -1816,15 +1911,18 @@ fn shuffle(
 /// its join keys into one bucket per healthy worker, and worker `j` joins
 /// bucket `j` of both sides. Equal key types hash equally, so matching
 /// rows meet on one worker.
-fn shuffle_join(node: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+fn shuffle_join(
+    node: &Arc<dyn ExecutionPlan>,
+    config: &ConfigOptions,
+) -> Option<Arc<dyn ExecutionPlan>> {
     use datafusion::common::{JoinType, NullEquality};
     use datafusion::physical_expr::expressions::Column;
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
     let join = node.as_ref().downcast_ref::<HashJoinExec>()?;
-    // The worker runs the same join: no residual filter, no mark join,
-    // no null-equal keys.
+    // The worker runs the same join: its filter as SQL (ADR 0098), no mark
+    // join, no null-equal keys.
+    let filter = join_filter(join, config)?;
     if *join.partition_mode() != PartitionMode::Partitioned
-        || join.filter().is_some()
         || join.null_equality() != NullEquality::NullEqualsNothing
         || matches!(join.join_type(), JoinType::LeftMark | JoinType::RightMark)
     {
@@ -1856,6 +1954,7 @@ fn shuffle_join(node: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>>
         left_keys,
         right_keys,
         projection: join.projection.as_ref().map(|p| p.to_vec()),
+        filter,
     };
     let (shuffle, partitions, maps) = (shuffle_id(), left.urls.len(), left.maps());
     let reduces = left
@@ -1911,8 +2010,11 @@ fn broadcast_join(
         join.join_type(),
         JoinType::Left | JoinType::Full | JoinType::LeftSemi | JoinType::LeftAnti
     );
+    // A filter travels as SQL (ADR 0098), or the join stays.
+    let Some(filter) = join_filter(join, config) else {
+        return Ok(None);
+    };
     if *join.partition_mode() != PartitionMode::CollectLeft
-        || join.filter().is_some()
         || join.null_equality() != NullEquality::NullEqualsNothing
         || join.null_aware
         || !(gathered
@@ -1958,6 +2060,7 @@ fn broadcast_join(
         probe_keys,
         projection: join.projection.as_ref().map(|p| p.to_vec()),
         matched: gathered,
+        filter,
     };
     // The build side is collected whole, so nothing in it depends on
     // its partitioning: it may shuffle too.
@@ -2410,6 +2513,10 @@ mod tests {
                 probe_keys: vec!["id".into()],
                 projection: None,
                 matched: true,
+                filter: Some(JoinFilter {
+                    sql: "f0 < f1".into(),
+                    columns: vec![(true, "a".into()), (false, "b".into())],
+                }),
             }),
             write: Some(WriteTo {
                 metadata_location: "s3://b/u/metadata/v1.metadata.json".into(),
@@ -2467,6 +2574,10 @@ mod tests {
                 left_keys: vec!["id".into()],
                 right_keys: vec!["re\"gion".into()],
                 projection: Some(vec![0]),
+                filter: Some(JoinFilter {
+                    sql: "f0 <> f1".into(),
+                    columns: vec![(true, "id".into()), (false, "re\"gion".into())],
+                }),
             }),
             ..r.clone()
         };

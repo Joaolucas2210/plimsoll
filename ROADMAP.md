@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Joins with filters on workers: the residual filter shipped as SQL over `f0…` columns mapped to each side, checked by equivalence after simplification; shuffled, broadcast and gathered joins (ADR 0098)
 - [x] Left, full, semi and anti broadcast joins on workers: workers join with numbered build rows and report the matches; the coordinator adds the build-only rows (`EXISTS`, `NOT EXISTS`, `IN`, left and full joins; `NOT IN` stays local) (ADR 0097)
 - [x] Row lineage in rewrites: first row ids inherited on read, `_row_id` / `_last_updated_sequence_number` read where materialized and written into rewritten files; UPDATE, merge-update and compaction work on v3 (ADR 0096)
 - [x] Writes to v3 tables: row lineage (`first-row-id`, `added-rows`, manifest `first_row_id`), deletes as deletion vectors in Puffin (one per data file, earlier deletes merged and replaced), `CREATE TABLE … 'format-version' = '3'`; rewrites (UPDATE, merge-update, compaction) refused until lineage is carried (ADR 0095)
@@ -130,9 +131,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Joins with filters on workers** — ship a join's non-equi filter as
-portable SQL over the joined row, so broadcast and shuffled joins with
-extra conditions (`a.id = b.id AND a.ts > b.ts`) distribute too.
+**Expression join keys on workers** — hash expression keys
+(`ON lower(a.k) = lower(b.k)`) on the maps, shipped as SQL like
+aggregation keys, so shuffled and broadcast joins take them too.
 
 ## Missing
 
@@ -149,7 +150,8 @@ extra conditions (`a.id = b.id AND a.ts > b.ts`) distribute too.
   REPLACE TABLE … AS SELECT`.
 
 **Distribution**
-- Joins with filters on workers (above);
+- Expression join keys on workers (above); non-equi (nested loop)
+  joins against a small side;
   an explicit cap on broadcast build sides, or caching them per snapshot
   (ADR 0066).
 - Expression join keys and residual filters in shuffled joins; joins

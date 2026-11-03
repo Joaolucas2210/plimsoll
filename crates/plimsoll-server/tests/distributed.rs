@@ -325,6 +325,15 @@ async fn distributed_scans_match_local_ones() {
                 "SELECT count(*), sum(id) FROM {t} a WHERE NOT EXISTS \
                  (SELECT 1 FROM {t} b WHERE b.id = a.id AND b.id > 5)"
             ),
+            // Joins with a residual filter (ADR 0098), shuffled.
+            format!(
+                "SELECT a.id, b.id AS b FROM {t} a JOIN {t} b ON a.id = b.id \
+                 AND a.id * 2 + b.id > 12 ORDER BY a.id, b"
+            ),
+            format!(
+                "SELECT count(*), sum(a.id), count(b.id) FROM {t} a LEFT JOIN {t} b \
+                 ON a.id = b.id AND a.id + b.id > 10"
+            ),
         ] {
             joins_match(&sql).await;
         }
@@ -414,6 +423,29 @@ async fn distributed_scans_match_local_ones() {
                     "SELECT a.id FROM (SELECT id FROM {t} WHERE id < 8) a \
                      WHERE NOT EXISTS (SELECT 1 FROM {t} b WHERE b.id = a.id AND b.id % 2 = 0) \
                      ORDER BY a.id"
+                ),
+                Some(true),
+            ),
+            // With residual filters (ADR 0098).
+            (
+                format!(
+                    "SELECT a.id, b.id AS b FROM {t} a JOIN (SELECT id FROM {t} WHERE id < 6) b \
+                     ON a.id = b.id AND a.id + b.id > 4 ORDER BY a.id, b"
+                ),
+                None,
+            ),
+            (
+                format!(
+                    "SELECT a.id, b.id AS b FROM (SELECT id FROM {t} WHERE id < 8) a \
+                     LEFT JOIN (SELECT id FROM {t} WHERE id % 2 = 0) b \
+                     ON a.id = b.id AND a.id + b.id > 6 ORDER BY a.id"
+                ),
+                Some(true),
+            ),
+            (
+                format!(
+                    "SELECT a.id FROM (SELECT id FROM {t} WHERE id < 8) a WHERE EXISTS \
+                     (SELECT 1 FROM {t} b WHERE b.id = a.id AND b.id + a.id > 6) ORDER BY a.id"
                 ),
                 Some(true),
             ),

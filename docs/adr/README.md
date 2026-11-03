@@ -105,6 +105,7 @@ are allowed in place.
 | [0095](0095-v3-writes.md) | Writes to format v3 tables | Accepted (amended by 0096: rewrites allowed) | 2026-11-03 | v3 manifests and manifest lists (first_row_id, content offset/size); commits assign row ids from `next-row-id` (`first-row-id`, `added-rows`); deletes are one Puffin deletion vector per data file including its earlier deletes, which the commit marks DELETED; UPDATE, merge-update and compaction refused on v3 until rewritten rows carry their lineage | 0017, 0075, 0077, 0083, 0093 |
 | [0096](0096-row-lineage-in-rewrites.md) | Row lineage in rewrites | Accepted | 2026-11-03 | Planning computes each data file's first row id (own or inherited, all entries counted); rewrites read materialized `_row_id` / `_last_updated_sequence_number` where present and write both as columns of rewritten files (UPDATE and merge-update keep ids with a NULL sequence, compaction keeps both); rewritten v3 manifests write inherited first row ids out; ADR 0095's refusals lifted | 0095, 0081, 0082, 0078 |
 | [0097](0097-gathered-broadcast-joins.md) | Left, full, semi and anti broadcast joins on workers | Accepted | 2026-11-03 | Workers number the build rows, join as inner (right for full) and return each row's build number (only the distinct numbers for semi/anti); one coordinator partition streams the joined rows, then adds the build-only rows (unmatched for left/full/anti with NULL probe columns, matched for semi); filters, null-equal keys and null-aware anti joins stay local | 0066, 0058, 0065 |
+| [0098](0098-join-filters-on-workers.md) | Joins with filters on workers | Accepted | 2026-11-03 | A join's residual filter is rendered as SQL over `f0…` (each a side's column by name) and accepted when it plans back equivalently after simplification; workers rebuild it over their aliased sides and add it to the join's ON; shuffled, broadcast and gathered joins all take it; expression keys and non-equi joins stay local | 0065, 0066, 0097, 0063 |
 
 ## Reading order
 
@@ -112,7 +113,7 @@ are allowed in place.
 - Shape of the system: 0001, 0002, 0004.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
 - Federation: 0005 → 0006.
-- Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074 → 0091 → 0092 → 0093 → 0094 → 0097.
+- Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074 → 0091 → 0092 → 0093 → 0094 → 0097 → 0098.
 - Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084 → 0085 → 0086 → 0087 → 0088 → 0089 → 0090 → 0091 → 0092 → 0093 → 0094 → 0095 → 0096.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046.
