@@ -56,6 +56,9 @@ pub struct Config {
     /// `PLIMSOLL_COORDINATORS`: the other coordinators, as `workers` are
     /// given; this node may be among them (ADR 0102).
     pub coordinators: Vec<String>,
+    /// `PLIMSOLL_ADMISSION_SCOPE=cluster`: the admission limits are the
+    /// cluster's, shared by the live coordinators (ADR 0103).
+    pub cluster_admission: bool,
     /// `PLIMSOLL_TLS_CERT` / `PLIMSOLL_TLS_KEY`: serve TLS (ADR 0099).
     pub tls: Option<crate::tls::TlsFiles>,
     /// `PLIMSOLL_TLS_CA`: a PEM bundle trusted, besides the system roots,
@@ -154,6 +157,25 @@ impl Config {
         let workers = nodes(&lookup, "PLIMSOLL_WORKERS", worker_token.is_some())?;
         // ADR 0102: the same shapes, and the same token between them.
         let coordinators = nodes(&lookup, "PLIMSOLL_COORDINATORS", worker_token.is_some())?;
+        const SCOPE: &str = "PLIMSOLL_ADMISSION_SCOPE";
+        let cluster_admission = match lookup(SCOPE).as_deref().map(str::trim) {
+            None | Some("node") => false,
+            Some("cluster") if !coordinators.is_empty() => true,
+            Some("cluster") => {
+                return Err(ConfigError {
+                    var: SCOPE,
+                    value: "cluster".into(),
+                    reason: "needs PLIMSOLL_COORDINATORS",
+                });
+            }
+            Some(other) => {
+                return Err(ConfigError {
+                    var: SCOPE,
+                    value: other.to_owned(),
+                    reason: "expected node or cluster",
+                });
+            }
+        };
         let slow_ms: u64 = parse(
             &lookup,
             "PLIMSOLL_SLOW_QUERY_MS",
@@ -215,6 +237,7 @@ impl Config {
             worker_token,
             workers,
             coordinators,
+            cluster_admission,
             tls,
             tls_ca,
             broadcast_max_bytes,
@@ -546,6 +569,22 @@ mod tests {
         );
         let e = cfg(&[token, ("PLIMSOLL_COORDINATORS", "c2:8080")]).unwrap_err();
         assert_eq!(e.var, "PLIMSOLL_COORDINATORS");
+        assert!(!c.cluster_admission);
+        let peers = ("PLIMSOLL_COORDINATORS", "http://c2:8080");
+        let scope = |v| ("PLIMSOLL_ADMISSION_SCOPE", v);
+        assert!(
+            cfg(&[token, peers, scope("cluster")])
+                .unwrap()
+                .cluster_admission
+        );
+        assert!(
+            !cfg(&[token, peers, scope("node")])
+                .unwrap()
+                .cluster_admission
+        );
+        let e = cfg(&[scope("cluster")]).unwrap_err();
+        assert_eq!(e.reason, "needs PLIMSOLL_COORDINATORS");
+        assert!(cfg(&[token, peers, scope("global")]).is_err());
     }
 
     #[test]

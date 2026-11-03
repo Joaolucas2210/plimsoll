@@ -65,6 +65,30 @@ impl Peers {
             .collect()
     }
 
+    /// The ids of the peers that answer: with this node's, every live
+    /// coordinator once (ADR 0103), whether or not the list names this one.
+    pub async fn nodes(&self) -> Vec<QueryId> {
+        let urls = self.0.healthy_urls();
+        let calls = urls.iter().map(|url| async move {
+            let r = self
+                .0
+                .request(reqwest::Method::GET, &format!("{url}/v1/peer/node"))
+                .timeout(TIMEOUT)
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?;
+            let body: Value = serde_json::from_slice(&r.bytes().await.ok()?).ok()?;
+            body["node"].as_u64()
+        });
+        futures::future::join_all(calls)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
     /// Asks every peer to cancel `id` (only if `only` owns it, when set).
     /// The first answer other than 404, or `None` when no peer has it.
     pub async fn cancel(&self, id: QueryId, only: Option<&str>) -> Option<(StatusCode, Value)> {

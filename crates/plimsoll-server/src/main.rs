@@ -92,12 +92,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 plimsoll_connectors::remote::Workers::new(cfg.coordinators.clone(), token.clone())?,
             ));
             let checked = peers.clone();
+            // ADR 0103: the limits are the cluster's; this node's part
+            // follows the live coordinators, itself counted once.
+            let shared = cfg.cluster_admission.then(|| admission.clone());
             tokio::spawn(async move {
+                let mut last = 0;
                 loop {
                     checked
                         .0
                         .check_health(std::time::Duration::from_secs(2))
                         .await;
+                    if let Some(admission) = &shared {
+                        let mut nodes = checked.nodes().await;
+                        nodes.push(admission.registry().first_id());
+                        nodes.sort_unstable();
+                        nodes.dedup();
+                        if nodes.len() != last {
+                            last = nodes.len();
+                            admission.share_with(last);
+                            log::emit(
+                                Level::Info,
+                                "admission_shared",
+                                json!({ "coordinators": last }),
+                            );
+                        }
+                    }
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             });

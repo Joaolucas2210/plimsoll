@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Admission limits shared by the coordinators: `PLIMSOLL_ADMISSION_SCOPE=cluster`, each node enforcing `ceil(limit / live coordinators)` (ADR 0103)
 - [x] Queries across coordinators: `PLIMSOLL_COORDINATORS` peers (seeds or DNS, health-checked), `system.runtime.queries` merges every coordinator's rows, cancels reach the coordinator running the query (ADR 0102)
 - [x] Several coordinators: query ids from random per-node ranges, scheduled maintenance claimed per table with a conditional-write lease in the table's location (ADR 0101)
 - [x] OTLP metrics: the `/metrics` series pushed to `<endpoint>/v1/metrics` as JSON every `OTEL_METRIC_EXPORT_INTERVAL`, flushed on shutdown (ADR 0100)
@@ -160,7 +161,7 @@ aggregation keys, so shuffled and broadcast joins take them too.
 - Cheaper recovery: one re-run of a lost map serving every reducer;
   more than one retry per step (ADR 0072).
 - Postgres (federated) scans stay on the coordinator.
-- Global admission across coordinators (ADR 0101); SRV-based discovery; TLS to workers discovered
+- Exact cluster admission limits (ADR 0103); SRV-based discovery; TLS to workers discovered
   by IP (ADR 0070).
 
 **Planning and performance**

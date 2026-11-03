@@ -85,6 +85,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/sql", post(sql))
         .route("/v1/queries/{id}", delete(cancel_query))
         .route("/v1/fragment", post(fragment))
+        .route("/v1/peer/node", get(peer_node))
         .route("/v1/peer/queries", get(peer_queries))
         .route("/v1/peer/queries/{id}", delete(peer_cancel))
         .route("/v1/maintenance/compact", post(compact))
@@ -385,6 +386,15 @@ fn node_auth(st: &AppState, headers: &HeaderMap) -> Option<Response> {
         );
     }
     None
+}
+
+/// `GET /v1/peer/node` (ADR 0103): this node's id, so coordinators count
+/// each other once.
+async fn peer_node(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(r) = node_auth(&st, &headers) {
+        return r;
+    }
+    Json(json!({ "node": st.admission.registry().first_id() })).into_response()
 }
 
 /// `GET /v1/peer/queries` (ADR 0102): this node's queries, unscoped, for
@@ -2228,6 +2238,8 @@ mod tests {
         {
             tokio::task::yield_now().await;
         }
+        // ADR 0103: the peer names itself by its first query id.
+        assert_eq!(a.peers.as_ref().unwrap().nodes().await, [7 << 32 | 1]);
         let listed = a.peers.as_ref().unwrap().queries().await;
         assert_eq!(listed.len(), 1);
         assert_eq!((listed[0].id, listed[0].user.as_str()), (id, "ana"));

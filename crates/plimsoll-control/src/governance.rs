@@ -107,6 +107,7 @@ pub struct QueryTotals {
 /// ring buffer + export to an audit table.
 pub struct QueryRegistry {
     queries: Mutex<BTreeMap<QueryId, QueryInfo>>,
+    first: QueryId,
     next_id: AtomicU64,
     retain_terminal: usize,
     finished: AtomicU64,
@@ -139,6 +140,7 @@ impl QueryRegistry {
     pub fn new(retain_terminal: usize) -> Self {
         Self {
             queries: Mutex::new(BTreeMap::new()),
+            first: 1,
             next_id: AtomicU64::new(1),
             retain_terminal,
             finished: AtomicU64::new(0),
@@ -149,9 +151,16 @@ impl QueryRegistry {
     }
 
     /// The id the first registered query gets (the default is 1).
-    pub fn starting_at(self, first: QueryId) -> Self {
+    pub fn starting_at(mut self, first: QueryId) -> Self {
         self.next_id.store(first, Ordering::Relaxed);
+        self.first = first;
         self
+    }
+
+    /// The first id: random per node (ADR 0101), so it also names the node
+    /// among coordinators (ADR 0103).
+    pub fn first_id(&self) -> QueryId {
+        self.first
     }
 
     /// Asks a queued or running query to stop. Who may cancel what is the
@@ -350,6 +359,9 @@ struct State {
     users: HashMap<String, Counts>,
     queue: VecDeque<Waiter>,
     next_waiter: u64,
+    /// Coordinators the configured limits are shared by (ADR 0103): this
+    /// node enforces its part of each. 0 or 1: the limits are its own.
+    share: usize,
 }
 
 impl State {
@@ -361,10 +373,16 @@ impl State {
         self.users.get(u).copied().unwrap_or_default()
     }
 
+    /// This node's part of a cluster-wide `limit`: rounded up, so a limit
+    /// smaller than the coordinators is never 0 anywhere (ADR 0103).
+    fn part(&self, limit: usize) -> usize {
+        limit.div_ceil(self.share.max(1))
+    }
+
     fn can_run(&self, cfg: &AdmissionConfig, user: &str, group: &str) -> bool {
-        self.global.running < cfg.global.max_running
-            && self.group(group).running < cfg.group_limits(group).max_running
-            && self.user(user).running < cfg.per_user.max_running
+        self.global.running < self.part(cfg.global.max_running)
+            && self.group(group).running < self.part(cfg.group_limits(group).max_running)
+            && self.user(user).running < self.part(cfg.per_user.max_running)
     }
 
     fn queue_check(
@@ -374,6 +392,7 @@ impl State {
         group: &str,
     ) -> Result<(), AdmissionError> {
         let full = |count: usize, limit: usize, scope: Scope| {
+            let limit = self.part(limit);
             if count >= limit {
                 Err(AdmissionError::QueueFull { scope, limit })
             } else {
@@ -520,6 +539,20 @@ impl Admission {
         &self.inner.cfg
     }
 
+    /// Shares the configured limits with `coordinators` nodes, this one
+    /// included (ADR 0103): each enforces its part. Fewer coordinators
+    /// raise the parts, and queued queries that now fit start.
+    pub fn share_with(&self, coordinators: usize) {
+        let promoted = {
+            let mut st = lock(&self.inner.state);
+            st.share = coordinators;
+            promote(&self.inner, &mut st)
+        };
+        for (tx, slot) in promoted {
+            let _ = tx.send(slot);
+        }
+    }
+
     /// Global `(running, queued)`, exported as gauges.
     pub fn load(&self) -> (usize, usize) {
         let st = lock(&self.inner.state);
@@ -647,6 +680,38 @@ mod tests {
             resource_group: "default".into(),
             sql: "select 1".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn cluster_limits_are_shared_by_the_coordinators() {
+        // 5 running, 3 queued for the cluster; three coordinators.
+        let adm = admission(lim(5, 3), lim(5, 3), lim(5, 3));
+        adm.share_with(3);
+        // ceil(5/3) = 2 run here, ceil(3/3) = 1 waits.
+        let _a = adm.acquire("u", DEFAULT_GROUP).await.unwrap();
+        let _b = adm.acquire("u", DEFAULT_GROUP).await.unwrap();
+        let waiting = tokio::spawn({
+            let adm = adm.clone();
+            async move { adm.acquire("u", DEFAULT_GROUP).await.map(|_| ()) }
+        });
+        while adm.load() != (2, 1) {
+            tokio::task::yield_now().await;
+        }
+        let err = adm.acquire("u", DEFAULT_GROUP).await.err().unwrap();
+        assert_eq!(
+            err,
+            AdmissionError::QueueFull {
+                scope: Scope::Global,
+                limit: 1
+            }
+        );
+        // A coordinator is lost: ceil(5/2) = 3, the waiting query starts.
+        adm.share_with(2);
+        waiting.await.unwrap().unwrap();
+        // Never 0: a limit of 1 shared by 3 is 1 per node.
+        let one = admission(lim(1, 0), lim(1, 0), lim(1, 0));
+        one.share_with(3);
+        let _c = one.acquire("u", DEFAULT_GROUP).await.unwrap();
     }
 
     #[tokio::test]
