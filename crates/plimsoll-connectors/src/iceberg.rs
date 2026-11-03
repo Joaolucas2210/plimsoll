@@ -50,11 +50,13 @@ use serde_json::Value as Json;
 
 use crate::{Connector, ConnectorError, portable};
 
+mod create;
 mod deletes;
 mod field_ids;
 mod files;
 pub mod meta;
 
+pub use create::create_request;
 pub mod expire;
 mod merge;
 mod prune;

@@ -2,6 +2,7 @@
 //!
 //! Invariant: this crate never depends on concrete connectors.
 
+pub mod ddl;
 pub mod engine;
 pub mod federation;
 pub mod memory;

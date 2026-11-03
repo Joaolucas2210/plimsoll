@@ -9,6 +9,7 @@
 //! `bronze."trips@audit"` reads the table as of that snapshot. The reference stays in its schema, so grants apply unchanged.
 //! `bronze."trips$snapshots"`, `$history` and `$refs` list them (ADR 0030);
 //! `$files` and `$manifests` list the current snapshot's files (ADR 0032).
+//! `CREATE TABLE ns.t (…)` creates through the catalog (ADR 0083).
 
 use std::sync::{Arc, PoisonError, RwLock};
 
@@ -137,6 +138,40 @@ impl iceberg::write::Committer for CatalogCommitter {
     }
 }
 
+/// `CREATE TABLE` in the REST catalog (ADR 0083): the table's schema is
+/// the catalog namespace.
+struct CatalogCreator(Arc<dyn Catalog>);
+
+#[async_trait]
+impl plimsoll_core::ddl::TableCreator for CatalogCreator {
+    async fn create_table(
+        &self,
+        table: &plimsoll_core::datafusion::common::ResolvedTableReference,
+        new: plimsoll_core::ddl::NewTable,
+    ) -> Result<()> {
+        let ident = TableIdent::new(Namespace::new(&[&table.schema]), &table.table);
+        let request =
+            iceberg::create_request(&table.table, &new.schema, &new.partition, &new.properties)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        match self.0.create_table(&ident, request).await {
+            Ok(_) => Ok(()),
+            Err(CatalogError::TableExists(_)) if new.if_not_exists => Ok(()),
+            Err(CatalogError::TableExists(_)) => Err(DataFusionError::Plan(format!(
+                "table {ident} already exists"
+            ))),
+            // The catalog refused the definition (a transform on the
+            // wrong type, a bad property): the statement's fault.
+            Err(CatalogError::Status {
+                status: 400,
+                message,
+            }) => Err(DataFusionError::Plan(format!(
+                "cannot create {ident}: {message}"
+            ))),
+            Err(e) => Err(DataFusionError::External(Box::new(e))),
+        }
+    }
+}
+
 #[async_trait]
 impl SchemaProvider for CatalogSchema {
     fn table_names(&self) -> Vec<String> {
@@ -204,7 +239,13 @@ pub async fn register(
     ctx: &SessionContext,
     catalog: Arc<dyn Catalog>,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let r = refresh(ctx, catalog).await?;
+    let r = refresh(ctx, catalog.clone()).await?;
+    ctx.state_ref()
+        .write()
+        .config_mut()
+        .set_extension(Arc::new(plimsoll_core::ddl::Creator(Arc::new(
+            CatalogCreator(catalog),
+        ))));
     for (namespace, reason) in &r.skipped {
         crate::log::emit(
             crate::log::Level::Warn,
@@ -490,33 +531,14 @@ mod tests {
         );
         // Partitioned (ADR 0076): rows routed by `identity(region)`, and
         // column bounds recorded, so both prune the new files.
+        // Created through SQL (ADR 0083), as a caller would.
         let parted = format!("{name}_p");
-        let created = http
-            .post(&base)
-            .header("content-type", "application/json")
-            .body(
-                serde_json::json!({
-                    "name": parted,
-                    "schema": {"type": "struct", "schema-id": 0, "fields": [
-                        {"id": 1, "name": "id", "required": true, "type": "long"},
-                        {"id": 2, "name": "region", "required": false, "type": "string"},
-                    ]},
-                    "partition-spec": {"spec-id": 0, "fields": [
-                        {"source-id": 2, "field-id": 1000, "name": "region", "transform": "identity"},
-                    ]},
-                    "properties": {"format-version": "2"},
-                })
-                .to_string(),
-            )
-            .send()
-            .await
-            .unwrap();
-        assert!(
-            created.status().is_success(),
-            "{}",
-            created.text().await.unwrap()
-        );
         let p = format!("bronze.{parted}");
+        let create =
+            format!("CREATE TABLE {p} (id BIGINT NOT NULL, region VARCHAR) PARTITION BY (region)");
+        text(&create).await;
+        assert!(engine.sql(&create).await.is_err(), "already exists");
+        text(&create.replace("TABLE", "TABLE IF NOT EXISTS")).await;
         text(&format!(
             "INSERT INTO {p} VALUES (1, 'eu'), (2, 'eu'), (3, 'us')"
         ))

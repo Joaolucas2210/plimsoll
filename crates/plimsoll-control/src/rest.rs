@@ -283,15 +283,48 @@ impl Catalog for RestCatalog {
             self.namespace_path(&ident.namespace),
             encode(&ident.name)
         );
-        let body =
-            serde_json::json!({"requirements": requirements, "updates": updates}).to_string();
+        let body = serde_json::json!({"requirements": requirements, "updates": updates});
+        match self.post(&url, body.to_string()).await? {
+            (s, body) if s.is_success() => Ok(committed(ident, body)),
+            // CommitFailedException: a requirement failed.
+            (StatusCode::CONFLICT, body) => Err(CatalogError::CommitConflict(error_message(&body))),
+            (StatusCode::NOT_FOUND, _) => Err(CatalogError::TableNotFound(ident.clone())),
+            (status, body) => Err(failed(status, &body)),
+        }
+    }
+
+    async fn create_table(
+        &self,
+        ident: &TableIdent,
+        request: Value,
+    ) -> Result<LoadedTable, CatalogError> {
+        let url = format!(
+            "{}/namespaces/{}/tables",
+            self.base,
+            self.namespace_path(&ident.namespace)
+        );
+        match self.post(&url, request.to_string()).await? {
+            (s, body) if s.is_success() => Ok(committed(ident, body)),
+            // AlreadyExistsException.
+            (StatusCode::CONFLICT, _) => Err(CatalogError::TableExists(ident.clone())),
+            (StatusCode::NOT_FOUND, _) => {
+                Err(CatalogError::NamespaceNotFound(ident.namespace.clone()))
+            }
+            (status, body) => Err(failed(status, &body)),
+        }
+    }
+}
+
+impl RestCatalog {
+    /// POSTs a JSON `body`, refreshing an OAuth token once on a 401.
+    async fn post(&self, url: &str, body: String) -> Result<(StatusCode, Value), CatalogError> {
         let mut retried = false;
-        let (status, mut body) = loop {
+        loop {
             let token = self.token.read().await.clone();
             let resp = self
                 .authorized(
                     self.http
-                        .post(&url)
+                        .post(url)
                         .header("content-type", "application/json")
                         .body(body.clone()),
                     token.as_deref(),
@@ -308,30 +341,31 @@ impl Catalog for RestCatalog {
                 self.refresh_token().await?;
                 continue;
             }
-            break (status, json_value(resp).await?);
-        };
-        match status {
-            s if s.is_success() => {
-                let metadata = body["metadata"].take();
-                Ok(LoadedTable {
-                    ident: ident.clone(),
-                    metadata_location: body["metadata-location"].as_str().map(str::to_owned),
-                    metadata,
-                    storage: Default::default(),
-                })
-            }
-            // CommitFailedException: a requirement failed.
-            StatusCode::CONFLICT => Err(CatalogError::CommitConflict(error_message(&body))),
-            StatusCode::NOT_FOUND => Err(CatalogError::TableNotFound(ident.clone())),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(CatalogError::Auth(format!(
-                "{status}: {}",
-                error_message(&body)
-            ))),
-            s => Err(CatalogError::Status {
-                status: s.as_u16(),
-                message: error_message(&body),
-            }),
+            return Ok((status, json_value(resp).await?));
         }
+    }
+}
+
+/// A table as a commit or create returned it.
+fn committed(ident: &TableIdent, mut body: Value) -> LoadedTable {
+    let metadata = body["metadata"].take();
+    LoadedTable {
+        ident: ident.clone(),
+        metadata_location: body["metadata-location"].as_str().map(str::to_owned),
+        metadata,
+        storage: Default::default(),
+    }
+}
+
+fn failed(status: StatusCode, body: &Value) -> CatalogError {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            CatalogError::Auth(format!("{status}: {}", error_message(body)))
+        }
+        s => CatalogError::Status {
+            status: s.as_u16(),
+            message: error_message(body),
+        },
     }
 }
 

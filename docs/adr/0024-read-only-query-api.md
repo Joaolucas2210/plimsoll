@@ -1,6 +1,6 @@
 # ADR 0024 — Read-only query API
 
-- Status: Accepted (amended by ADR 0075, 0077 and 0081: `INSERT INTO`, `DELETE FROM` and `UPDATE` are allowed, granted per schema)
+- Status: Accepted (amended by ADR 0075, 0077, 0081, 0082 and 0083: `INSERT INTO`, `DELETE FROM`, `UPDATE`, `MERGE INTO` and `CREATE TABLE` are allowed, granted per schema)
 - Date: 2026-10-30
 - Owner: JoaoLucas2210
 - Related: ADR 0002 (operator registers tables), ADR 0004 (HTTP surface), ADR 0013 (error classes), ADR 0021/0022/0023 (identity and authorization this would have bypassed)

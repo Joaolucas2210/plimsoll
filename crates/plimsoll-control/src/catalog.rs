@@ -32,6 +32,8 @@ pub enum CatalogError {
     NamespaceNotFound(Namespace),
     #[error("table not found: {0}")]
     TableNotFound(TableIdent),
+    #[error("table already exists: {0}")]
+    TableExists(TableIdent),
     #[error("catalog unreachable: {0}")]
     Http(String),
     #[error("catalog authentication failed: {0}")]
@@ -128,6 +130,17 @@ pub trait Catalog: Send + Sync {
     ) -> Result<LoadedTable, CatalogError> {
         Err(CatalogError::Unsupported(format!(
             "{ident}: this catalog does not accept commits"
+        )))
+    }
+
+    /// Creates `ident` from a REST `CreateTableRequest` (ADR 0083).
+    async fn create_table(
+        &self,
+        ident: &TableIdent,
+        _request: serde_json::Value,
+    ) -> Result<LoadedTable, CatalogError> {
+        Err(CatalogError::Unsupported(format!(
+            "{ident}: this catalog does not create tables"
         )))
     }
 }

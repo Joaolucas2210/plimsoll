@@ -298,6 +298,10 @@ impl Engine {
         access: Option<&dyn TableAccess>,
     ) -> Result<QueryStream> {
         let started = Instant::now();
+        // `CREATE TABLE`, the one DDL, goes to the catalog (ADR 0083).
+        if crate::ddl::is_create(sql) {
+            return self.create_table(ctx, sql, params, access, started).await;
+        }
         // Read-only SQL (ADR 0024): DDL would let any caller read or write
         // server files (`CREATE EXTERNAL TABLE ... LOCATION '/etc/...'`,
         // `COPY ... TO`) and mutate the catalogs every user shares; `SET`
@@ -482,6 +486,44 @@ impl Engine {
             stream,
             planning: started.elapsed(),
             reads,
+            physical,
+            spilled_total: self.spilled_total.clone(),
+        })
+    }
+}
+
+impl Engine {
+    /// `CREATE TABLE` (ADR 0083): planned without executing, checked
+    /// against the write grant on the new table's name, then created by the
+    /// session's [`crate::ddl::Creator`]. The result is empty.
+    async fn create_table(
+        &self,
+        ctx: &SessionContext,
+        sql: &str,
+        params: &[ScalarValue],
+        access: Option<&dyn TableAccess>,
+        started: Instant,
+    ) -> Result<QueryStream> {
+        if !params.is_empty() {
+            return plan_err!("CREATE TABLE takes no parameters");
+        }
+        let (table, new) = crate::ddl::plan(ctx, sql).await?;
+        if let Some(access) = access {
+            access.check_write(&table)?;
+        }
+        let state = ctx.state();
+        let Some(creator) = state.config().get_extension::<crate::ddl::Creator>() else {
+            return plan_err!("CREATE TABLE needs a REST catalog (PLIMSOLL_CATALOG_URI)");
+        };
+        creator.0.create_table(&table, new).await?;
+        let physical: Arc<dyn ExecutionPlan> =
+            Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
+                datafusion::arrow::datatypes::Schema::empty(),
+            )));
+        Ok(QueryStream {
+            stream: execute_stream(physical.clone(), state.task_ctx())?,
+            planning: started.elapsed(),
+            reads: Vec::new(),
             physical,
             spilled_total: self.spilled_total.clone(),
         })
@@ -939,6 +981,47 @@ mod tests {
                 "{sql}: {err}"
             );
         }
+        // CREATE TABLE (ADR 0083): the write grant on the new name, then
+        // the session's creator; none installed, refused.
+        let create = "CREATE TABLE {t} (id BIGINT NOT NULL) PARTITION BY bucket(4, id)";
+        let err = e
+            .sql_with(&create.replace("{t}", "silver.n"), &[], bronze.clone())
+            .await
+            .unwrap_err();
+        assert!(denied(&err), "{err}");
+        let err = e
+            .sql_with(&create.replace("{t}", "bronze.n"), &[], bronze.clone())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("needs a REST catalog"), "{err}");
+        struct Created(std::sync::Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl crate::ddl::TableCreator for Created {
+            async fn create_table(
+                &self,
+                table: &ResolvedTableReference,
+                new: crate::ddl::NewTable,
+            ) -> Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("{table} {:?}", new.partition));
+                Ok(())
+            }
+        }
+        let created = Arc::new(Created(Default::default()));
+        e.context()
+            .state_ref()
+            .write()
+            .config_mut()
+            .set_extension(Arc::new(crate::ddl::Creator(created.clone())));
+        e.sql_with(&create.replace("{t}", "bronze.n"), &[], bronze.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            *created.0.lock().unwrap(),
+            ["datafusion.bronze.n [(\"bucket[4]\", \"id\")]"]
+        );
         // 3 (deleted), then 2 (appended): one row left.
         let rows = e.sql("SELECT x FROM bronze.b").await.unwrap();
         let rows = pretty_format_batches(&rows.batches).unwrap().to_string();
