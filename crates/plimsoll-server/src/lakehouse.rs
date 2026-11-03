@@ -139,8 +139,9 @@ impl iceberg::write::Committer for CatalogCommitter {
     }
 }
 
-/// `CREATE TABLE` (ADR 0083) and `ALTER TABLE` (ADR 0084) in the REST
-/// catalog: the table's schema is the catalog namespace.
+/// `CREATE TABLE` (ADR 0083), `ALTER TABLE` (ADR 0084) and `DROP TABLE`
+/// (ADR 0089) in the REST catalog: the table's schema is the catalog
+/// namespace.
 struct CatalogDdl(Arc<dyn Catalog>);
 
 /// Commit attempts of an `ALTER TABLE` racing other writers.
@@ -209,6 +210,20 @@ impl plimsoll_core::ddl::TableDdl for CatalogDdl {
                 }
                 Err(e) => return Err(external(e)),
             }
+        }
+    }
+
+    async fn drop_table(
+        &self,
+        table: &plimsoll_core::datafusion::common::ResolvedTableReference,
+        if_exists: bool,
+        purge: bool,
+    ) -> Result<()> {
+        let ident = TableIdent::new(Namespace::new(&[&table.schema]), &table.table);
+        match self.0.drop_table(&ident, purge).await {
+            Ok(()) => Ok(()),
+            Err(CatalogError::TableNotFound(_)) if if_exists => Ok(()),
+            Err(e) => Err(DataFusionError::External(Box::new(e))),
         }
     }
 }
@@ -989,11 +1004,18 @@ mod tests {
             }
         })
         .await;
+        // DROP TABLE (ADR 0089) cleans up: gone for queries, and a second
+        // drop only passes with IF EXISTS.
         for t in [name, parted, nested] {
-            let _ = http
-                .delete(format!("{base}/{t}?purgeRequested=true"))
-                .send()
-                .await;
+            text(&format!("DROP TABLE bronze.{t} PURGE")).await;
+            assert!(
+                engine
+                    .sql(&format!("SELECT * FROM bronze.{t}"))
+                    .await
+                    .is_err()
+            );
+            assert!(engine.sql(&format!("DROP TABLE bronze.{t}")).await.is_err());
+            text(&format!("DROP TABLE IF EXISTS bronze.{t}")).await;
         }
     }
 

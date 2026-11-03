@@ -313,22 +313,47 @@ impl Catalog for RestCatalog {
             (status, body) => Err(failed(status, &body)),
         }
     }
+
+    async fn drop_table(&self, ident: &TableIdent, purge: bool) -> Result<(), CatalogError> {
+        let url = format!(
+            "{}/namespaces/{}/tables/{}?purgeRequested={purge}",
+            self.base,
+            self.namespace_path(&ident.namespace),
+            encode(&ident.name)
+        );
+        match self.send(reqwest::Method::DELETE, &url, None).await? {
+            (s, _) if s.is_success() => Ok(()),
+            (StatusCode::NOT_FOUND, _) => Err(CatalogError::TableNotFound(ident.clone())),
+            (status, body) => Err(failed(status, &body)),
+        }
+    }
 }
 
 impl RestCatalog {
     /// POSTs a JSON `body`, refreshing an OAuth token once on a 401.
     async fn post(&self, url: &str, body: String) -> Result<(StatusCode, Value), CatalogError> {
+        self.send(reqwest::Method::POST, url, Some(body)).await
+    }
+
+    /// Sends a request (with a JSON body, if any), refreshing an OAuth
+    /// token once on a 401.
+    async fn send(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<String>,
+    ) -> Result<(StatusCode, Value), CatalogError> {
         let mut retried = false;
         loop {
             let token = self.token.read().await.clone();
+            let mut request = self.http.request(method.clone(), url);
+            if let Some(body) = &body {
+                request = request
+                    .header("content-type", "application/json")
+                    .body(body.clone());
+            }
             let resp = self
-                .authorized(
-                    self.http
-                        .post(url)
-                        .header("content-type", "application/json")
-                        .body(body.clone()),
-                    token.as_deref(),
-                )
+                .authorized(request, token.as_deref())
                 .send()
                 .await
                 .map_err(|e| CatalogError::Http(e.to_string()))?;

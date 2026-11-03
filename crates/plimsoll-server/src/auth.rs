@@ -18,6 +18,8 @@
 //! `PLIMSOLL_AUTH_WRITE_GRANTS=etl=bronze|silver` lists the schemas each
 //! principal may `INSERT INTO`; unlisted principals write nothing, and
 //! unset means no writes at all (ADR 0075).
+//! `PLIMSOLL_AUTH_DROP_GRANTS=etl=bronze` lists the schemas whose tables each
+//! principal may `DROP`; a write grant does not include it (ADR 0089).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -50,6 +52,8 @@ pub enum Auth {
         grants: Option<HashMap<String, HashSet<String>>>,
         /// Principal -> schemas it may `INSERT INTO` (ADR 0075).
         write_grants: HashMap<String, HashSet<String>>,
+        /// Principal -> schemas whose tables it may `DROP` (ADR 0089).
+        drop_grants: HashMap<String, HashSet<String>>,
         /// Principal -> `schema.table.column`s it may not read (ADR 0044).
         column_deny: HashMap<String, Arc<HashSet<String>>>,
         /// Principal -> `schema.table` -> SQL predicate its rows must
@@ -94,6 +98,7 @@ const OPERATORS: &str = "PLIMSOLL_AUTH_OPERATORS";
 const GROUPS: &str = "PLIMSOLL_AUTH_GROUPS";
 const GRANTS: &str = "PLIMSOLL_AUTH_GRANTS";
 const WRITE_GRANTS: &str = "PLIMSOLL_AUTH_WRITE_GRANTS";
+const DROP_GRANTS: &str = "PLIMSOLL_AUTH_DROP_GRANTS";
 const COLUMN_DENY: &str = "PLIMSOLL_AUTH_COLUMN_DENY";
 const ROW_FILTERS: &str = "PLIMSOLL_AUTH_ROW_FILTERS";
 
@@ -117,6 +122,7 @@ impl Auth {
                     GROUPS,
                     GRANTS,
                     WRITE_GRANTS,
+                    DROP_GRANTS,
                     COLUMN_DENY,
                     ROW_FILTERS,
                 ] {
@@ -219,6 +225,7 @@ impl Auth {
         };
         let grants = schema_grants(GRANTS)?;
         let write_grants = schema_grants(WRITE_GRANTS)?.unwrap_or_default();
+        let drop_grants = schema_grants(DROP_GRANTS)?.unwrap_or_default();
         let mut column_deny = HashMap::new();
         for entry in lookup(COLUMN_DENY)
             .unwrap_or_default()
@@ -294,6 +301,7 @@ impl Auth {
             groups,
             grants,
             write_grants,
+            drop_grants,
             column_deny,
             row_filters,
         })
@@ -330,6 +338,7 @@ impl Auth {
             operators,
             grants,
             write_grants,
+            drop_grants,
             column_deny,
             row_filters,
             ..
@@ -340,6 +349,7 @@ impl Auth {
                 only: None,
                 schemas: None,
                 writable: Some(["*".to_owned()].into()),
+                droppable: Some(["*".to_owned()].into()),
                 group: None,
                 denied_columns: None,
                 row_filters: None,
@@ -352,6 +362,7 @@ impl Auth {
                 .as_ref()
                 .map(|g| g.get(principal).cloned().unwrap_or_default()),
             writable: write_grants.get(principal).cloned(),
+            droppable: drop_grants.get(principal).cloned(),
             group: None,
             denied_columns: column_deny.get(principal).cloned(),
             row_filters: row_filters.get(principal).cloned(),
@@ -389,6 +400,9 @@ pub struct Viewer {
     pub schemas: Option<HashSet<String>>,
     /// Schemas it may `INSERT INTO` (`*` = all). `None`: none (ADR 0075).
     pub writable: Option<HashSet<String>>,
+    /// Schemas whose tables it may `DROP` (`*` = all). `None`: none (ADR
+    /// 0089).
+    pub droppable: Option<HashSet<String>>,
     /// The resource group the query runs in (memory share, ADR 0036).
     pub group: Option<String>,
     /// `schema.table.column`s this principal may not read (ADR 0044).
@@ -459,6 +473,19 @@ impl TableAccess for Viewer {
         }
         Err(DataFusionError::External(Box::new(AccessDenied {
             table: format!("{table} (write)"),
+        })))
+    }
+
+    fn check_drop(&self, table: &ResolvedTableReference) -> DfResult<()> {
+        let allowed = self
+            .droppable
+            .as_ref()
+            .is_some_and(|w| w.contains("*") || w.contains(table.schema.as_ref()));
+        if allowed && table.catalog.as_ref() != "system" {
+            return Ok(());
+        }
+        Err(DataFusionError::External(Box::new(AccessDenied {
+            table: format!("{table} (drop)"),
         })))
     }
 
@@ -566,6 +593,7 @@ pub(crate) mod tests {
             Auth::Disabled.viewer("x"),
             Viewer {
                 writable: Some(["*".to_owned()].into()),
+                droppable: Some(["*".to_owned()].into()),
                 ..Viewer::default()
             }
         );
@@ -670,6 +698,27 @@ pub(crate) mod tests {
             let e = auth(&[(TOKENS, tokens.clone()), (WRITE_GRANTS, bad.into())]).unwrap_err();
             assert_eq!(e.var, WRITE_GRANTS, "{bad}");
         }
+        // Dropping is its own grant (ADR 0089): writing does not imply it.
+        assert!(etl.check_drop(&t("datafusion", "bronze")).is_err());
+        let d = auth(&[
+            (TOKENS, tokens.clone()),
+            (WRITE_GRANTS, "etl=bronze".into()),
+            (DROP_GRANTS, "etl=bronze".into()),
+        ])
+        .unwrap();
+        assert!(
+            d.viewer("etl")
+                .check_drop(&t("datafusion", "bronze"))
+                .is_ok()
+        );
+        assert!(
+            d.viewer("etl")
+                .check_drop(&t("datafusion", "gold"))
+                .is_err()
+        );
+        assert!(dev.check_drop(&t("datafusion", "bronze")).is_ok());
+        let e = auth(&[(TOKENS, tokens.clone()), (DROP_GRANTS, "zed=bronze".into())]).unwrap_err();
+        assert_eq!(e.var, DROP_GRANTS);
     }
 
     #[test]

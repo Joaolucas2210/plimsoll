@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] `DROP TABLE [IF EXISTS] … [PURGE]` under its own grant (`PLIMSOLL_AUTH_DROP_GRANTS`), through the catalog's `dropTable` (ADR 0089)
 - [x] Nested field evolution: nested fields resolve by id in the scan (renamed, moved and re-added fields read right); `ALTER TABLE … ADD | RENAME | DROP COLUMN a.b` in Spark's syntax (ADR 0088)
 - [x] Writes to nested columns: field ids at every level (struct fields, list elements, map keys and values), no statistics under a nested column's id; `CREATE TABLE` / `ADD COLUMN` with `STRUCT` and `ARRAY`; read by Spark and pyiceberg (ADR 0087)
 - [x] Scheduled maintenance: `PLIMSOLL_MAINTENANCE_INTERVAL_MS` passes over catalog tables that opt in through properties (`plimsoll.maintenance.*`, Iceberg's `history.expire.*`): compaction, expiration and optional orphan removal under admission (ADR 0086)
@@ -121,9 +122,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**`DROP TABLE`** — under its own grant (`PLIMSOLL_AUTH_DROP_GRANTS`),
-through the catalog's `dropTable`, with `PURGE` deleting the table's
-files; the last common DDL statement missing.
+**`CREATE TABLE … AS SELECT` in one commit** — create the table staged,
+write the query's rows, and commit table and data together, so a failed
+query leaves no empty table behind.
 
 ## Missing
 
@@ -134,8 +135,7 @@ files; the last common DDL statement missing.
   tables.
 - Maintenance: a per-table lease for several coordinators, per-step
   schedules, metrics.
-- DDL: `DROP TABLE` (above), nested promotions and leaf statistics for
-  nested fields, and
+- DDL: nested promotions and leaf statistics for nested fields, and
   one-commit `CREATE TABLE … AS SELECT`.
 
 **Distribution**

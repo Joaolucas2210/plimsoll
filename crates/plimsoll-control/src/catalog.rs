@@ -133,6 +133,14 @@ pub trait Catalog: Send + Sync {
         )))
     }
 
+    /// Drops `ident`; `purge` asks the catalog to delete its files too
+    /// (ADR 0089).
+    async fn drop_table(&self, ident: &TableIdent, _purge: bool) -> Result<(), CatalogError> {
+        Err(CatalogError::Unsupported(format!(
+            "{ident}: this catalog does not drop tables"
+        )))
+    }
+
     /// Creates `ident` from a REST `CreateTableRequest` (ADR 0083).
     async fn create_table(
         &self,

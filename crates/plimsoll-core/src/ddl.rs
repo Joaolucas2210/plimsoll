@@ -1,5 +1,5 @@
-//! `CREATE TABLE` and `ALTER TABLE` through the query API (ADR 0083,
-//! 0084, 0085).
+//! `CREATE TABLE`, `ALTER TABLE` and `DROP TABLE` through the query API
+//! (ADR 0083, 0084, 0085, 0089).
 //!
 //! DataFusion would create an in-memory table; Plimsoll instead hands the
 //! statement's schema, partitioning and properties, or the changes to a
@@ -126,6 +126,16 @@ pub trait TableDdl: Send + Sync {
         changes: Vec<Alteration>,
         if_exists: bool,
     ) -> Result<()>;
+
+    /// Drops `table` from its catalog (ADR 0089); `purge` asks the catalog
+    /// to delete its files too. `if_exists`: a missing table is not an
+    /// error.
+    async fn drop_table(
+        &self,
+        table: &ResolvedTableReference,
+        if_exists: bool,
+        purge: bool,
+    ) -> Result<()>;
 }
 
 /// The session config extension carrying the [`TableDdl`].
@@ -140,19 +150,24 @@ pub(crate) enum Planned {
         changes: Vec<Alteration>,
         if_exists: bool,
     },
+    Drop {
+        table: ResolvedTableReference,
+        if_exists: bool,
+        purge: bool,
+    },
 }
 
 /// Whether `sql` is a `CREATE …` or `ALTER …` statement (by its first
 /// word).
 pub(crate) fn is_ddl(sql: &str) -> bool {
     let sql = sql.trim_start();
-    ["create ", "alter "].iter().any(|w| {
+    ["create ", "alter ", "drop "].iter().any(|w| {
         sql.get(..w.len())
             .is_some_and(|s| s.eq_ignore_ascii_case(w))
     })
 }
 
-const ONLY_CREATE_TABLE: &str = "of DDL, only CREATE TABLE and ALTER TABLE are allowed; \
+const ONLY_CREATE_TABLE: &str = "of DDL, only CREATE, ALTER and DROP TABLE are allowed; \
      the query API is otherwise read-only";
 
 fn refuse<T>(why: impl Into<String>) -> Result<T> {
@@ -179,6 +194,26 @@ pub(crate) async fn plan(ctx: &SessionContext, sql: &str) -> Result<Planned> {
             Ok(Planned::Create(table, new))
         }
         Statement::AlterTable(alter) => plan_alter(ctx, alter).await,
+        Statement::Drop {
+            object_type: datafusion::sql::sqlparser::ast::ObjectType::Table,
+            if_exists,
+            names,
+            cascade: false,
+            purge,
+            temporary: false,
+            table: None,
+            ..
+        } => {
+            let [name] = names.as_slice() else {
+                return refuse("DROP TABLE drops one table at a time");
+            };
+            let table = served(ctx, TableReference::from(name.to_string().as_str()))?;
+            Ok(Planned::Drop {
+                table,
+                if_exists,
+                purge,
+            })
+        }
         _ => refuse(ONLY_CREATE_TABLE),
     }
 }
@@ -667,6 +702,27 @@ mod tests {
         assert!(
             is_ddl("  create table t (x int)") && is_ddl("ALTER table t") && !is_ddl("SELECT 1")
         );
+        assert!(is_ddl("drop table t"));
+        match plan(&ctx, "DROP TABLE IF EXISTS bronze.t PURGE")
+            .await
+            .unwrap()
+        {
+            Planned::Drop {
+                table,
+                if_exists: true,
+                purge: true,
+            } => assert_eq!(table.to_string(), "datafusion.bronze.t"),
+            p => panic!("{p:?}"),
+        }
+        for sql in [
+            "DROP TABLE bronze.a, bronze.b",
+            "DROP TABLE bronze.t CASCADE",
+            "DROP VIEW bronze.v",
+            "DROP SCHEMA bronze",
+            "DROP TABLE nowhere.t",
+        ] {
+            assert!(plan(&ctx, sql).await.is_err(), "{sql}");
+        }
     }
 
     #[tokio::test]

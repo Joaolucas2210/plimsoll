@@ -84,6 +84,14 @@ pub trait TableAccess: Send + Sync + 'static {
         })))
     }
 
+    /// Whether the caller may `DROP` `table` (ADR 0089). Denied unless a
+    /// policy grants it; a write grant does not.
+    fn check_drop(&self, table: &ResolvedTableReference) -> Result<()> {
+        Err(DataFusionError::External(Box::new(AccessDenied {
+            table: table.to_string(),
+        })))
+    }
+
     /// The resource group the query runs in; its memory share, if any,
     /// caps every reservation the query makes (ADR 0036).
     fn resource_group(&self) -> Option<&str> {
@@ -514,6 +522,8 @@ impl Engine {
         if let Some(access) = access {
             match &planned {
                 Planned::Create(table, _) => access.check_write(table)?,
+                // Its own grant: dropping loses every row (ADR 0089).
+                Planned::Drop { table, .. } => access.check_drop(table)?,
                 Planned::Alter { table, changes, .. } => {
                     access.check_write(table)?;
                     // Renaming or dropping a column the caller may not
@@ -534,6 +544,11 @@ impl Engine {
                 changes,
                 if_exists,
             } => ddl.0.alter_table(&table, changes, if_exists).await?,
+            Planned::Drop {
+                table,
+                if_exists,
+                purge,
+            } => ddl.0.drop_table(&table, if_exists, purge).await?,
         }
         let physical: Arc<dyn ExecutionPlan> =
             Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
@@ -1039,6 +1054,15 @@ mod tests {
                     .push(format!("{table} {}", changes.len()));
                 Ok(())
             }
+            async fn drop_table(
+                &self,
+                table: &ResolvedTableReference,
+                _: bool,
+                purge: bool,
+            ) -> Result<()> {
+                self.0.lock().unwrap().push(format!("drop {table} {purge}"));
+                Ok(())
+            }
         }
         let created = Arc::new(Created(Default::default()));
         e.context()
@@ -1089,11 +1113,30 @@ mod tests {
         )
         .await
         .unwrap();
+        // DROP TABLE (ADR 0089): its own grant; a write grant is not one.
+        let err = e
+            .sql_with("DROP TABLE bronze.n", &[], bronze.clone())
+            .await
+            .unwrap_err();
+        assert!(denied(&err), "{err}");
+        struct Dropper;
+        impl TableAccess for Dropper {
+            fn check(&self, _: &ResolvedTableReference) -> Result<()> {
+                Ok(())
+            }
+            fn check_drop(&self, _: &ResolvedTableReference) -> Result<()> {
+                Ok(())
+            }
+        }
+        e.sql_with("DROP TABLE bronze.n PURGE", &[], Arc::new(Dropper))
+            .await
+            .unwrap();
         assert_eq!(
             *created.0.lock().unwrap(),
             [
                 "datafusion.bronze.n [(\"bucket[4]\", \"id\")]",
-                "datafusion.bronze.n 2"
+                "datafusion.bronze.n 2",
+                "drop datafusion.bronze.n true"
             ]
         );
         // 3 (deleted), then 2 (appended): one row left.
