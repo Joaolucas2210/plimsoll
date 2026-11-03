@@ -93,24 +93,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             *engine.context().state_ref().write() = state;
         }
         // Fragments only go to workers whose /readyz answers (ADR 0059): a
-        // draining or dead worker drops out within one interval.
+        // draining or dead worker drops out within one interval; `dns+`
+        // entries are re-resolved each round, so workers join and leave
+        // without a restart (ADR 0070).
         tokio::spawn(async move {
-            let mut last = workers.urls().len();
+            let mut last = (Vec::new(), Vec::new());
             loop {
-                let healthy = workers
+                workers
                     .check_health(std::time::Duration::from_secs(2))
                     .await;
-                if healthy != last {
+                let now = (workers.urls(), workers.healthy_urls());
+                if now != last {
                     log::emit(
-                        if healthy < workers.urls().len() {
+                        if now.1.len() < now.0.len() {
                             Level::Warn
                         } else {
                             Level::Info
                         },
                         "workers_health",
-                        json!({ "healthy": workers.healthy_urls(), "total": workers.urls().len() }),
+                        json!({ "healthy": now.1, "total": now.0.len(), "workers": now.0 }),
                     );
-                    last = healthy;
+                    last = now;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }

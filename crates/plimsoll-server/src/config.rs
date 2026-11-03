@@ -44,7 +44,9 @@ pub struct Config {
     /// `PLIMSOLL_WORKER_TOKEN` (secret): shared by coordinator and workers;
     /// on a worker it enables `/v1/fragment` (ADR 0058).
     pub worker_token: Option<String>,
-    /// `PLIMSOLL_WORKERS`: worker base URLs; set, this node coordinates.
+    /// `PLIMSOLL_WORKERS`: worker base URLs, or `dns+http(s)://name:port`
+    /// entries re-resolved into workers (ADR 0070); set, this node
+    /// coordinates.
     pub workers: Vec<String>,
 }
 
@@ -103,11 +105,16 @@ impl Config {
             if url.is_empty() {
                 continue;
             }
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
+            // `dns+http://name:port`: every address `name` resolves to is
+            // a worker, re-resolved while running (ADR 0070).
+            let base = url.strip_prefix("dns+").unwrap_or(url);
+            let valid = (base.starts_with("http://") || base.starts_with("https://"))
+                && reqwest::Url::parse(base).is_ok_and(|u| u.host_str().is_some());
+            if !valid {
                 return Err(ConfigError {
                     var: "PLIMSOLL_WORKERS",
                     value: url.to_owned(),
-                    reason: "expected http:// or https:// URLs",
+                    reason: "expected http(s):// URLs or dns+http(s)://name:port",
                 });
             }
             workers.push(url.to_owned());
@@ -466,9 +473,17 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(c.workers, ["http://w1:8080", "http://w2:8080"]);
+        let c = cfg(&[
+            token,
+            ("PLIMSOLL_WORKERS", "dns+http://workers.plimsoll.svc:8080"),
+        ])
+        .unwrap();
+        assert_eq!(c.workers, ["dns+http://workers.plimsoll.svc:8080"]);
         for bad in [
             vec![("PLIMSOLL_WORKERS", "http://w1:8080")],
             vec![token, ("PLIMSOLL_WORKERS", "w1:8080")],
+            vec![token, ("PLIMSOLL_WORKERS", "dns+w1:8080")],
+            vec![token, ("PLIMSOLL_WORKERS", "dns+ftp://w1:8080")],
             vec![("PLIMSOLL_WORKER_TOKEN", "short")],
         ] {
             let e = cfg(&bad).unwrap_err();

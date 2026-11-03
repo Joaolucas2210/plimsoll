@@ -12,7 +12,6 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -43,52 +42,125 @@ use serde_json::{Value as Json, json};
 /// config extension on coordinators.
 #[derive(Clone)]
 pub struct Workers {
-    urls: Vec<String>,
+    /// As configured: worker base URLs, or `dns+http(s)://name:port`
+    /// entries whose addresses are workers (ADR 0070).
+    seeds: Vec<String>,
     token: String,
     client: reqwest::Client,
-    /// Per URL: last health check passed (ADR 0059). Starts healthy.
-    healthy: Arc<Vec<AtomicBool>>,
+    /// The current workers. Static seeds start healthy; discovered ones
+    /// join unhealthy and are checked in the round that found them.
+    members: Arc<std::sync::RwLock<Vec<Member>>>,
+}
+
+#[derive(Debug, Clone)]
+struct Member {
+    url: String,
+    /// Index of the seed it came from.
+    seed: usize,
+    /// Last health check passed (ADR 0059).
+    healthy: bool,
 }
 
 impl fmt::Debug for Workers {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Never the token.
-        f.debug_struct("Workers").field("urls", &self.urls).finish()
+        f.debug_struct("Workers")
+            .field("seeds", &self.seeds)
+            .finish()
     }
 }
 
 impl Workers {
-    pub fn new(urls: Vec<String>, token: String) -> Result<Self, reqwest::Error> {
-        let healthy = Arc::new(urls.iter().map(|_| AtomicBool::new(true)).collect());
+    pub fn new(seeds: Vec<String>, token: String) -> Result<Self, reqwest::Error> {
+        let seeds: Vec<String> = seeds
+            .into_iter()
+            .map(|u| u.trim_end_matches('/').to_owned())
+            .collect();
+        let members = seeds
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.starts_with("dns+"))
+            .map(|(seed, url)| Member {
+                url: url.clone(),
+                seed,
+                healthy: true,
+            })
+            .collect();
         Ok(Self {
-            urls: urls
-                .into_iter()
-                .map(|u| u.trim_end_matches('/').to_owned())
-                .collect(),
+            seeds,
             token,
             client: reqwest::Client::builder().build()?,
-            healthy,
+            members: Arc::new(std::sync::RwLock::new(members)),
         })
     }
 
-    pub fn urls(&self) -> &[String] {
-        &self.urls
+    fn members(&self) -> Vec<Member> {
+        self.members
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Every current worker, healthy or not.
+    pub fn urls(&self) -> Vec<String> {
+        self.members().into_iter().map(|m| m.url).collect()
     }
 
     /// Workers whose last `/readyz` answered 200: the ones fragments go
     /// to. A draining or dead worker drops out until it answers again.
     pub fn healthy_urls(&self) -> Vec<String> {
-        self.urls
-            .iter()
-            .zip(self.healthy.iter())
-            .filter(|(_, h)| h.load(Ordering::Relaxed))
-            .map(|(u, _)| u.clone())
+        self.members()
+            .into_iter()
+            .filter(|m| m.healthy)
+            .map(|m| m.url)
             .collect()
     }
 
-    /// One round of health checks; returns how many workers are healthy.
+    /// Re-resolves `dns+` seeds (ADR 0070): each address is a worker at
+    /// the seed's scheme and port. A name that fails to resolve keeps its
+    /// last known workers; one that resolves to nothing has none.
+    async fn discover(&self) {
+        let current = self.members();
+        let mut next = Vec::new();
+        for (seed, entry) in self.seeds.iter().enumerate() {
+            let Some(name) = entry.strip_prefix("dns+") else {
+                next.extend(current.iter().filter(|m| m.seed == seed).cloned());
+                continue;
+            };
+            let resolved = match reqwest::Url::parse(name) {
+                Ok(url) => match (url.host_str(), url.port_or_known_default()) {
+                    (Some(host), Some(port)) => {
+                        let host = host.trim_start_matches('[').trim_end_matches(']');
+                        tokio::net::lookup_host((host, port))
+                            .await
+                            .ok()
+                            .map(|addrs| (url.scheme().to_owned(), addrs.collect::<Vec<_>>()))
+                    }
+                    _ => None,
+                },
+                Err(_) => None,
+            };
+            let Some((scheme, mut addrs)) = resolved else {
+                next.extend(current.iter().filter(|m| m.seed == seed).cloned());
+                continue;
+            };
+            addrs.sort();
+            addrs.dedup();
+            for addr in addrs {
+                let url = format!("{scheme}://{addr}");
+                let healthy = current.iter().any(|m| m.url == url && m.healthy);
+                next.push(Member { url, seed, healthy });
+            }
+        }
+        *self.members.write().unwrap_or_else(|e| e.into_inner()) = next;
+    }
+
+    /// One round: discovery, then health checks of every current worker;
+    /// returns how many are healthy.
     pub async fn check_health(&self, timeout: Duration) -> usize {
-        let checks = self.urls.iter().map(|url| {
+        self.discover().await;
+        let urls = self.urls();
+        let checks = urls.iter().map(|url| {
             let request = self
                 .client
                 .get(format!("{url}/readyz"))
@@ -97,10 +169,13 @@ impl Workers {
             async move { request.await.is_ok_and(|r| r.status().is_success()) }
         });
         let results = futures::future::join_all(checks).await;
-        for (flag, ok) in self.healthy.iter().zip(&results) {
-            flag.store(*ok, Ordering::Relaxed);
+        let mut members = self.members.write().unwrap_or_else(|e| e.into_inner());
+        for m in members.iter_mut() {
+            if let Some(i) = urls.iter().position(|u| *u == m.url) {
+                m.healthy = results[i];
+            }
         }
-        results.iter().filter(|ok| **ok).count()
+        members.iter().filter(|m| m.healthy).count()
     }
 }
 
@@ -1821,6 +1896,47 @@ mod tests {
         let results: Vec<_> = broken.collect().await;
         assert!(results.last().unwrap().is_err());
         assert!(with_schema(chunks(Vec::new())).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dns_seeds_are_resolved_into_workers_each_round() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A worker that is always ready, on 127.0.0.1.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        let w = Workers::new(
+            vec![
+                "http://static:1".into(),
+                format!("dns+http://localhost:{port}"),
+                "dns+http://no-such-worker.invalid:1".into(),
+            ],
+            "t".repeat(16),
+        )
+        .unwrap();
+        // Before the first round: the static seed only, presumed healthy.
+        assert_eq!(w.urls(), ["http://static:1"]);
+        w.check_health(Duration::from_secs(2)).await;
+        let found = format!("http://127.0.0.1:{port}");
+        let urls = w.urls();
+        assert!(
+            urls.contains(&found) && urls.contains(&"http://static:1".to_owned()),
+            "{urls:?}"
+        );
+        // Only the listening address answers /readyz.
+        assert_eq!(w.healthy_urls(), std::slice::from_ref(&found));
+        // Another round keeps it; an unresolvable name never adds any.
+        w.check_health(Duration::from_secs(2)).await;
+        assert!(w.healthy_urls().contains(&found));
+        assert!(w.urls().iter().all(|u| !u.contains("invalid")));
     }
 
     #[test]
