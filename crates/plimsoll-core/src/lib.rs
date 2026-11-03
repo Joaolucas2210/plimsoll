@@ -5,6 +5,7 @@
 pub mod engine;
 pub mod federation;
 pub mod memory;
+pub mod plan_trace;
 pub mod result_cache;
 pub mod storage;
 

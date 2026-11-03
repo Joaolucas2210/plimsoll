@@ -40,7 +40,21 @@ impl CatalogSchema {
     /// `loadTable` for `name`; `None` when the catalog has no such table.
     async fn load(&self, name: &str) -> Result<Option<(TableIdent, LoadedTable)>> {
         let ident = TableIdent::new(self.namespace.clone(), name);
-        match self.catalog.load_table(&ident).await {
+        let started = std::time::Instant::now();
+        let loaded = self.catalog.load_table(&ident).await;
+        // A span in the query's trace (ADR 0056).
+        plimsoll_core::plan_trace::record(
+            "catalog.load_table",
+            started,
+            vec![
+                ("table", ident.to_string()),
+                (
+                    "found",
+                    (!matches!(loaded, Err(CatalogError::TableNotFound(_)))).to_string(),
+                ),
+            ],
+        );
+        match loaded {
             Ok(t) => Ok(Some((ident, t))),
             Err(CatalogError::TableNotFound(_)) => Ok(None),
             Err(e) => Err(DataFusionError::External(Box::new(e))),
@@ -360,6 +374,19 @@ mod tests {
 
         let err = ctx.sql("SELECT * FROM silver.nope").await.unwrap_err();
         assert!(err.to_string().contains("not found"), "{err}");
+
+        // Each loadTable is a planning event for the trace (ADR 0056).
+        let (_, events) =
+            plimsoll_core::plan_trace::collect(ctx.sql("SELECT b FROM silver.users")).await;
+        let load = events
+            .iter()
+            .find(|e| e.name == "catalog.load_table")
+            .unwrap();
+        assert!(
+            load.attrs.contains(&("table", "silver.users".to_owned())),
+            "{load:?}"
+        );
+        assert!(load.attrs.contains(&("found", "true".to_owned())));
     }
 
     /// Two snapshots with different schemas: `a` (snapshot 1, t=100 ms),

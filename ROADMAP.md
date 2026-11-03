@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Planning spans in traces: `catalog.load_table` and `iceberg.plan` (files/manifests/deletes) under `planning` (ADR 0056)
 - [x] Exact identity-partition filters: decided per file, no `FilterExec`, partition-filtered `count(*)` from metadata (ADR 0055)
 - [x] `count(*)` from manifest record counts when exact (no deletes, filters or limit) (ADR 0054)
 - [x] Decimal pruning: unscaled `i128` bounds, exact literal rescaling, decimal bucket/truncate partitions (ADR 0053)
@@ -88,14 +89,14 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Spans below the request**: per-query child spans for catalog
-`loadTable`, manifest planning (with `files=` / `manifests=` counts) and
-each phase, so a slow query's trace shows where planning time went
-(ADR 0031's revisit item), still without an OpenTelemetry SDK.
+**Slow-query log**: a `slow_query` warn line (with the plan's scan labels:
+files, manifests, deletes, cache hits) when a query exceeds
+`PLIMSOLL_SLOW_QUERY_MS`, so slow queries are explainable from logs alone,
+without a trace backend.
 
 ## Later
 
-- Spans below the request (per-operator, per-fetch) via `tracing` +
-  `opentelemetry-otlp`, and OTLP metrics (ADR 0031's upgrade path).
+- Spans below planning (per-operator, per-fetch) via `tracing` +
+  `opentelemetry-otlp`, and OTLP metrics (ADR 0031/0056 upgrade path).
 
 - Coordinator/worker split along the existing plane boundary.

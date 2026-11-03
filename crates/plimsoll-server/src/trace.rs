@@ -298,11 +298,16 @@ pub fn spans(
     ];
     let ran: Duration = phases.iter().filter_map(|(_, d)| *d).sum();
     let mut at = end.checked_sub(ran).unwrap_or(started).max(started);
+    let mut planning = None;
     for (name, d) in phases {
         let Some(d) = d else { continue };
+        let id = random_hex::<8>();
+        if name == "planning" {
+            planning = Some(id.clone());
+        }
         out.push(json!({
             "traceId": ctx.trace_id,
-            "spanId": random_hex::<8>(),
+            "spanId": id,
             "parentSpanId": ctx.span_id,
             "name": name,
             "kind": 1,
@@ -310,6 +315,27 @@ pub fn spans(
             "endTimeUnixNano": nanos(at + d),
         }));
         at += d;
+    }
+    // What planning did (ADR 0056): catalog loads, connector planning, at
+    // their real times, under the planning span (or the query, when
+    // planning failed and has no span).
+    let parent = planning.unwrap_or_else(|| ctx.span_id.clone());
+    for e in &q.plan_events {
+        let attributes: Vec<Value> = e
+            .attrs
+            .iter()
+            .map(|(k, v)| attr(&format!("plimsoll.{k}"), json!(v)))
+            .collect();
+        out.push(json!({
+            "traceId": ctx.trace_id,
+            "spanId": random_hex::<8>(),
+            "parentSpanId": parent,
+            "name": e.name,
+            "kind": 1,
+            "startTimeUnixNano": nanos(e.start),
+            "endTimeUnixNano": nanos(e.start + e.duration),
+            "attributes": attributes,
+        }));
     }
     out
 }
@@ -383,6 +409,22 @@ mod tests {
         let attrs = s[0]["attributes"].to_string();
         assert!(attrs.contains(r#""intValue":"7""#), "{attrs}");
         assert!(attrs.contains("enduser.id"), "{attrs}");
+        // Planning events become children of the planning span (ADR 0056).
+        let q = QueryLog {
+            plan_events: vec![plimsoll_core::plan_trace::PlanEvent {
+                name: "iceberg.plan",
+                start: t0 + Duration::from_millis(2),
+                duration: Duration::from_millis(1),
+                attrs: vec![("files", "1/3".into())],
+            }],
+            ..q
+        };
+        let s = spans(&ctx, t0, &q, 200, None);
+        let planning = s.iter().find(|s| s["name"] == "planning").unwrap();
+        let plan = s.iter().find(|s| s["name"] == "iceberg.plan").unwrap();
+        assert_eq!(plan["parentSpanId"], planning["spanId"]);
+        assert_eq!(plan["startTimeUnixNano"], "1002000000");
+        assert!(plan["attributes"].to_string().contains("plimsoll.files"));
         // A caller error is not a server error.
         let s = spans(&ctx, t0, &q, 403, Some(("forbidden", "no")));
         assert_eq!(s[0]["status"]["code"], 0);

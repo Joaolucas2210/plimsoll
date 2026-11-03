@@ -65,6 +65,8 @@ pub struct QueryLog {
     /// Tables and columns the query read (ADR 0046); empty when it never
     /// planned (rejected, invalid, denied).
     pub reads: Vec<plimsoll_core::engine::TableRead>,
+    /// Planning events for the trace (ADR 0056); not logged.
+    pub plan_events: Vec<plimsoll_core::plan_trace::PlanEvent>,
     pub queue: Option<Duration>,
     pub planning: Option<Duration>,
     pub execution: Option<Duration>,

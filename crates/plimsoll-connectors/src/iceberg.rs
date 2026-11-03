@@ -781,7 +781,29 @@ impl TableProvider for IcebergTable {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let pruner = Pruner::new(filters, &self.columns);
+        let planning = std::time::Instant::now();
         let (mut files, sets, stats) = self.data_files(state, &pruner).await?;
+        // A span in the query's trace (ADR 0056): where planning time went.
+        plimsoll_core::plan_trace::record(
+            "iceberg.plan",
+            planning,
+            vec![
+                ("table", self.name.clone()),
+                (
+                    "snapshot",
+                    self.snapshot_id
+                        .map_or("none".to_owned(), |id| id.to_string()),
+                ),
+                (
+                    "manifests",
+                    format!("{}/{}", stats.manifests_read, stats.manifests),
+                ),
+                ("files", format!("{}/{}", stats.files_kept, stats.files)),
+                ("delete_files", stats.delete_files.to_string()),
+                ("equality_deletes", stats.equality_files.to_string()),
+                ("manifest_cache_hits", stats.manifest_cache_hits.to_string()),
+            ],
+        );
         // Exact filters (ADR 0055) are this scan's to enforce: decided per
         // file from its partition tuple. The rest go to Parquet and are
         // re-checked above the scan.

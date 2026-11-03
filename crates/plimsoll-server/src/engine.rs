@@ -19,6 +19,7 @@ use plimsoll_core::datafusion::error::DataFusionError;
 use plimsoll_core::datafusion::object_store::Error as ObjectStoreError;
 use plimsoll_core::datafusion::parquet::errors::ParquetError;
 use plimsoll_core::engine::{AccessDenied, Engine, QueryResult, TableRead};
+use plimsoll_core::plan_trace::{self, PlanEvent};
 
 use crate::auth::Viewer;
 use plimsoll_core::memory::{ConsumerKind, Reservation};
@@ -34,6 +35,8 @@ pub struct QueryOutput {
     pub phases: Phases,
     /// What each scan read, for the audit trail (ADR 0046).
     pub reads: Vec<TableRead>,
+    /// Catalog loads and connector planning, for the trace (ADR 0056).
+    pub plan_events: Vec<PlanEvent>,
 }
 
 /// Where a successful query spent its time (the admission queue is timed by
@@ -54,6 +57,7 @@ impl QueryOutput {
             memory: None,
             phases: Phases::default(),
             reads: Vec::new(),
+            plan_events: Vec::new(),
         }
     }
 }
@@ -113,6 +117,8 @@ pub struct Streamed {
     pub phases: Phases,
     /// What each scan read, for the audit trail (ADR 0046).
     pub reads: Vec<TableRead>,
+    /// Catalog loads and connector planning, for the trace (ADR 0056).
+    pub plan_events: Vec<PlanEvent>,
 }
 
 /// The receiver is gone (client disconnected). The caller cancels the query
@@ -164,6 +170,7 @@ pub trait QueryEngine: Send + Sync {
             rows: rows.len() as u64,
             phases: out.phases,
             reads: out.reads,
+            plan_events: out.plan_events,
         })
     }
 }
@@ -202,17 +209,19 @@ impl QueryEngine for CoreEngine {
         params: &[ScalarValue],
         viewer: Viewer,
     ) -> Result<QueryOutput, EngineError> {
+        let plan_events;
         let QueryResult {
             batches,
             mut memory,
             planning,
             execution,
             reads,
-        } = self
-            .0
-            .sql_with(sql, params, Arc::new(viewer))
-            .await
-            .map_err(|e| classify(&e))?;
+        } = {
+            let (result, events) =
+                plan_trace::collect(self.0.sql_with(sql, params, Arc::new(viewer))).await;
+            plan_events = events;
+            result.map_err(|e| classify(&e))?
+        };
         let serializing = Instant::now();
         let columns: Vec<String> = batches
             .first()
@@ -255,6 +264,7 @@ impl QueryEngine for CoreEngine {
                 serialization: serializing.elapsed(),
             },
             reads,
+            plan_events,
         })
     }
 
@@ -269,11 +279,9 @@ impl QueryEngine for CoreEngine {
         let started = Instant::now();
         let viewer = Arc::new(viewer);
         let group = self.0.capped_group(viewer.as_ref());
-        let mut query = self
-            .0
-            .sql_stream_with(sql, params, viewer)
-            .await
-            .map_err(|e| classify(&e))?;
+        let (query, plan_events) =
+            plan_trace::collect(self.0.sql_stream_with(sql, params, viewer)).await;
+        let mut query = query.map_err(|e| classify(&e))?;
         let columns: Vec<String> = query
             .stream
             .schema()
@@ -349,6 +357,7 @@ impl QueryEngine for CoreEngine {
         Ok(Streamed {
             rows,
             reads: std::mem::take(&mut query.reads),
+            plan_events,
             phases: Phases {
                 planning,
                 // Includes time spent waiting for the reader.

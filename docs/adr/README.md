@@ -63,6 +63,7 @@ are allowed in place.
 | [0053](0053-decimal-pruning.md) | Decimal pruning | Accepted | 2026-11-02 | `decimal(p, s)` bounds decode as unscaled `i128` (big-endian two's complement); literals rescale to the column scale only when exact; bucket hashes the minimal unscaled bytes (spec vector), truncate works on the unscaled value | 0010, 0051 |
 | [0054](0054-count-from-metadata.md) | `count(*)` from metadata | Accepted | 2026-11-02 | The Iceberg scan reports an exact row count (sum of `record_count`) when no delete applies and no filter or limit is pushed into it, so DataFusion's aggregate-statistics rule answers `count(*)` without reading data files; `min`/`max` are not (spec bounds may be loose) | 0003, 0007, 0014, 0016, 0017 |
 | [0055](0055-exact-partition-filters.md) | Exact identity-partition filters | Accepted | 2026-11-02 | Filters built only from exact comparisons/null checks/IN on columns that are identity sources in every spec are pushed down `Exact` and decided per file from its partition tuple (SQL NULL semantics; undecidable = error); Iceberg's federation policy lets the table's claim stand | 0006, 0050, 0054 |
+| [0056](0056-planning-spans.md) | Planning spans in traces | Accepted | 2026-11-02 | A `tokio::task_local` collector in core (`plan_trace::{collect, record}`) gathers events from inside DataFusion planning (catalog `loadTable`, Iceberg planning with file/manifest/delete counts); exported as children of the `planning` span at their real times | 0031, 0027 |
 
 ## Reading order
 
@@ -70,7 +71,7 @@ are allowed in place.
 - Shape of the system: 0001, 0002, 0004.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
 - Federation: 0005 → 0006.
-- Observability: 0013 → 0019 → 0027 → 0031 → 0046.
+- Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046.
 
 ## Conventions

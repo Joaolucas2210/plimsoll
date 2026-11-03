@@ -118,9 +118,8 @@ no endpoint is configured.
 - Zero new crates; the binary's dependency tree is unchanged.
 
 **Negative (accepted debt)**
-- **Request-level only.** No spans per operator, per manifest fetch or
-  per catalog call; their cost is visible in aggregate under `planning`
-  and `execution`.
+- **Request-level only** at first. ADR 0056 adds spans for catalog loads
+  and Iceberg planning. Per-operator and per-fetch spans are still absent.
 - **No OTLP metrics.** `/metrics` (Prometheus format) remains the
   metrics path; collectors can scrape it.
 - **Phase start times are reconstructed.** Durations are exact; start
