@@ -73,7 +73,7 @@ pub(crate) fn physical_sql(
 }
 
 /// `text` parsed, coerced and simplified, as the optimizer leaves filters.
-fn parse(text: &str, schema: &DFSchema) -> Option<Expr> {
+pub(crate) fn parse(text: &str, schema: &DFSchema) -> Option<Expr> {
     let parsed = PARSER.create_logical_expr(text, schema).ok()?;
     let context = SimplifyContext::builder()
         .with_schema(Arc::new(schema.clone()))

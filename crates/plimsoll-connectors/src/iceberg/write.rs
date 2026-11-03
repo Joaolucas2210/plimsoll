@@ -313,6 +313,10 @@ impl Written {
         self.rows
     }
 
+    pub(super) fn is_delete(&self) -> bool {
+        self.content == 1
+    }
+
     /// As a worker reports it to the coordinator (ADR 0091). Column types
     /// are not sent: the coordinator's layout has them by field id.
     pub(super) fn to_json(&self) -> Json {
@@ -329,6 +333,8 @@ impl Written {
             "partition": self.partition.iter().map(datum).collect::<Vec<_>>(),
             "stats": self.stats.iter().map(|(id, _, s)| json!([id, s.values, s.nulls, datum(&s.lower), datum(&s.upper)])).collect::<Vec<_>>(),
             "spec": self.spec,
+            "content": self.content,
+            "referenced": self.referenced,
         })
     }
 }
@@ -361,7 +367,10 @@ impl IcebergSink {
                 )),
             })
         };
-        let prims: HashMap<i64, Option<Prim>> = self.layout.columns.iter().copied().collect();
+        let mut prims: HashMap<i64, Option<Prim>> = self.layout.columns.iter().copied().collect();
+        // A position delete file's own columns (ADR 0093).
+        prims.insert(DELETE_FILE_PATH, Some(Prim::String));
+        prims.insert(DELETE_POS, Some(Prim::Long));
         let stats = v["stats"]
             .as_array()
             .ok_or("stats")?
@@ -391,8 +400,12 @@ impl IcebergSink {
                 .map(datum)
                 .collect::<std::result::Result<_, _>>()?,
             stats,
-            referenced: None,
-            content: 0,
+            referenced: v["referenced"].as_str().map(str::to_owned),
+            content: match v["content"].as_i64() {
+                None | Some(0) => 0,
+                Some(1) => 1,
+                Some(c) => return Err(format!("content {c}")),
+            },
             spec: v["spec"].as_i64().ok_or("spec")?,
         })
     }
@@ -1061,6 +1074,8 @@ fn creation_updates(meta: &Json) -> Vec<Json> {
 /// a running count is each row's position.
 pub(super) struct Target {
     pub(super) path: String,
+    /// Bytes, for assigning targets to workers (ADR 0093).
+    pub(super) size: Option<u64>,
     /// The data file's partition spec and its partition in it: its
     /// position deletes go there (ADR 0085).
     pub(super) spec: i64,
@@ -1084,7 +1099,7 @@ pub(super) struct IcebergDeleteExec {
     pub(super) predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
     /// `UPDATE` (ADR 0081): each table column of a changed row, as its
     /// new value (`SET`) or itself. `None`: a `DELETE`.
-    update: Option<Arc<Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>>>>,
+    pub(super) update: Option<Arc<Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>>>>,
     properties: Arc<datafusion::physical_plan::PlanProperties>,
 }
 
@@ -1259,6 +1274,46 @@ impl IcebergSink {
         update: Option<&[Arc<dyn datafusion::physical_expr::PhysicalExpr>]>,
         context: &Arc<TaskContext>,
     ) -> Result<u64> {
+        let written = self.rewrite(targets, predicate, update, context).await?;
+        let deleted = written
+            .iter()
+            .filter(|w| w.content == 1)
+            .map(|w| w.rows)
+            .sum();
+        if deleted > 0 {
+            self.commit_change(&written, update.is_some(), &context.runtime_env())
+                .await?;
+        }
+        Ok(deleted)
+    }
+
+    /// Commits a `DELETE`'s position deletes, or an `UPDATE`'s with its
+    /// rewritten rows (`update`), written here or on workers (ADR 0093).
+    pub(super) async fn commit_change(
+        &self,
+        files: &[Written],
+        update: bool,
+        env: &datafusion::execution::runtime_env::RuntimeEnv,
+    ) -> Result<()> {
+        let change = if update {
+            Change::Overwrite
+        } else {
+            Change::Delete
+        };
+        self.commit(files, change, None, env).await
+    }
+
+    /// The files of a `DELETE` or `UPDATE` over `targets`, not committed:
+    /// position deletes for the rows matching `predicate`, and with
+    /// `update` the rewritten rows as data files. What a worker does for
+    /// its share of the files (ADR 0093).
+    pub(super) async fn rewrite(
+        &self,
+        targets: &[Target],
+        predicate: &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        update: Option<&[Arc<dyn datafusion::physical_expr::PhysicalExpr>]>,
+        context: &Arc<TaskContext>,
+    ) -> Result<Vec<Written>> {
         use datafusion::arrow::array::{AsArray, BooleanArray};
         let env = context.runtime_env();
         let run = unique();
@@ -1324,25 +1379,19 @@ impl IcebergSink {
                 );
             }
         }
-        let deleted = written.iter().map(|w| w.rows).sum();
         if written.is_empty() {
-            return Ok(0);
+            return Ok(written);
         }
-        let change = match update {
-            None => Change::Delete,
-            Some(_) => {
-                let rows = datafusion::physical_plan::memory::MemoryStream::try_new(
-                    changed,
-                    self.schema.clone(),
-                    None,
-                )?;
-                written.extend(self.write_rows(Box::pin(rows), context).await?);
-                Change::Overwrite
-            }
-        };
-        self.commit(&written, change, None, &env).await?;
+        if update.is_some() {
+            let rows = datafusion::physical_plan::memory::MemoryStream::try_new(
+                changed,
+                self.schema.clone(),
+                None,
+            )?;
+            written.extend(self.write_rows(Box::pin(rows), context).await?);
+        }
         memory.resize(0);
-        Ok(deleted)
+        Ok(written)
     }
 
     /// One position delete file: `(file_path, pos)` rows, sorted, with
@@ -2504,6 +2553,31 @@ mod tests {
         assert_eq!(back.to_json(), file.to_json());
         assert_eq!(back.stats[0].1, Some(Prim::Long), "types from the layout");
         assert!(sink.written_from_json(&json!({"path": "x"})).is_err());
+        // A position delete file (ADR 0093): content, referenced data file
+        // and its reserved columns' bounds come back too.
+        let deletes = Written {
+            path: "file:///t/data/d.parquet".into(),
+            rows: 2,
+            bytes: 5,
+            partition: vec![Some(Datum::Bytes(b"a".to_vec())), Some(Datum::Int(1))],
+            stats: vec![(
+                DELETE_POS,
+                Some(Prim::Long),
+                ColumnStats {
+                    values: 2,
+                    nulls: 0,
+                    lower: Some(Datum::Int(3)),
+                    upper: Some(Datum::Int(7)),
+                },
+            )],
+            referenced: Some("file:///t/data/a.parquet".into()),
+            content: 1,
+            spec: 4,
+        };
+        let back = sink.written_from_json(&deletes.to_json()).unwrap();
+        assert!(back.is_delete() && back.referenced.as_deref() == deletes.referenced.as_deref());
+        assert_eq!(back.stats[0].1, Some(Prim::Long));
+        assert_eq!(back.spec, 4);
         let groups = sink.split(&batch).unwrap();
         // ("a", bucket(1)) twice, then ("b", ...), then (NULL, ...).
         let sizes: Vec<usize> = groups.iter().map(|(_, b)| b.num_rows()).collect();

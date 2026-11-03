@@ -829,6 +829,43 @@ async fn writes_on_workers_through_the_rest_catalog() {
         counts.contains("| eu     | 400 |") && counts.contains("| us     | 400 |"),
         "{counts}"
     );
+    // Row-level writes (ADR 0093): DELETE and UPDATE rewrite their files
+    // on the workers, and the counts and contents are a local run's.
+    let delete = format!("DELETE FROM {c1} WHERE v > 250");
+    let plan = text(&format!("EXPLAIN {delete}")).await;
+    assert!(
+        plan.contains("RemoteWriteExec") && plan.contains("source=RemoteScanExec"),
+        "{plan}"
+    );
+    let expected = text(&format!("SELECT count(*) AS n FROM {c1} WHERE v > 250")).await;
+    let deleted = text(&delete).await;
+    let (n, d) = (expected.lines().nth(3), deleted.lines().nth(3));
+    assert_eq!(
+        n.map(|l| l.split('|').nth(1).map(str::trim)),
+        d.map(|l| l.split('|').nth(1).map(str::trim))
+    );
+    assert!(
+        text(&format!("SELECT count(*) AS n FROM {c1} WHERE v > 250"))
+            .await
+            .contains("| 0 |")
+    );
+    let update = format!("UPDATE {c1} SET v = -v WHERE id % 2 = 0");
+    let plan = text(&format!("EXPLAIN {update}")).await;
+    assert!(plan.contains("RemoteWriteExec"), "{plan}");
+    let before = text(&format!("SELECT count(*) AS n FROM {c1} WHERE id % 2 = 0")).await;
+    let updated = text(&update).await;
+    assert_eq!(
+        before
+            .lines()
+            .nth(3)
+            .map(|l| l.split('|').nth(1).map(str::trim)),
+        updated
+            .lines()
+            .nth(3)
+            .map(|l| l.split('|').nth(1).map(str::trim))
+    );
+    let negative = text(&format!("SELECT count(*) AS n FROM {c1} WHERE v < 0")).await;
+    assert_eq!(negative.lines().nth(3), before.lines().nth(3), "{negative}");
     for t in [src, dst, c1, c2] {
         text(&format!("DROP TABLE {t} PURGE")).await;
     }

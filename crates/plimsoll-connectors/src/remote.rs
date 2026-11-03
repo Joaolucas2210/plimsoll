@@ -211,6 +211,21 @@ pub struct Fragment {
     /// Write the rows as data files of this table and return the files
     /// written (ADR 0091), one JSON per row.
     pub write: Option<WriteTo>,
+    /// A `DELETE` or `UPDATE` of this fragment's files (ADR 0093): their
+    /// position deletes (and rewritten rows) written, the files returned
+    /// as for `write`.
+    pub change: Option<RowChange>,
+}
+
+/// A row-level change of a fragment's files (ADR 0093), as SQL over the
+/// table's columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowChange {
+    /// The rows changed: the `WHERE` (row filters included).
+    pub predicate: String,
+    /// `UPDATE`: every column's new value, in table order. `None`: a
+    /// `DELETE`.
+    pub update: Option<Vec<String>>,
 }
 
 /// The table a worker writes its rows into (ADR 0091, 0092).
@@ -468,6 +483,7 @@ impl Fragment {
                 "projection": b.projection,
             })),
             "write": self.write.as_ref().map(WriteTo::to_json),
+            "change": self.change.as_ref().map(|c| json!({"predicate": c.predicate, "update": c.update})),
             "aggregate": self.aggregate.as_ref().map(|a| json!({
                 "group_by": a.group_by,
                 "aggregates": a.aggregates.iter().map(|(f, c)| json!({"fn": f, "column": c})).collect::<Vec<_>>(),
@@ -478,7 +494,8 @@ impl Fragment {
     pub fn from_json(v: &Json) -> Result<Self, String> {
         // A field this worker does not know could change the answer (a
         // filter it would skip): refuse it rather than ignore it.
-        const KNOWN: [&str; 9] = [
+        const KNOWN: [&str; 10] = [
+            "change",
             "write",
             "metadata_location",
             "snapshot_id",
@@ -520,6 +537,19 @@ impl Fragment {
             files: strings("files")?,
             columns: strings("columns")?,
             write: WriteTo::from_json(&v["write"])?,
+            change: match &v["change"] {
+                Json::Null => None,
+                c => Some(RowChange {
+                    predicate: c["predicate"]
+                        .as_str()
+                        .ok_or("`change.predicate` is required")?
+                        .to_owned(),
+                    update: match &c["update"] {
+                        Json::Null => None,
+                        u => Some(names(u, "change.update")?),
+                    },
+                }),
+            },
             filters: match &v["filters"] {
                 Json::Null => Vec::new(),
                 _ => strings("filters")?,
@@ -656,6 +686,7 @@ impl RemoteScanExec {
                     bucket: None,
                     broadcast: None,
                     write: None,
+                    change: None,
                 },
             })
             .collect();
@@ -763,6 +794,16 @@ impl RemoteScanExec {
             a.fragment.columns = columns.clone();
         }
         Some(out)
+    }
+
+    /// The same fragments, each applying `change` to its files and
+    /// returning the files it wrote (ADR 0093).
+    pub(crate) fn changing(&self, change: RowChange) -> Self {
+        let mut out = self.with_schema(written_schema());
+        for a in &mut out.fragments {
+            a.fragment.change = Some(change.clone());
+        }
+        out
     }
 
     /// The columns each fragment returns, by name.
@@ -2006,6 +2047,10 @@ mod tests {
                 metadata_location: "s3://b/u/metadata/v1.metadata.json".into(),
                 metadata: Some(json!({"format-version": 2})),
                 picks: Some(vec![1, 0]),
+            }),
+            change: Some(RowChange {
+                predicate: "id > 3".into(),
+                update: Some(vec!["id".into(), "upper(name)".into()]),
             }),
         };
         assert_eq!(Fragment::from_json(&f.to_json()).unwrap(), f);

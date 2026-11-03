@@ -34,6 +34,9 @@ use crate::remote::{RemoteReduceExec, RemoteScanExec, WriteTo};
 #[derive(Debug)]
 pub(crate) struct RemoteWriteExec {
     sink: IcebergSink,
+    /// A `DELETE` (`false`) or `UPDATE` (`true`) whose files the source
+    /// rewrote (ADR 0093); `None`: an append.
+    change: Option<bool>,
     /// Partitions returning [`crate::remote::written_schema`] rows.
     source: Arc<dyn ExecutionPlan>,
     /// The write's output: the rows written.
@@ -128,18 +131,30 @@ pub(super) fn distribute(
             let reduce = input.as_ref().downcast_ref::<RemoteReduceExec>()?;
             Arc::new(reduce.writing(to(Some(picks))))
         };
-    let properties = Arc::new(PlanProperties::new(
-        EquivalenceProperties::new(schema.clone()),
-        Partitioning::UnknownPartitioning(1),
-        EmissionType::Final,
-        Boundedness::Bounded,
-    ));
-    Some(RemoteWriteExec {
-        sink: sink.clone(),
-        source: writing,
-        schema,
-        properties,
-    })
+    Some(RemoteWriteExec::new(sink.clone(), writing, schema, None))
+}
+
+impl RemoteWriteExec {
+    pub(super) fn new(
+        sink: IcebergSink,
+        source: Arc<dyn ExecutionPlan>,
+        schema: SchemaRef,
+        change: Option<bool>,
+    ) -> Self {
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        ));
+        Self {
+            sink,
+            change,
+            source,
+            schema,
+            properties,
+        }
+    }
 }
 
 /// A write's output: the rows written.
@@ -223,6 +238,7 @@ impl ExecutionPlan for RemoteWriteExec {
             .map(|p| self.source.execute(p, ctx.clone()))
             .collect::<Result<Vec<_>>>()?;
         let sink = self.sink.clone();
+        let change = self.change;
         let schema = self.schema.clone();
         let out = schema.clone();
         // Held until the commit: a shuffle's reduce releases its maps when
@@ -246,8 +262,26 @@ impl ExecutionPlan for RemoteWriteExec {
                     );
                 }
             }
-            sink.commit_files(&files, &ctx.runtime_env()).await?;
-            let rows: u64 = files.iter().map(|f| f.rows()).sum();
+            // An append counts the rows written; a row-level change the
+            // rows deleted (an update's rewritten rows are those again).
+            let rows: u64 = match change {
+                None => {
+                    sink.commit_files(&files, &ctx.runtime_env()).await?;
+                    files.iter().map(|f| f.rows()).sum()
+                }
+                Some(update) => {
+                    let deleted = files
+                        .iter()
+                        .filter(|f| f.is_delete())
+                        .map(|f| f.rows())
+                        .sum();
+                    if deleted > 0 {
+                        sink.commit_change(&files, update, &ctx.runtime_env())
+                            .await?;
+                    }
+                    deleted
+                }
+            };
             Ok(RecordBatch::try_new(
                 out,
                 vec![Arc::new(UInt64Array::from(vec![rows]))],

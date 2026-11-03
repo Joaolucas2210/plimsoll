@@ -302,8 +302,6 @@ async fn write_rows(
     df: plimsoll_core::datafusion::prelude::DataFrame,
     target: &plimsoll_connectors::remote::WriteTo,
 ) -> Result<Running, EngineError> {
-    use plimsoll_core::datafusion::arrow::array::StringArray;
-    use plimsoll_core::datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     let fail = |e: DataFusionError| classify(&e);
     let state = ctx.state();
     let rows = df.execute_stream().await.map_err(fail)?;
@@ -315,6 +313,14 @@ async fn write_rows(
     )
     .await
     .map_err(|e| fail(e.into()))?;
+    files_written(files)
+}
+
+/// The files a worker wrote, one JSON per row (ADR 0091).
+fn files_written(files: Vec<serde_json::Value>) -> Result<Running, EngineError> {
+    use plimsoll_core::datafusion::arrow::array::StringArray;
+    use plimsoll_core::datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    let fail = |e: DataFusionError| classify(&e);
     let schema = plimsoll_connectors::remote::written_schema();
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -827,6 +833,21 @@ impl QueryEngine for CoreEngine {
             }
         }
         let state = self.0.context().state();
+        // A row-level change of these files (ADR 0093): their position
+        // deletes and rewritten rows written here, for the coordinator to
+        // commit.
+        if let Some(change) = &f.change {
+            let files = IcebergConnector::rewrite_files(
+                &f.metadata_location,
+                f.snapshot_id,
+                f.files.iter().cloned().collect(),
+                change,
+                &state,
+            )
+            .await
+            .map_err(|e| fail(e.into()))?;
+            return files_written(files);
+        }
         let connector = IcebergConnector::fragment(
             &f.metadata_location,
             f.snapshot_id,
@@ -1479,6 +1500,7 @@ mod tests {
             }),
             broadcast: None,
             write: None,
+            change: None,
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         for id in ["rel-a", "rel-a~m1r0"] {

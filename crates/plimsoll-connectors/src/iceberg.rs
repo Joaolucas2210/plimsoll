@@ -176,6 +176,44 @@ impl IcebergConnector {
         Ok(connector)
     }
 
+    /// A worker's part of a distributed `DELETE` or `UPDATE` (ADR 0093):
+    /// the rows of `files` (the table at `metadata_path` and `snapshot`)
+    /// matching `predicate` are deleted by position, and with `update`
+    /// rewritten with those new values (SQL over the table's columns). The
+    /// files written, not committed.
+    pub async fn rewrite_files(
+        metadata_path: &str,
+        snapshot: Option<i64>,
+        files: HashSet<String>,
+        change: &crate::remote::RowChange,
+        state: &dyn Session,
+    ) -> Result<Vec<Json>, ConnectorError> {
+        let connector = Self::fragment(metadata_path, snapshot, files, state).await?;
+        let table = &connector.table;
+        let schema = DFSchema::try_from(table.schema.as_ref().clone())?;
+        let parse = |sql: &str| {
+            portable::parse(sql, &schema).ok_or_else(|| {
+                ConnectorError::Unsupported(format!("expression {sql:?} does not parse here"))
+            })
+        };
+        let filter = parse(&change.predicate)?;
+        let (sink, targets, predicate, schema) = table
+            .rows_with(table.file_writer()?, state, vec![filter])
+            .await?;
+        let update = match &change.update {
+            None => None,
+            Some(row) => Some(
+                row.iter()
+                    .map(|sql| Ok(state.create_physical_expr(parse(sql)?, &schema)?))
+                    .collect::<Result<Vec<_>, ConnectorError>>()?,
+            ),
+        };
+        let written = sink
+            .rewrite(&targets, &predicate, update.as_deref(), &state.task_ctx())
+            .await?;
+        Ok(written.iter().map(write::Written::to_json).collect())
+    }
+
     /// A worker's part of a distributed write (ADR 0091): `rows` written
     /// as data files of the table at `metadata_path` (its current schema
     /// and partition spec), not committed. Each file as the coordinator
@@ -385,6 +423,8 @@ struct IcebergTable {
     name: String,
     schema: SchemaRef,
     snapshot_id: Option<i64>,
+    /// The schema its snapshot was written with, when the metadata says.
+    snapshot_schema_id: Option<i64>,
     /// `None` for a table without snapshots (empty).
     manifest_list: Option<String>,
     /// Table base location (`location` in the metadata).
@@ -536,6 +576,12 @@ impl IcebergTable {
         );
 
         let snapshot_id = meta["current-snapshot-id"].as_i64().filter(|id| *id != -1);
+        let snapshot_schema_id = meta["snapshots"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|s| snapshot_id.is_some() && s["snapshot-id"].as_i64() == snapshot_id)
+            .and_then(|s| s["schema-id"].as_i64());
         let manifest_list = match snapshot_id {
             None => None,
             Some(id) => {
@@ -605,6 +651,7 @@ impl IcebergTable {
             name: name.to_owned(),
             schema,
             snapshot_id,
+            snapshot_schema_id,
             manifest_list,
             location: meta["location"].as_str().map(str::to_owned),
             scoped: None,
@@ -985,7 +1032,7 @@ impl TableProvider for IcebergTable {
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let (exec, _) = self.row_change("delete from", state, filters).await?;
-        Ok(Arc::new(exec))
+        Ok(self.on_workers(state, exec))
     }
 
     /// `MERGE INTO t USING s ON … WHEN …` (ADR 0082): every target file
@@ -1171,7 +1218,7 @@ impl TableProvider for IcebergTable {
                 None => Ok(Arc::new(Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>),
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Arc::new(exec.with_update(row)))
+        Ok(self.on_workers(state, exec.with_update(row)))
     }
 
     /// Filters that identity partitions decide are `Exact` (ADR 0055): the
@@ -1613,6 +1660,23 @@ impl IcebergTable {
         DFSchema,
     )> {
         let sink = self.writable(verb)?;
+        self.rows_with(sink, state, filters).await
+    }
+
+    /// [`Self::rows_of`] for `sink`: a worker's, which does not commit
+    /// (ADR 0093).
+    #[allow(clippy::type_complexity)]
+    async fn rows_with(
+        &self,
+        sink: write::IcebergSink,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> Result<(
+        write::IcebergSink,
+        Vec<write::Target>,
+        Arc<dyn PhysicalExpr>,
+        DFSchema,
+    )> {
         let filters = filters
             .into_iter()
             .map(unqualified)
@@ -1624,7 +1688,11 @@ impl IcebergTable {
         };
         self.register_scoped(state);
         let pruner = Pruner::new(&filters, &self.columns);
-        let (files, _, _) = self.data_files(state, &pruner).await?;
+        let (mut files, _, _) = self.data_files(state, &pruner).await?;
+        // A worker's share only (ADR 0093).
+        if let Some(only) = &self.only_files {
+            files.retain(|f| only.contains(&f.path));
+        }
         let mut targets = Vec::with_capacity(files.len());
         for file in files {
             let whole = DataFile {
@@ -1640,6 +1708,7 @@ impl IcebergTable {
             let plan = self.parquet_scan(state, &[&whole], None, &[], None).await?;
             targets.push(write::Target {
                 path: file.path,
+                size: file.size,
                 spec: file.spec,
                 partition: prune::partition_values(file.partition.as_ref()),
                 selection: file.selection,
@@ -1647,6 +1716,72 @@ impl IcebergTable {
             });
         }
         Ok((sink, targets, predicate, schema))
+    }
+
+    /// `exec` run on the workers (ADR 0093): its target files split into
+    /// fragments, each rewritten where it lands, the files written
+    /// committed here. As it is when there are no healthy workers, the
+    /// table is read with vended credentials (they never leave the
+    /// coordinator), or the predicate or a new value does not travel as
+    /// SQL.
+    fn on_workers(
+        &self,
+        state: &dyn Session,
+        exec: write::IcebergDeleteExec,
+    ) -> Arc<dyn ExecutionPlan> {
+        let local = |exec| Arc::new(exec) as Arc<dyn ExecutionPlan>;
+        let Some(workers) = state.config().get_extension::<crate::remote::Workers>() else {
+            return local(exec);
+        };
+        let urls = workers.healthy_urls();
+        // Workers read the files at the snapshot, with its schema: it must
+        // be the schema the predicate and new values are written against.
+        let same_schema = self
+            .snapshot_schema_id
+            .is_none_or(|id| id == self.schema_id);
+        if urls.is_empty()
+            || exec.targets.is_empty()
+            || !exec.sink.workers_may_write()
+            || !same_schema
+        {
+            return local(exec);
+        }
+        let config = state.config_options();
+        let sql = |e: &Arc<dyn PhysicalExpr>| portable::physical_sql(e, &self.schema, config);
+        let Some(predicate) = sql(&exec.predicate) else {
+            return local(exec);
+        };
+        let update = match &exec.update {
+            None => None,
+            Some(row) => match row.iter().map(sql).collect::<Option<Vec<_>>>() {
+                Some(row) => Some(row),
+                None => return local(exec),
+            },
+        };
+        let files = exec
+            .targets
+            .iter()
+            .map(|t| (t.path.clone(), t.size))
+            .collect();
+        let fragments = crate::remote::RemoteScanExec::new(
+            crate::remote::written_schema(),
+            workers,
+            &urls,
+            &self.metadata_path,
+            self.snapshot_id,
+            files,
+            Vec::new(),
+        )
+        .changing(crate::remote::RowChange {
+            predicate,
+            update: update.clone(),
+        });
+        Arc::new(remote_write::RemoteWriteExec::new(
+            (*exec.sink).clone(),
+            Arc::new(fragments),
+            remote_write::count_schema(),
+            Some(update.is_some()),
+        ))
     }
 
     /// See [`IcebergConnector::compact`]. A partition is rewritten when it
