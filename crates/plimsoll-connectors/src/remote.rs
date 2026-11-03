@@ -20,9 +20,14 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::buffer::Buffer;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::ipc::reader::StreamDecoder;
+use datafusion::common::config::ConfigOptions;
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::expressions::{Column, Literal};
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -30,6 +35,7 @@ use datafusion::physical_plan::{
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use plimsoll_core::engine::QueryTag;
+use plimsoll_core::memory::AccountedExec;
 use serde_json::{Value as Json, json};
 
 /// Worker endpoints and the shared secret they accept, set as a session
@@ -105,6 +111,18 @@ pub struct Fragment {
     pub snapshot_id: Option<i64>,
     pub files: Vec<String>,
     pub columns: Vec<String>,
+    /// Aggregate on the worker and return partial states (ADR 0061).
+    pub aggregate: Option<AggregateSpec>,
+}
+
+/// `<aggregates> GROUP BY <group_by>` over the fragment: what a worker
+/// computes for a partial aggregation (ADR 0061). Each
+/// aggregate is (`count` | `sum` | `min` | `max`, column), `count` with no
+/// column meaning `count(*)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregateSpec {
+    pub group_by: Vec<String>,
+    pub aggregates: Vec<(String, Option<String>)>,
 }
 
 impl Fragment {
@@ -114,6 +132,10 @@ impl Fragment {
             "snapshot_id": self.snapshot_id,
             "files": self.files,
             "columns": self.columns,
+            "aggregate": self.aggregate.as_ref().map(|a| json!({
+                "group_by": a.group_by,
+                "aggregates": a.aggregates.iter().map(|(f, c)| json!({"fn": f, "column": c})).collect::<Vec<_>>(),
+            })),
         })
     }
 
@@ -138,6 +160,28 @@ impl Fragment {
             snapshot_id: v["snapshot_id"].as_i64(),
             files: strings("files")?,
             columns: strings("columns")?,
+            aggregate: match &v["aggregate"] {
+                Json::Null => None,
+                a => Some(AggregateSpec {
+                    group_by: a["group_by"]
+                        .as_array()
+                        .ok_or("`aggregate.group_by` must be an array")?
+                        .iter()
+                        .map(|c| c.as_str().map(str::to_owned).ok_or("group_by: strings"))
+                        .collect::<Result<_, _>>()?,
+                    aggregates: a["aggregates"]
+                        .as_array()
+                        .ok_or("`aggregate.aggregates` must be an array")?
+                        .iter()
+                        .map(|e| {
+                            Ok((
+                                e["fn"].as_str().ok_or("aggregate fn")?.to_owned(),
+                                e["column"].as_str().map(str::to_owned),
+                            ))
+                        })
+                        .collect::<Result<_, String>>()?,
+                }),
+            },
         })
     }
 }
@@ -201,6 +245,7 @@ impl RemoteScanExec {
                     snapshot_id,
                     files,
                     columns: columns.clone(),
+                    aggregate: None,
                 },
             })
             .collect();
@@ -219,6 +264,33 @@ impl RemoteScanExec {
         }
     }
 
+    /// The same fragments, each aggregated on its worker into the partial
+    /// states `schema` describes (ADR 0061).
+    pub fn with_aggregate(&self, spec: AggregateSpec, schema: SchemaRef) -> Self {
+        let fragments = self
+            .fragments
+            .iter()
+            .cloned()
+            .map(|mut a| {
+                a.fragment.aggregate = Some(spec.clone());
+                a
+            })
+            .collect::<Vec<_>>();
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(fragments.len().max(1)),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Self {
+            schema,
+            workers: self.workers.clone(),
+            urls: self.urls.clone(),
+            fragments,
+            properties,
+        }
+    }
+
     /// (worker url, files, bytes) per fragment, in partition order.
     pub fn assignments(&self) -> Vec<(String, usize, u64)> {
         self.fragments
@@ -232,9 +304,21 @@ impl DisplayAs for RemoteScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         let files: usize = self.fragments.iter().map(|a| a.fragment.files.len()).sum();
         let bytes: Vec<u64> = self.fragments.iter().map(|a| a.bytes).collect();
+        let aggregate = self
+            .fragments
+            .first()
+            .and_then(|a| a.fragment.aggregate.as_ref())
+            .map_or(String::new(), |a| {
+                let aggs: Vec<String> = a
+                    .aggregates
+                    .iter()
+                    .map(|(f, c)| format!("{f}({})", c.as_deref().unwrap_or("*")))
+                    .collect();
+                format!(" aggregate=[{}] group_by={:?}", aggs.join(", "), a.group_by)
+            });
         write!(
             f,
-            "RemoteScanExec: fragments={} files={files} bytes={bytes:?}",
+            "RemoteScanExec: fragments={} files={files} bytes={bytes:?}{aggregate}",
             self.fragments.len()
         )
     }
@@ -299,6 +383,123 @@ impl ExecutionPlan for RemoteScanExec {
             ),
         )))
     }
+}
+
+/// Moves partial aggregations into worker fragments (ADR 0061).
+///
+/// Matches `AggregateExec(Partial)` whose input is, through pass-through
+/// nodes only (repartition, coalesce), an `AccountedExec` over a
+/// [`RemoteScanExec`], and whose group keys are plain columns and whose
+/// aggregates are `count(*)` or `count`/`sum`/`min`/`max` of a column
+/// (no DISTINCT, FILTER, ORDER BY). Such an aggregate's partial state per
+/// partition *is* the value computed over that partition's rows, so each
+/// worker returns it for its fragment and the coordinator's `Final`
+/// merges. Anything else is left as it is: rows travel, as before.
+#[derive(Debug, Default)]
+pub struct PartialAggregatePushdown;
+
+impl PhysicalOptimizerRule for PartialAggregatePushdown {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        plan.transform_down(|node| {
+            Ok(match push_partial(&node)? {
+                Some(pushed) => Transformed::yes(pushed),
+                None => Transformed::no(node),
+            })
+        })
+        .data()
+    }
+
+    fn name(&self) -> &str {
+        "plimsoll_partial_aggregate_pushdown"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+fn push_partial(node: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let Some(agg) = node.as_ref().downcast_ref::<AggregateExec>() else {
+        return Ok(None);
+    };
+    if *agg.mode() != AggregateMode::Partial
+        || !agg.group_expr().is_single()
+        || agg.filter_expr().iter().any(Option::is_some)
+    {
+        return Ok(None);
+    }
+    let column = |e: &Arc<dyn datafusion::physical_expr::PhysicalExpr>| {
+        e.as_ref()
+            .downcast_ref::<Column>()
+            .map(|c| c.name().to_owned())
+    };
+    let mut group_by = Vec::new();
+    for (e, _) in agg.group_expr().expr() {
+        let Some(c) = column(e) else { return Ok(None) };
+        group_by.push(c);
+    }
+    let mut aggregates = Vec::new();
+    for a in agg.aggr_expr() {
+        let name = a.fun().name().to_lowercase();
+        if a.is_distinct() || !a.order_bys().is_empty() || a.ignore_nulls() {
+            return Ok(None);
+        }
+        let args = a.expressions();
+        let arg = match (name.as_str(), args.as_slice()) {
+            // count(*) is planned as count(<non-null literal>).
+            ("count", [e])
+                if e.as_ref()
+                    .downcast_ref::<Literal>()
+                    .is_some_and(|l| !l.value().is_null()) =>
+            {
+                None
+            }
+            ("count" | "sum" | "min" | "max", [e]) => match column(e) {
+                Some(c) => Some(c),
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        aggregates.push((name, arg));
+    }
+    // Down to the remote scan through pass-through nodes only (the
+    // optimizer may put a repartition on either side of the accounting).
+    let pass = |mut p: Arc<dyn ExecutionPlan>| loop {
+        if !matches!(p.name(), "RepartitionExec" | "CoalesceBatchesExec") {
+            return Some(p);
+        }
+        p = p.children().first().map(|c| (*c).clone())?;
+    };
+    let Some(input) = pass(agg.input().clone()) else {
+        return Ok(None);
+    };
+    let Some(accounted) = input.as_ref().downcast_ref::<AccountedExec>() else {
+        return Ok(None);
+    };
+    let Some(below) = accounted
+        .children()
+        .first()
+        .map(|c| (*c).clone())
+        .and_then(pass)
+    else {
+        return Ok(None);
+    };
+    let Some(remote) = below.as_ref().downcast_ref::<RemoteScanExec>() else {
+        return Ok(None);
+    };
+    let spec = AggregateSpec {
+        group_by,
+        aggregates,
+    };
+    let pushed = remote.with_aggregate(spec, agg.schema());
+    Ok(Some(Arc::new(AccountedExec::new(
+        "RemoteAggregate",
+        Arc::new(pushed),
+    ))))
 }
 
 /// A fragment request's failure, and whether another worker may be tried.
@@ -493,7 +694,21 @@ fn decode(
     stream::unfold(state, |mut st| async move {
         loop {
             if let Some(batch) = st.ready.pop_front() {
-                let batch = RecordBatch::try_new(st.schema.clone(), batch.columns().to_vec())
+                // The coordinator's names and types: partial states come
+                // back as the worker's SQL typed them (ADR 0061).
+                let batch = batch
+                    .columns()
+                    .iter()
+                    .zip(st.schema.fields())
+                    .map(|(c, f)| {
+                        if c.data_type() == f.data_type() {
+                            Ok(c.clone())
+                        } else {
+                            datafusion::arrow::compute::cast(c, f.data_type())
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .and_then(|cols| RecordBatch::try_new(st.schema.clone(), cols))
                     .map_err(DataFusionError::from);
                 return Some((batch, st));
             }
@@ -557,6 +772,10 @@ mod tests {
             snapshot_id: Some(42),
             files: vec!["s3://b/t/data/a.parquet".into()],
             columns: vec!["id".into()],
+            aggregate: Some(AggregateSpec {
+                group_by: vec!["re\"gion".into()],
+                aggregates: vec![("count".into(), None), ("sum".into(), Some("id".into()))],
+            }),
         };
         assert_eq!(Fragment::from_json(&f.to_json()).unwrap(), f);
         assert!(Fragment::from_json(&json!({"files": []})).is_err());

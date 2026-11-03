@@ -61,6 +61,18 @@ async fn worker_with(groups: std::collections::HashMap<String, Limits>) -> (Stri
     (url, state)
 }
 
+/// Makes `engine` a coordinator, as `main` does (ADR 0058, 0061).
+fn coordinate(engine: &Engine, workers: Workers) {
+    use plimsoll_core::datafusion::execution::session_state::SessionStateBuilder;
+    let mut state = SessionStateBuilder::new_from_existing(engine.context().state())
+        .with_physical_optimizer_rule(Arc::new(
+            plimsoll_connectors::remote::PartialAggregatePushdown,
+        ))
+        .build();
+    state.config_mut().set_extension(Arc::new(workers));
+    *engine.context().state_ref().write() = state;
+}
+
 /// A query's result as text, and the plan's text.
 async fn run(engine: &Engine, sql: &str) -> (String, String) {
     let df = engine.context().sql(sql).await.unwrap();
@@ -89,12 +101,7 @@ async fn distributed_scans_match_local_ones() {
         let pool = Arc::new(CeilingPool::new(256 << 20, 8 << 20).unwrap());
         let e = Engine::new(pool, None).unwrap();
         if distributed {
-            let w = Workers::new(urls.clone(), TOKEN.into()).unwrap();
-            e.context()
-                .state_ref()
-                .write()
-                .config_mut()
-                .set_extension(Arc::new(w));
+            coordinate(&e, Workers::new(urls.clone(), TOKEN.into()).unwrap());
         }
         e
     };
@@ -108,15 +115,42 @@ async fn distributed_scans_match_local_ones() {
                 .unwrap();
         }
         let t = name.to_lowercase();
-        for sql in [
-            format!("SELECT count(*), sum(id) FROM {t}"),
-            format!("SELECT id FROM {t} WHERE id % 7 = 1 ORDER BY id"),
-            format!("SELECT max(id), min(id) FROM {t}"),
+        let group = if *name == "EQ" { "region" } else { "name" };
+        for (sql, pushed) in [
+            (format!("SELECT count(*), sum(id) FROM {t}"), true),
+            (
+                format!("SELECT id FROM {t} WHERE id % 7 = 1 ORDER BY id"),
+                false,
+            ),
+            (format!("SELECT max(id), min(id) FROM {t}"), true),
+            // Partial aggregation on workers (ADR 0061), grouped and with
+            // a count over a nullable column.
+            (
+                format!(
+                    "SELECT {group}, count(*), count({group}), sum(id), min(id), max(id) \
+                     FROM {t} GROUP BY {group} ORDER BY {group}"
+                ),
+                true,
+            ),
+            // Not pushed: a filter above the scan, an expression key. (DataFusion
+            // plans count(DISTINCT id) as GROUP BY id under a count: that
+            // inner grouping is pushed, workers return their distinct ids
+            // and the coordinator dedups.)
+            (
+                format!("SELECT count(*), sum(id) FROM {t} WHERE id > 3"),
+                false,
+            ),
+            (format!("SELECT count(DISTINCT id) FROM {t}"), true),
+            (
+                format!("SELECT id % 3, count(*) FROM {t} GROUP BY id % 3 ORDER BY 1"),
+                false,
+            ),
         ] {
             let (want, plan) = run(&local, &sql).await;
             assert!(!plan.contains("RemoteScanExec"), "{plan}");
             let (got, plan) = run(&coordinator, &sql).await;
             assert!(plan.contains("RemoteScanExec"), "{sql}: {plan}");
+            assert_eq!(plan.contains("aggregate=["), pushed, "{sql}: {plan}");
             assert_eq!(got, want, "{sql}");
         }
     }

@@ -13,6 +13,7 @@ use plimsoll_control::catalog::CatalogConfig;
 use plimsoll_control::governance::{Admission, QueryRegistry};
 
 use plimsoll_control::rest::RestCatalog;
+use plimsoll_core::datafusion::execution::session_state::SessionStateBuilder;
 use plimsoll_core::engine::Engine;
 use plimsoll_core::memory::CeilingPool;
 use plimsoll_server::app::{self, AppState};
@@ -80,12 +81,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             cfg.workers.clone(),
             token.clone(),
         )?);
-        engine
-            .context()
-            .state_ref()
-            .write()
-            .config_mut()
-            .set_extension(workers.clone());
+        {
+            // count/sum/min/max partials computed on workers (ADR 0061),
+            // appended after DataFusion's own physical rules.
+            let mut state = SessionStateBuilder::new_from_existing(engine.context().state())
+                .with_physical_optimizer_rule(Arc::new(
+                    plimsoll_connectors::remote::PartialAggregatePushdown,
+                ))
+                .build();
+            state.config_mut().set_extension(workers.clone());
+            *engine.context().state_ref().write() = state;
+        }
         // Fragments only go to workers whose /readyz answers (ADR 0059): a
         // draining or dead worker drops out within one interval.
         tokio::spawn(async move {

@@ -227,6 +227,45 @@ impl QueryEngine for CoreEngine {
         .await
         .map_err(|e| fail(e.into()))?;
         let table = connector.source();
+        // Partial aggregation (ADR 0061), built on the provider directly
+        // (`read_table`): no SQL, and nothing registered in the catalog
+        // the worker's users share.
+        if let Some(spec) = &f.aggregate {
+            use plimsoll_core::datafusion::functions_aggregate::expr_fn::{count, max, min, sum};
+            use plimsoll_core::datafusion::prelude::{SessionContext, ident, lit};
+            let ctx = SessionContext::new_with_state(state);
+            let df = ctx.read_table(table).map_err(fail)?;
+            let groups = spec.group_by.iter().map(ident).collect::<Vec<_>>();
+            let aggregates = spec
+                .aggregates
+                .iter()
+                .enumerate()
+                .map(|(i, (f, c))| {
+                    let arg = || {
+                        c.as_deref()
+                            .map(ident)
+                            .ok_or_else(|| EngineError::InvalidQuery(format!("{f} needs a column")))
+                    };
+                    let e = match f.as_str() {
+                        "count" => match c {
+                            None => count(lit(1)),
+                            Some(_) => count(arg()?),
+                        },
+                        "sum" => sum(arg()?),
+                        "min" => min(arg()?),
+                        "max" => max(arg()?),
+                        other => {
+                            return Err(EngineError::InvalidQuery(format!(
+                                "aggregate {other} is not partial-safe"
+                            )));
+                        }
+                    };
+                    Ok(e.alias(format!("a{i}")))
+                })
+                .collect::<Result<Vec<_>, EngineError>>()?;
+            let df = df.aggregate(groups, aggregates).map_err(fail)?;
+            return df.execute_stream().await.map_err(fail);
+        }
         let schema = table.schema();
         let projection = f
             .columns
