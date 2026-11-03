@@ -201,14 +201,7 @@ impl IcebergConnector {
         let task = state.task_ctx();
         let probed = merge::probe(&sink, &targets, &index, &merge, &task).await?;
         let mut written = probed.files;
-        if !probed.new_rows.is_empty() {
-            let rows = datafusion::physical_plan::memory::MemoryStream::try_new(
-                probed.new_rows,
-                sink.schema_ref(),
-                None,
-            )?;
-            written.extend(sink.write_rows(Box::pin(rows), &task).await?);
-        }
+        written.extend(merge::write_new_rows(&sink, probed.new_rows, &task).await?);
         let mut out: Vec<Json> = written.iter().map(write::Written::to_json).collect();
         let matched: Vec<usize> = (0..probed.matched.len())
             .filter(|i| probed.matched[*i])
@@ -521,6 +514,9 @@ struct DataFile {
     partition: Option<Avro>,
     /// Indices into the planned equality delete sets that apply to this file.
     eq: Vec<usize>,
+    /// v3: the row id of the file's first row, explicit or inherited from
+    /// its manifest (ADR 0096). `None`: no row lineage.
+    first_row_id: Option<i64>,
 }
 
 /// Keys deleted by one equality delete file (ADR 0016).
@@ -772,6 +768,7 @@ impl IcebergTable {
             let is_delete = long_field(&manifest, "content").unwrap_or(0) == 1;
             let manifest_seq = long_field(&manifest, "sequence_number").unwrap_or(0);
             let spec_id = long_field(&manifest, "partition_spec_id").unwrap_or(0);
+            let first_row_id = long_field(&manifest, "first_row_id");
             stats.manifests += 1;
             // Delete manifests prune like data manifests: a position delete
             // shares its data file's partition, so if no data file there can
@@ -784,7 +781,13 @@ impl IcebergTable {
                 }
             }
             stats.manifests_read += 1;
-            manifests.push((manifest_path, is_delete, manifest_seq, spec_id));
+            manifests.push((
+                manifest_path,
+                is_delete,
+                manifest_seq,
+                spec_id,
+                first_row_id,
+            ));
         }
         reservation.shrink(list_held);
 
@@ -794,18 +797,51 @@ impl IcebergTable {
         let mut deletes = Vec::new();
         let mut equality = Vec::new();
         let mut fetched = futures::stream::iter(manifests)
-            .map(|(path, is_delete, seq, spec)| {
+            .map(|(path, is_delete, seq, spec, first_row_id)| {
                 let load = &load;
                 async move {
                     let (bytes, held) = load(&path).await?;
-                    Ok::<_, DataFusionError>((path, is_delete, seq, spec, bytes, held))
+                    Ok::<_, DataFusionError>((
+                        path,
+                        is_delete,
+                        seq,
+                        spec,
+                        first_row_id,
+                        bytes,
+                        held,
+                    ))
                 }
             })
             .buffered(concurrency);
         while let Some(manifest) = fetched.next().await {
-            let (manifest_path, is_delete, manifest_seq, spec_id, manifest_bytes, held) = manifest?;
+            let (
+                manifest_path,
+                is_delete,
+                manifest_seq,
+                spec_id,
+                mut inherited,
+                manifest_bytes,
+                held,
+            ) = manifest?;
             for entry in avro_entries(&manifest_path, &manifest_bytes)? {
                 let entry = entry?;
+                // v3 row lineage (ADR 0096): a data file without its own first
+                // row id takes the next ones of its manifest's range, in entry
+                // order, every entry counted.
+                let first_row_id = match field(&entry, "data_file") {
+                    Some(file) if !is_delete => match long_field(file, "first_row_id") {
+                        Some(id) => Some(id),
+                        None => {
+                            let id = inherited;
+                            if let Some(first) = id {
+                                inherited =
+                                    Some(first + long_field(file, "record_count").unwrap_or(0));
+                            }
+                            id
+                        }
+                    },
+                    _ => None,
+                };
                 // status 2 = deleted in this snapshot.
                 if long_field(&entry, "status") == Some(2) {
                     continue;
@@ -923,6 +959,7 @@ impl IcebergTable {
                     spec: spec_id,
                     partition: field(file, "partition").cloned(),
                     eq: vec![],
+                    first_row_id,
                 });
             }
             reservation.shrink(held);
@@ -1168,7 +1205,6 @@ impl TableProvider for IcebergTable {
                     if let Some(name) = set.keys().next() {
                         return refuse(format!("no column {name}"));
                     }
-                    self.keeps_lineage("merge into (WHEN … THEN UPDATE)")?;
                     merge::Action::Update(row)
                 }
                 MergeIntoAction::Insert { columns, values } => {
@@ -1245,7 +1281,6 @@ impl TableProvider for IcebergTable {
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.keeps_lineage("update")?;
         let (exec, schema) = self.row_change("update", state, filters).await?;
         let mut set: HashMap<String, Expr> = HashMap::new();
         for (column, expr) in assignments {
@@ -1753,11 +1788,14 @@ impl IcebergTable {
                 spec: file.spec,
                 partition: None,
                 eq: Vec::new(),
+                first_row_id: file.first_row_id,
             };
             let plan = self.parquet_scan(state, &[&whole], None, &[], None).await?;
             targets.push(write::Target {
                 path: file.path,
                 size: file.size,
+                first_row_id: file.first_row_id,
+                seq: file.seq,
                 spec: file.spec,
                 partition: prune::partition_values(file.partition.as_ref()),
                 selection: file.selection,
@@ -1765,21 +1803,6 @@ impl IcebergTable {
             });
         }
         Ok((sink, targets, predicate, schema))
-    }
-
-    /// Writes that rewrite existing rows (`UPDATE`, a merge's update,
-    /// compaction) are refused on v3 tables (ADR 0095): their rows must
-    /// keep their `_row_id` (row lineage), which Plimsoll does not carry
-    /// into rewritten files yet. Appends and deletes are fine.
-    fn keeps_lineage(&self, verb: &str) -> Result<()> {
-        match &self.layout {
-            Ok(layout) if layout.version() >= 3 => Err(DataFusionError::Plan(format!(
-                "cannot {verb} {}: rewriting rows of a format v3 table would lose their row \
-                 lineage, which is not supported yet (appends and DELETE are)",
-                self.name
-            ))),
-            _ => Ok(()),
-        }
     }
 
     /// `exec` run on the workers (ADR 0093): its target files split into
@@ -1857,14 +1880,19 @@ impl IcebergTable {
     /// has a file carrying deletes (position, deletion vector or
     /// equality), or two small files; its other files stay.
     async fn compact(&self, state: &dyn Session) -> Result<Compaction> {
-        self.keeps_lineage("compact")?;
         let sink = self.writable("compact")?;
+        let v3 = sink.layout.version() >= 3;
         self.register_scoped(state);
         let mut planner = self.clone();
         planner.keep_empty = true;
         let (files, _, _) = planner.data_files(state, &Pruner::default()).await?;
         let mut groups: BTreeMap<String, (bool, Vec<String>)> = BTreeMap::new();
         for file in files {
+            // v3 (ADR 0096): rows keep their ids through a rewrite, which is
+            // read by position; files with equality deletes are left alone.
+            if v3 && !file.eq.is_empty() {
+                continue;
+            }
             // A file under an older partition spec is rewritten into the
             // current one, alone if need be (ADR 0085).
             let deletes = file.selection.is_some()
@@ -1898,9 +1926,15 @@ impl IcebergTable {
         // The chosen files' live rows: the regular scan, deletes applied.
         let mut only = self.clone();
         only.only_files = Some(Arc::new(chosen.clone()));
-        let plan = only.scan(state, None, &[], None).await?;
         let task = state.task_ctx();
-        let rows = datafusion::physical_plan::execute_stream(plan, task.clone())?;
+        let rows = if v3 {
+            // With each row's lineage, as it was (ADR 0096).
+            let (sink, targets, _, _) = only.rows_with(sink.clone(), state, Vec::new()).await?;
+            sink.with_lineage(&targets, &task).await?
+        } else {
+            let plan = only.scan(state, None, &[], None).await?;
+            datafusion::physical_plan::execute_stream(plan, task.clone())?
+        };
         let (rows, written) = sink.replace(rows, &chosen, &task).await?;
         report.rows = rows;
         report.files_written = written;

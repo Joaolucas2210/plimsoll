@@ -646,16 +646,22 @@ impl IcebergSink {
             // types carry them in their child fields, hence the cast); a
             // NULL in a required column fails here.
             let batch = batch?;
+            // Rewritten rows bring their lineage columns along (ADR 0096).
+            let schema = if batch.num_columns() == self.schema.fields().len() + 2 {
+                self.lineage_schema()
+            } else {
+                self.schema.clone()
+            };
             let columns = batch
                 .columns()
                 .iter()
-                .zip(self.schema.fields())
+                .zip(schema.fields())
                 .map(|(c, f)| match c.data_type() == f.data_type() {
                     true => Ok(c.clone()),
                     false => datafusion::arrow::compute::cast(c, f.data_type()),
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            let batch = RecordBatch::try_new(self.schema.clone(), columns)?;
+            let batch = RecordBatch::try_new(schema.clone(), columns)?;
             if batch.num_rows() == 0 {
                 continue;
             }
@@ -668,7 +674,7 @@ impl IcebergSink {
                 let file = match open.entry(key.clone()) {
                     std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                     std::collections::hash_map::Entry::Vacant(e) => e.insert(Open {
-                        writer: ArrowWriter::try_new(Vec::new(), self.schema.clone(), None)?,
+                        writer: ArrowWriter::try_new(Vec::new(), schema.clone(), None)?,
                         rows: 0,
                         stats: vec![ColumnStats::default(); self.layout.columns.len()],
                     }),
@@ -936,6 +942,7 @@ impl IcebergSink {
                 let reader = apache_avro::Reader::new(list).map_err(|e| failed(e.to_string()))?;
                 for (n, entry) in reader.enumerate() {
                     let entry = entry.map_err(|e| failed(e.to_string()))?;
+                    let first_row_id = field(&entry, "first_row_id").map(strip).and_then(long);
                     let (Some(Avro::String(path)), Some(seq)) = (
                         field(&entry, "manifest_path").map(strip),
                         field(&entry, "sequence_number").map(strip).and_then(long),
@@ -945,9 +952,15 @@ impl IcebergSink {
                     let bytes = read_env(path, env, self.scoped.as_ref())
                         .await
                         .map_err(DataFusionError::from)?;
-                    let Some((copy, counts)) =
-                        rewrite_manifest(&bytes, removed_or_none, &deletes_of, seq, snapshot_id)
-                            .map_err(|e| failed(format!("rewriting {path}: {e}")))?
+                    let Some((copy, counts)) = rewrite_manifest(
+                        &bytes,
+                        removed_or_none,
+                        &deletes_of,
+                        seq,
+                        snapshot_id,
+                        first_row_id,
+                    )
+                    .map_err(|e| failed(format!("rewriting {path}: {e}")))?
                     else {
                         continue;
                     };
@@ -1137,6 +1150,11 @@ pub(super) struct Target {
     pub(super) path: String,
     /// Bytes, for assigning targets to workers (ADR 0093).
     pub(super) size: Option<u64>,
+    /// v3 row lineage (ADR 0096): the id of the file's first row, and its
+    /// data sequence number (what its rows were last updated at, unless the
+    /// file says otherwise).
+    pub(super) first_row_id: Option<i64>,
+    pub(super) seq: i64,
     /// The data file's partition spec and its partition in it: its
     /// position deletes go there (ADR 0085).
     pub(super) spec: i64,
@@ -1146,6 +1164,49 @@ pub(super) struct Target {
     /// A scan of this file alone: one partition, no row selection, no
     /// pushed predicate.
     pub(super) plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+}
+
+/// Iceberg's reserved field ids of the row lineage columns (v3, ADR 0096).
+pub(super) const ROW_ID: i64 = 2_147_483_540;
+pub(super) const LAST_UPDATED: i64 = 2_147_483_539;
+
+/// A target file's row lineage (ADR 0096): what each row's `_row_id` and
+/// `_last_updated_sequence_number` are, from the file's own columns where
+/// it has them (files rewritten before), inherited otherwise.
+pub(super) struct Lineage {
+    first_row_id: Option<i64>,
+    seq: i64,
+    row_ids: Option<datafusion::arrow::array::Int64Array>,
+    seqs: Option<datafusion::arrow::array::Int64Array>,
+}
+
+impl Lineage {
+    pub(super) fn row_id(&self, pos: u64) -> Option<i64> {
+        let i = usize::try_from(pos).ok()?;
+        match &self.row_ids {
+            Some(ids) if i < ids.len() && ids.is_valid(i) => Some(ids.value(i)),
+            _ => self.first_row_id.map(|id| id + pos as i64),
+        }
+    }
+
+    pub(super) fn seq(&self, pos: u64) -> Option<i64> {
+        let i = usize::try_from(pos).ok();
+        match (&self.seqs, i) {
+            (Some(seqs), Some(i)) if i < seqs.len() && seqs.is_valid(i) => Some(seqs.value(i)),
+            _ => Some(self.seq),
+        }
+    }
+}
+
+/// The two lineage columns, as rewritten rows carry them after the table's
+/// columns: each row's id and, for an update, NULL (the commit's sequence
+/// number), or for compaction the sequence number it had.
+pub(super) fn lineage_columns(ids: Vec<Option<i64>>, seqs: Vec<Option<i64>>) -> [ArrayRef; 2] {
+    use datafusion::arrow::array::Int64Array;
+    [
+        Arc::new(Int64Array::from(ids)),
+        Arc::new(Int64Array::from(seqs)),
+    ]
 }
 
 /// Iceberg's reserved field ids of a position delete file's columns.
@@ -1388,12 +1449,18 @@ impl IcebergSink {
         for target in targets {
             let kept = target.selection.as_ref().map(kept_ranges);
             let mut range = 0;
+            // v3 (ADR 0096): an updated row keeps its id.
+            let lineage = match update {
+                Some(_) => self.lineage(target, &env).await?,
+                None => None,
+            };
             let mut stream = target.plan.execute(0, context.clone())?;
             let mut offset = 0u64;
             let mut positions: Vec<i64> = Vec::new();
             while let Some(batch) = stream.next().await {
                 let batch = batch?;
                 let n = batch.num_rows();
+                let first = positions.len();
                 let mask = predicate.evaluate(&batch)?.into_array(n)?;
                 let mask = mask.as_boolean_opt().ok_or_else(|| {
                     DataFusionError::Plan("DELETE predicate is not boolean".into())
@@ -1427,7 +1494,21 @@ impl IcebergSink {
                                 Ok(datafusion::arrow::compute::cast(&value, field.data_type())?)
                             })
                             .collect::<Result<Vec<_>>>()?;
-                        let rows = RecordBatch::try_new(self.schema.clone(), columns)?;
+                        let rows = match &lineage {
+                            None => RecordBatch::try_new(self.schema.clone(), columns)?,
+                            Some(lineage) => {
+                                // The rows' ids; NULL sequence numbers: they
+                                // are updated by this commit.
+                                let ids = positions[first..]
+                                    .iter()
+                                    .map(|p| lineage.row_id(*p as u64))
+                                    .collect::<Vec<_>>();
+                                let seqs = vec![None; ids.len()];
+                                let mut columns = columns;
+                                columns.extend(lineage_columns(ids, seqs));
+                                RecordBatch::try_new(self.lineage_schema(), columns)?
+                            }
+                        };
                         memory.try_grow(rows.get_array_memory_size())?;
                         changed.push(rows);
                     }
@@ -1444,15 +1525,161 @@ impl IcebergSink {
             return Ok(written);
         }
         if update.is_some() {
-            let rows = datafusion::physical_plan::memory::MemoryStream::try_new(
-                changed,
-                self.schema.clone(),
-                None,
-            )?;
+            let schema = changed.first().map_or(self.schema.clone(), |b| b.schema());
+            let rows =
+                datafusion::physical_plan::memory::MemoryStream::try_new(changed, schema, None)?;
             written.extend(self.write_rows(Box::pin(rows), context).await?);
         }
         memory.resize(0);
         Ok(written)
+    }
+
+    /// `target`'s row lineage (ADR 0096); `None` for v2 tables.
+    pub(super) async fn lineage(
+        &self,
+        target: &Target,
+        env: &datafusion::execution::runtime_env::RuntimeEnv,
+    ) -> Result<Option<Lineage>> {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::parquet::arrow::ProjectionMask;
+        // ponytail: deprecated in parquet 59 in favour of a hand-written
+        // `AsyncFileReader`; it still reads just the footer and two columns.
+        #[allow(deprecated)]
+        use datafusion::parquet::arrow::async_reader::ParquetObjectReader;
+        use datafusion::parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+        if self.layout.version < 3 {
+            return Ok(None);
+        }
+        let url = ListingTableUrl::parse(&target.path)?;
+        let store = env.object_store(store_url(&url, self.scoped.as_ref()))?;
+        #[allow(deprecated)]
+        let reader = ParquetObjectReader::new(store, url.prefix().clone());
+        let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+        // The lineage columns, if a writer before us materialized them.
+        let wanted: Vec<(usize, i64)> = builder
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| {
+                let id = super::field_ids::field_id(f)?;
+                (id == ROW_ID || id == LAST_UPDATED).then_some((i, id))
+            })
+            .collect();
+        let mut lineage = Lineage {
+            first_row_id: target.first_row_id,
+            seq: target.seq,
+            row_ids: None,
+            seqs: None,
+        };
+        if wanted.is_empty() {
+            return Ok(Some(lineage));
+        }
+        let mask = ProjectionMask::roots(builder.parquet_schema(), wanted.iter().map(|(i, _)| *i));
+        let batches: Vec<RecordBatch> = builder
+            .with_projection(mask)
+            .build()?
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<std::result::Result<_, _>>()?;
+        let Some(first) = batches.first() else {
+            return Ok(Some(lineage));
+        };
+        let batch = datafusion::arrow::compute::concat_batches(&first.schema(), &batches)?;
+        for (column, field) in batch.columns().iter().zip(batch.schema().fields()) {
+            let values = datafusion::arrow::compute::cast(column, &DataType::Int64)?;
+            let values = values
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .cloned()
+                .ok_or_else(|| DataFusionError::Internal("lineage column".into()))?;
+            match super::field_ids::field_id(field) {
+                Some(ROW_ID) => lineage.row_ids = Some(values),
+                Some(LAST_UPDATED) => lineage.seqs = Some(values),
+                _ => {}
+            }
+        }
+        Ok(Some(lineage))
+    }
+
+    /// The live rows of `targets` with their lineage columns, ids and
+    /// sequence numbers as they were: what a v3 compaction rewrites (ADR
+    /// 0096). ponytail: collected (reserved) before writing; stream per
+    /// file if partitions outgrow the pool.
+    pub(super) async fn with_lineage(
+        &self,
+        targets: &[Target],
+        context: &Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        use datafusion::arrow::array::BooleanArray;
+        let env = context.runtime_env();
+        let memory = MemoryConsumer::new(format!("IcebergCompact[{}]", self.name))
+            .register(context.memory_pool());
+        let schema = self.lineage_schema();
+        let mut out = Vec::new();
+        for target in targets {
+            let Some(lineage) = self.lineage(target, &env).await? else {
+                return Err(DataFusionError::Internal("lineage of a v2 table".into()));
+            };
+            let kept = target.selection.as_ref().map(kept_ranges);
+            let mut range = 0;
+            let mut offset = 0u64;
+            let mut stream = target.plan.execute(0, context.clone())?;
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                let n = batch.num_rows();
+                let live: Vec<bool> = (0..n)
+                    .map(|i| alive(kept.as_deref(), offset + i as u64, &mut range))
+                    .collect();
+                let positions: Vec<u64> = (0..n as u64)
+                    .filter(|i| live[*i as usize])
+                    .map(|i| offset + i)
+                    .collect();
+                offset += n as u64;
+                if positions.is_empty() {
+                    continue;
+                }
+                let rows = datafusion::arrow::compute::filter_record_batch(
+                    &batch,
+                    &BooleanArray::from(live),
+                )?;
+                let mut columns = rows
+                    .columns()
+                    .iter()
+                    .zip(self.schema.fields())
+                    .map(|(c, f)| datafusion::arrow::compute::cast(c, f.data_type()))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                columns.extend(lineage_columns(
+                    positions.iter().map(|p| lineage.row_id(*p)).collect(),
+                    positions.iter().map(|p| lineage.seq(*p)).collect(),
+                ));
+                let rows = RecordBatch::try_new(schema.clone(), columns)?;
+                memory.try_grow(rows.get_array_memory_size())?;
+                out.push(rows);
+            }
+        }
+        let stream = datafusion::physical_plan::memory::MemoryStream::try_new(out, schema, None)?;
+        Ok(Box::pin(stream))
+    }
+
+    /// The table's write schema with the lineage columns after its own
+    /// (ADR 0096), for rewritten rows.
+    pub(super) fn lineage_schema(&self) -> SchemaRef {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+        let field = |name: &str, id: i64| {
+            Arc::new(
+                Field::new(name, DataType::Int64, true).with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_owned(),
+                    id.to_string(),
+                )])),
+            )
+        };
+        let mut fields: Vec<_> = self.schema.fields().iter().cloned().collect();
+        fields.push(field("_row_id", ROW_ID));
+        fields.push(field("_last_updated_sequence_number", LAST_UPDATED));
+        Arc::new(Schema::new(fields))
     }
 
     /// The deletes of `positions` in `target`: a position delete file (v2),
@@ -2213,14 +2440,41 @@ fn rewrite_manifest(
     deletes_of: &std::collections::HashSet<String>,
     inherited: i64,
     snapshot_id: i64,
+    first_row_id: Option<i64>,
 ) -> std::result::Result<Option<(Vec<u8>, Counts)>, String> {
     let (schema_text, metadata) = read_header(bytes).ok_or("not an Avro container")?;
     let schema = avro_schema(&schema_text)?;
     let reader = apache_avro::Reader::new(bytes).map_err(|e| e.to_string())?;
     let mut entries = Vec::new();
     let mut counts = Counts::default();
+    // v3 (ADR 0096): data files inheriting their first row id get it written
+    // out, every entry counted as readers count them, so marking some
+    // DELETED (or dropping old DELETED ones) never shifts the others' ids.
+    let mut next_row_id = first_row_id;
     for entry in reader {
-        let entry = entry.map_err(|e| e.to_string())?;
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        if let (Some(next), Some(file)) = (next_row_id.as_mut(), field(&entry, "data_file")) {
+            let file = strip(file);
+            let data = field(file, "content")
+                .map(strip)
+                .and_then(long)
+                .unwrap_or(0)
+                == 0;
+            let own = field(file, "first_row_id").map(strip).and_then(long);
+            if data && own.is_none() {
+                let rows = field(file, "record_count")
+                    .map(strip)
+                    .and_then(long)
+                    .unwrap_or(0);
+                let id = *next;
+                *next += rows;
+                if let Avro::Record(fields) = &mut entry {
+                    if let Some((_, f)) = fields.iter_mut().find(|(n, _)| n == "data_file") {
+                        set(f, "first_row_id", Avro::Long(id));
+                    }
+                }
+            }
+        }
         if field(&entry, "status").map(strip).and_then(long) == Some(2) {
             continue;
         }
@@ -2536,6 +2790,89 @@ mod tests {
         assert!(matches!(carried, Avro::Array(p) if p.len() == 1));
     }
 
+    /// v3 (ADR 0096): a row's id and sequence number are the file's own
+    /// columns where it has them (non-null), inherited otherwise.
+    #[test]
+    fn lineage_prefers_written_columns() {
+        use datafusion::arrow::array::Int64Array;
+        let l = Lineage {
+            first_row_id: Some(100),
+            seq: 7,
+            row_ids: Some(Int64Array::from(vec![Some(5), None])),
+            seqs: Some(Int64Array::from(vec![None, Some(3)])),
+        };
+        assert_eq!((l.row_id(0), l.seq(0)), (Some(5), Some(7)));
+        assert_eq!((l.row_id(1), l.seq(1)), (Some(101), Some(3)));
+        assert_eq!((l.row_id(9), l.seq(9)), (Some(109), Some(7)));
+        let none = Lineage {
+            first_row_id: None,
+            seq: 1,
+            row_ids: None,
+            seqs: None,
+        };
+        assert_eq!(none.row_id(0), None, "a v2-era file has no ids");
+    }
+
+    /// v3 (ADR 0096): a rewritten manifest writes out the first row ids
+    /// its data files inherited, so removing one never shifts the others.
+    #[test]
+    fn rewritten_v3_manifests_keep_row_ids() {
+        let meta = table(3, json!([]), flat());
+        let layout = Layout::of(&meta).unwrap();
+        let file = |path: &str, rows: u64| Written {
+            path: path.into(),
+            rows,
+            bytes: 10,
+            partition: vec![],
+            stats: vec![],
+            content: 0,
+            referenced: None,
+            spec: 0,
+            dv: None,
+            added: rows,
+        };
+        let data = manifest(
+            &meta,
+            &layout,
+            &[&file("a", 3), &file("b", 4), &file("c", 5)],
+            7,
+            0,
+            0,
+        )
+        .unwrap();
+        let removed = std::collections::HashSet::from(["a".to_owned()]);
+        let (copy, _) = rewrite_manifest(&data, &removed, &Default::default(), 5, 9, Some(100))
+            .unwrap()
+            .unwrap();
+        let ids: Vec<Option<i64>> = apache_avro::Reader::new(&copy[..])
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                field(strip(field(&e, "data_file").unwrap()), "first_row_id")
+                    .map(strip)
+                    .and_then(long)
+            })
+            .collect();
+        // a (DELETED) 100..103, b 103..107, c 107..
+        assert_eq!(ids, [Some(100), Some(103), Some(107)]);
+        // Rewritten again without the DELETED entry: ids stay put.
+        let removed_b = std::collections::HashSet::from(["b".to_owned()]);
+        let (again, _) = rewrite_manifest(&copy, &removed_b, &Default::default(), 6, 10, Some(100))
+            .unwrap()
+            .unwrap();
+        let c = apache_avro::Reader::new(&again[..])
+            .unwrap()
+            .last()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            field(strip(field(&c, "data_file").unwrap()), "first_row_id")
+                .map(strip)
+                .and_then(long),
+            Some(107)
+        );
+    }
+
     #[test]
     fn rewritten_manifests_mark_replaced_files_and_their_deletes() {
         let meta = table(2, json!([]), flat());
@@ -2567,7 +2904,7 @@ mod tests {
         assert!(schema.contains(r#""logicalType":"map""#));
         assert!(metadata.contains(&("content".to_owned(), "data".to_owned())));
         let removed = std::collections::HashSet::from(["a".to_owned()]);
-        let (copy, counts) = rewrite_manifest(&data, &removed, &Default::default(), 5, 9)
+        let (copy, counts) = rewrite_manifest(&data, &removed, &Default::default(), 5, 9, None)
             .unwrap()
             .unwrap();
         assert_eq!((counts.deleted_files, counts.existing_files), (1, 1));
@@ -2589,7 +2926,7 @@ mod tests {
         );
         // Rewritten again: the earlier DELETED entry is dropped.
         let removed_b = std::collections::HashSet::from(["b".to_owned()]);
-        let (again, counts) = rewrite_manifest(&copy, &removed_b, &Default::default(), 6, 10)
+        let (again, counts) = rewrite_manifest(&copy, &removed_b, &Default::default(), 6, 10, None)
             .unwrap()
             .unwrap();
         assert_eq!((counts.deleted_files, counts.existing_files), (1, 0));
@@ -2605,14 +2942,14 @@ mod tests {
             1,
         )
         .unwrap();
-        let (_, counts) = rewrite_manifest(&deletes, &removed, &Default::default(), 5, 9)
+        let (_, counts) = rewrite_manifest(&deletes, &removed, &Default::default(), 5, 9, None)
             .unwrap()
             .unwrap();
         assert_eq!((counts.delete_files, counts.existing_files), (1, 1));
         assert!(counts.data_paths.is_empty());
         let none = std::collections::HashSet::from(["q".to_owned()]);
         assert!(
-            rewrite_manifest(&deletes, &none, &Default::default(), 5, 9)
+            rewrite_manifest(&deletes, &none, &Default::default(), 5, 9, None)
                 .unwrap()
                 .is_none()
         );

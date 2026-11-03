@@ -1129,12 +1129,23 @@ mod tests {
                 .metadata;
             assert_eq!(meta["next-row-id"], 10);
             assert_eq!(meta["snapshots"][0]["first-row-id"], 0);
+            // Rewrites keep row lineage (ADR 0096): UPDATE, a merge's update
+            // and compaction all run, and the rows come out right.
             assert!(
-                engine
-                    .sql(&format!("UPDATE {t3} SET id = 0 WHERE id = 3"))
+                text(&format!("UPDATE {t3} SET id = 30 WHERE id = 3"))
                     .await
-                    .is_err()
+                    .contains("| 1     |")
             );
+            text(&format!(
+                "MERGE INTO {t3} t USING (SELECT 4 AS id) s ON t.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET id = 40"
+            ))
+            .await;
+            let report = compact(engine.context(), &t3).await.unwrap();
+            assert!(report.files_rewritten > 0, "{report:?}");
+            let ids = text(&format!("SELECT sum(id) AS s, count(*) AS n FROM {t3}")).await;
+            // 5..10, 30 and 40: 45 + 70.
+            assert!(ids.contains("| 115 | 8 |"), "{ids}");
         })
         .await;
         // DROP TABLE (ADR 0089) cleans up: gone for queries, and a second

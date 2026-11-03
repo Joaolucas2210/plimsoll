@@ -275,12 +275,17 @@ fn holds(expr: Option<&Expr>, batch: &RecordBatch) -> Result<Vec<bool>> {
 
 /// Applies `clauses` (first match wins) to the rows of `batch`: positions
 /// (of `rows`, parallel to the batch) to delete, and new target rows.
+///
+/// With `lineage` (v3, ADR 0096), the target rows' ids, parallel to the
+/// batch: updated rows keep theirs, written with the lineage columns in
+/// `lineage_schema`.
 fn apply(
     clauses: &[Clause],
     batch: &RecordBatch,
     target: &SchemaRef,
     deleted: &mut Vec<usize>,
     written: &mut Vec<RecordBatch>,
+    lineage: Option<(&[Option<i64>], &SchemaRef)>,
 ) -> Result<u64> {
     let mut decided = vec![false; batch.num_rows()];
     let mut changed = 0;
@@ -308,12 +313,20 @@ fn apply(
                     batch,
                     &BooleanArray::from(pick),
                 )?;
-                let columns = row
+                let mut columns = row
                     .iter()
                     .zip(target.fields())
                     .map(|(e, f)| Ok(cast(&evaluate(e, &rows)?, f.data_type())?))
                     .collect::<Result<Vec<_>>>()?;
-                written.push(RecordBatch::try_new(target.clone(), columns)?);
+                match (&clause.action, lineage) {
+                    (Action::Update(_), Some((ids, schema))) => {
+                        let ids: Vec<Option<i64>> = chosen.iter().map(|&i| ids[i]).collect();
+                        let seqs = vec![None; ids.len()];
+                        columns.extend(super::write::lineage_columns(ids, seqs));
+                        written.push(RecordBatch::try_new(schema.clone(), columns)?);
+                    }
+                    _ => written.push(RecordBatch::try_new(target.clone(), columns)?),
+                }
             }
         }
     }
@@ -629,9 +642,11 @@ pub(super) async fn probe(
     let mut files = Vec::new();
     let mut new_rows: Vec<RecordBatch> = Vec::new();
     let mut changed = 0u64;
+    let lineage_schema = sink.lineage_schema();
     for target in targets {
         let kept = target.selection.as_ref().map(super::write::kept_ranges);
         let mut range = 0;
+        let lineage = sink.lineage(target, &env).await?;
         let mut stream = target.plan.execute(0, context.clone())?;
         let mut offset = 0u64;
         let mut positions: Vec<i64> = Vec::new();
@@ -694,12 +709,19 @@ pub(super) async fn probe(
                     &BooleanArray::from(mask),
                 )?;
                 let mut deleted = Vec::new();
+                let ids: Option<Vec<Option<i64>>> = lineage.as_ref().map(|l| {
+                    kept_pairs
+                        .iter()
+                        .map(|&k| l.row_id(offset + u64::from(t[k])))
+                        .collect()
+                });
                 changed += apply(
                     &merge.matched,
                     &matched_pairs,
                     &target_schema,
                     &mut deleted,
                     &mut new_rows,
+                    ids.as_deref().map(|ids| (ids, &lineage_schema)),
                 )?;
                 positions.extend(
                     deleted
@@ -722,12 +744,18 @@ pub(super) async fn probe(
                         lone.len(),
                     )?;
                     let mut deleted = Vec::new();
+                    let ids: Option<Vec<Option<i64>>> = lineage.as_ref().map(|l| {
+                        lone.iter()
+                            .map(|&i| l.row_id(offset + u64::from(i)))
+                            .collect()
+                    });
                     changed += apply(
                         &merge.not_matched_by_source,
                         &rows,
                         &target_schema,
                         &mut deleted,
                         &mut new_rows,
+                        ids.as_deref().map(|ids| (ids, &lineage_schema)),
                     )?;
                     positions.extend(
                         deleted
@@ -790,6 +818,7 @@ pub(super) fn not_matched(
         &sink.schema_ref(),
         &mut deleted,
         new_rows,
+        None,
     )
 }
 
@@ -800,15 +829,29 @@ pub(super) async fn finish(
     new_rows: Vec<RecordBatch>,
     context: &Arc<TaskContext>,
 ) -> Result<()> {
-    if !new_rows.is_empty() {
-        let rows = datafusion::physical_plan::memory::MemoryStream::try_new(
-            new_rows,
-            sink.schema_ref(),
-            None,
-        )?;
+    files.extend(write_new_rows(sink, new_rows, context).await?);
+    sink.commit_overwrite(&files, &context.runtime_env()).await
+}
+
+/// `rows` written: inserted rows, and updated ones with their lineage
+/// columns (ADR 0096), each in files of their own shape.
+pub(super) async fn write_new_rows(
+    sink: &IcebergSink,
+    rows: Vec<RecordBatch>,
+    context: &Arc<TaskContext>,
+) -> Result<Vec<Written>> {
+    let (kept, plain): (Vec<_>, Vec<_>) = rows
+        .into_iter()
+        .partition(|b| b.num_columns() > sink.schema_ref().fields().len());
+    let mut files = Vec::new();
+    for (batches, schema) in [(plain, sink.schema_ref()), (kept, sink.lineage_schema())] {
+        if batches.is_empty() {
+            continue;
+        }
+        let rows = datafusion::physical_plan::memory::MemoryStream::try_new(batches, schema, None)?;
         files.extend(sink.write_rows(Box::pin(rows), context).await?);
     }
-    sink.commit_overwrite(&files, &context.runtime_env()).await
+    Ok(files)
 }
 
 /// The rows of `batch` at `indices`, in that order.

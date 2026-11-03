@@ -1,6 +1,6 @@
 # ADR 0095 — Writes to format v3 tables
 
-- Status: Accepted
+- Status: Accepted (amended by ADR 0096: UPDATE, merge-update and compaction now keep row lineage and are allowed)
 - Date: 2026-11-03
 - Owner: JoaoLucas2210
 - Related: ADR 0017 (v3 reads, deletion vectors), ADR 0075–0083 (writes, CREATE TABLE), ADR 0091–0094 (writes on workers)
