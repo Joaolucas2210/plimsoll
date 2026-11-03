@@ -102,10 +102,27 @@ async fn distributed_scans_match_local_ones() {
         let e = Engine::new(pool, None).unwrap();
         if distributed {
             coordinate(&e, Workers::new(urls.clone(), TOKEN.into()).unwrap());
+            // Fixture tables are tiny: without this every join would
+            // collect its build side instead of partitioning (ADR 0065).
+            let state = e.context().state_ref();
+            let mut state = state.write();
+            let optimizer = &mut state.config_mut().options_mut().optimizer;
+            optimizer.hash_join_single_partition_threshold = 0;
+            optimizer.hash_join_single_partition_threshold_rows = 0;
         }
         e
     };
     let (local, coordinator) = (engine(false), engine(true));
+    // Joins of two remote scans shuffle between workers (ADR 0065).
+    let joins_match = async |sql: &str| {
+        let (want, _) = run(&local, sql).await;
+        let (got, plan) = run(&coordinator, sql).await;
+        assert!(
+            plan.contains("shuffled") && plan.contains(" join"),
+            "{sql}: {plan}"
+        );
+        assert_eq!(got, want, "{sql}");
+    };
     for (name, location) in &tables {
         for e in [&local, &coordinator] {
             IcebergConnector::try_new(name.to_lowercase(), location, &e.context().state())
@@ -182,13 +199,16 @@ async fn distributed_scans_match_local_ones() {
             let (want, plan) = run(&local, &sql).await;
             assert!(!plan.contains("RemoteScanExec"), "{plan}");
             let (got, plan) = run(&coordinator, &sql).await;
-            assert!(plan.contains("RemoteScanExec"), "{sql}: {plan}");
-            assert_eq!(plan.contains("aggregate=["), pushed, "{sql}: {plan}");
+            assert!(plan.contains("Remote"), "{sql}: {plan}");
+            let on_workers = plan.contains("aggregate=[") || plan.contains("shuffled aggregate");
+            assert_eq!(on_workers, pushed, "{sql}: {plan}");
             assert_eq!(got, want, "{sql}");
             // Grouped aggregations over two fragments or more shuffle
-            // between workers (ADR 0064); count(DISTINCT) does not (its
-            // inner grouping feeds another aggregation).
-            let shuffles = pushed && sql.contains("GROUP BY") && !plan.contains("fragments=1 ");
+            // between workers (ADR 0064), count(DISTINCT)'s inner
+            // grouping too: a partial count above it is free to take any
+            // partitioning (ADR 0065).
+            let grouped = sql.contains("GROUP BY") || sql.contains("DISTINCT");
+            let shuffles = pushed && grouped && !plan.contains("fragments=1 ");
             assert_eq!(plan.contains(" shuffled"), shuffles, "{sql}: {plan}");
             if sql.contains("WHERE") {
                 // Applied by the scan, here and on the workers.
@@ -221,7 +241,50 @@ async fn distributed_scans_match_local_ones() {
         )
         .await;
         assert_eq!(filtered, reference);
+        for sql in [
+            format!(
+                "SELECT a.id, b.{group} FROM {t} a JOIN {t} b ON a.id = b.id ORDER BY a.id, b.{group}"
+            ),
+            // Outer, with a filtered side (filters travel, ADR 0062).
+            format!(
+                "SELECT a.id, b.id AS b FROM {t} a \
+                 LEFT JOIN (SELECT id FROM {t} WHERE id % 2 = 0) b ON a.id = b.id ORDER BY a.id"
+            ),
+            // Semi and anti joins.
+            format!(
+                "SELECT id FROM {t} WHERE id IN (SELECT id FROM {t} WHERE id % 3 = 0) ORDER BY id"
+            ),
+            format!(
+                "SELECT id FROM {t} a WHERE NOT EXISTS \
+                 (SELECT 1 FROM {t} b WHERE b.id = a.id AND b.id > 5) ORDER BY id"
+            ),
+        ] {
+            joins_match(&sql).await;
+        }
     }
+    // Across tables, and two keys.
+    if tables.len() > 1 {
+        let (a, b) = (tables[0].0.to_lowercase(), tables[1].0.to_lowercase());
+        joins_match(&format!(
+            "SELECT x.id, y.id AS y FROM {a} x FULL JOIN {b} y ON x.id = y.id ORDER BY x.id, y"
+        ))
+        .await;
+        joins_match(&format!(
+            "SELECT x.name, count(*) FROM {a} x JOIN {a} y ON x.id = y.id AND x.name = y.name \
+             GROUP BY x.name ORDER BY x.name"
+        ))
+        .await;
+    }
+    // Grouped by the join key: the final aggregation may rely on the
+    // join's partitioning, so the join must then stay as planned.
+    let (a, _) = &tables[0];
+    let keyed = format!(
+        "SELECT x.id, count(*) FROM {a} x JOIN {a} y ON x.id = y.id GROUP BY x.id ORDER BY x.id",
+        a = a.to_lowercase()
+    );
+    let (got, plan) = run(&coordinator, &keyed).await;
+    assert_eq!(got, run(&local, &keyed).await.0);
+    assert!(!plan.contains("shuffled"), "{plan}");
     // A worker that is down fails the query; it never returns less.
     let dead = Engine::new(Arc::new(CeilingPool::new(64 << 20, 0).unwrap()), None).unwrap();
     let w = Workers::new(vec!["http://127.0.0.1:9".into()], TOKEN.into()).unwrap();

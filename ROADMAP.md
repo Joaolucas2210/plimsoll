@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Join shuffle between workers: partitioned equi-joins of two remote scans hash both sides into buckets and join on workers (ADR 0065)
 - [x] Aggregation shuffle between workers: grouped partial states hash-partitioned, merged on workers, final rows to the coordinator (ADR 0064)
 - [x] Expression keys and arguments in worker aggregations (`GROUP BY id % 16`, `sum(price * qty)`), shipped as round-tripped SQL (ADR 0063)
 - [x] Row filters on workers: portable filters (SQL round trip) are exact, enforced by the scan locally and on workers; filtered aggregations pushed (ADR 0062)
@@ -97,8 +98,8 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Join shuffle across workers**: hash-partition both join sides by key
-between workers and join there (aggregations shuffle since ADR 0064);
+**Broadcast joins on workers**: ship a small build side to every worker
+(DataFusion's `CollectLeft` joins still pull rows to the coordinator), and
 spill shuffle buckets to local disk.
 
 ## Later

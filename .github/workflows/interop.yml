@@ -11,6 +11,9 @@ on:
       - "crates/plimsoll-connectors/src/iceberg*/**"
       - "crates/plimsoll-connectors/src/iceberg.rs"
       - "crates/plimsoll-connectors/tests/iceberg.rs"
+      # Distribution (ADR 0058–0065) is validated against the same tables.
+      - "crates/plimsoll-connectors/src/remote.rs"
+      - "crates/plimsoll-server/tests/distributed.rs"
       - "scripts/spark_mor_fixture.sh"
       - ".github/workflows/interop.yml"
   schedule:

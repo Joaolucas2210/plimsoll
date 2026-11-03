@@ -130,16 +130,69 @@ pub struct Bucket {
     pub map: usize,
     pub partitions: usize,
     pub index: usize,
+    /// Output columns hashed (by position): group keys or join keys.
+    pub keys: Vec<usize>,
 }
 
-/// A shuffle reduce (ADR 0064): fetch bucket `partition` of every map
-/// (aggregated fragments, each kept by the worker at its URL), merge the
-/// partial states and return final values for this bucket's groups.
+/// A shuffle reduce (ADR 0064, 0065): fetch bucket `partition` (of
+/// `partitions`) of every map, each kept by the worker at its URL. Without
+/// `join`, the maps are aggregated fragments: merge their partial states
+/// into final values. With it, the maps are the join's left side and
+/// `join.right` its right side: join the two buckets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reduce {
     pub shuffle: String,
     pub partition: usize,
+    pub partitions: usize,
     pub maps: Vec<(String, Fragment)>,
+    pub join: Option<JoinSpec>,
+}
+
+/// An equi-join of two shuffled sides, on columns of their fragments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinSpec {
+    /// `JoinType`'s name (`Inner`, `Left`, `LeftSemi`, …).
+    pub join_type: String,
+    pub right: Vec<(String, Fragment)>,
+    pub left_keys: Vec<String>,
+    pub right_keys: Vec<String>,
+    /// Output columns kept, by position in left ++ right.
+    pub projection: Option<Vec<usize>>,
+}
+
+fn maps_json(maps: &[(String, Fragment)]) -> Json {
+    maps.iter()
+        .map(|(url, f)| json!({"url": url, "fragment": f.to_json()}))
+        .collect()
+}
+
+fn maps_from_json(v: &Json, key: &str) -> Result<Vec<(String, Fragment)>, String> {
+    v.as_array()
+        .ok_or(format!("`{key}` must be an array"))?
+        .iter()
+        .map(|m| {
+            let url = m["url"].as_str().ok_or(format!("`{key}[].url`"))?;
+            Ok((url.to_owned(), Fragment::from_json(&m["fragment"])?))
+        })
+        .collect()
+}
+
+fn names(v: &Json, key: &str) -> Result<Vec<String>, String> {
+    v.as_array()
+        .ok_or(format!("`{key}` must be an array"))?
+        .iter()
+        .map(|s| {
+            s.as_str()
+                .map(str::to_owned)
+                .ok_or(format!("`{key}`: strings"))
+        })
+        .collect()
+}
+
+fn count(v: &Json, key: &str) -> Result<usize, String> {
+    v.as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or(format!("`{key}` must be a count"))
 }
 
 impl Reduce {
@@ -147,37 +200,60 @@ impl Reduce {
         json!({"reduce": {
             "shuffle": self.shuffle,
             "partition": self.partition,
-            "maps": self.maps.iter().map(|(url, f)| json!({"url": url, "fragment": f.to_json()})).collect::<Vec<_>>(),
+            "partitions": self.partitions,
+            "maps": maps_json(&self.maps),
+            "join": self.join.as_ref().map(|j| json!({
+                "join_type": j.join_type,
+                "right": maps_json(&j.right),
+                "left_keys": j.left_keys,
+                "right_keys": j.right_keys,
+                "projection": j.projection,
+            })),
         }})
     }
 
     pub fn from_json(v: &Json) -> Result<Self, String> {
         let r = &v["reduce"];
-        let maps = r["maps"]
-            .as_array()
-            .ok_or("`reduce.maps` must be an array")?
-            .iter()
-            .map(|m| {
-                let url = m["url"].as_str().ok_or("`reduce.maps[].url`")?.to_owned();
-                let fragment = Fragment::from_json(&m["fragment"])?;
-                if fragment.aggregate.is_none() {
-                    return Err("a shuffle map must aggregate".to_owned());
-                }
-                Ok((url, fragment))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let partition = r["partition"]
-            .as_u64()
-            .and_then(|p| usize::try_from(p).ok())
-            .filter(|p| *p < maps.len())
-            .ok_or("`reduce.partition` must index `maps`")?;
+        let maps = maps_from_json(&r["maps"], "reduce.maps")?;
+        let join = match &r["join"] {
+            Json::Null => None,
+            j => Some(JoinSpec {
+                join_type: j["join_type"]
+                    .as_str()
+                    .ok_or("`reduce.join.join_type` is required")?
+                    .to_owned(),
+                right: maps_from_json(&j["right"], "reduce.join.right")?,
+                left_keys: names(&j["left_keys"], "reduce.join.left_keys")?,
+                right_keys: names(&j["right_keys"], "reduce.join.right_keys")?,
+                projection: match &j["projection"] {
+                    Json::Null => None,
+                    p => Some(
+                        p.as_array()
+                            .ok_or("`reduce.join.projection` must be an array")?
+                            .iter()
+                            .map(|i| count(i, "reduce.join.projection[]"))
+                            .collect::<Result<_, _>>()?,
+                    ),
+                },
+            }),
+        };
+        if join.is_none() && maps.iter().any(|(_, f)| f.aggregate.is_none()) {
+            return Err("an aggregation shuffle's maps must aggregate".into());
+        }
+        let partitions = count(&r["partitions"], "reduce.partitions")?;
+        let partition = count(&r["partition"], "reduce.partition")?;
+        if partition >= partitions {
+            return Err("`reduce.partition` must be below `reduce.partitions`".into());
+        }
         Ok(Self {
             shuffle: r["shuffle"]
                 .as_str()
                 .ok_or("`reduce.shuffle` is required")?
                 .to_owned(),
             partition,
+            partitions,
             maps,
+            join,
         })
     }
 }
@@ -219,7 +295,7 @@ impl Fragment {
             "columns": self.columns,
             "filters": self.filters,
             "bucket": self.bucket.as_ref().map(|b| json!({
-                "shuffle": b.shuffle, "map": b.map, "partitions": b.partitions, "index": b.index,
+                "shuffle": b.shuffle, "map": b.map, "partitions": b.partitions, "index": b.index, "keys": b.keys,
             })),
             "aggregate": self.aggregate.as_ref().map(|a| json!({
                 "group_by": a.group_by,
@@ -294,6 +370,12 @@ impl Fragment {
                         map: n("map")?,
                         partitions,
                         index,
+                        keys: b["keys"]
+                            .as_array()
+                            .ok_or("`bucket.keys` must be an array")?
+                            .iter()
+                            .map(|k| count(k, "bucket.keys[]"))
+                            .collect::<Result<_, _>>()?,
                     })
                 }
             },
@@ -332,9 +414,6 @@ pub struct RemoteScanExec {
     urls: Vec<String>,
     /// In partition order.
     fragments: Vec<Assigned>,
-    /// Shuffle id (ADR 0064): partition `i` is reduce `i`, run by the
-    /// owner of fragment `i` over bucket `i` of every fragment.
-    shuffle: Option<String>,
     properties: Arc<PlanProperties>,
 }
 
@@ -402,7 +481,6 @@ impl RemoteScanExec {
             workers,
             urls: urls.to_vec(),
             fragments,
-            shuffle: None,
             properties,
         }
     }
@@ -428,10 +506,36 @@ impl RemoteScanExec {
     /// The same aggregated fragments, shuffled between their workers by
     /// group key and merged there (ADR 0064): each partition returns the
     /// final values, in `schema`, of the groups hashed to it.
-    pub fn with_shuffle(&self, shuffle: String, schema: SchemaRef) -> Self {
-        let mut out = self.with_schema(schema);
-        out.shuffle = Some(shuffle);
-        out
+    fn shuffled(&self, schema: SchemaRef) -> RemoteReduceExec {
+        let shuffle = shuffle_id();
+        let partitions = self.fragments.len();
+        let maps = self.maps();
+        let reduces = self
+            .fragments
+            .iter()
+            .enumerate()
+            .map(|(partition, a)| {
+                (
+                    self.urls[a.worker].clone(),
+                    Reduce {
+                        shuffle: shuffle.clone(),
+                        partition,
+                        partitions,
+                        maps: maps.clone(),
+                        join: None,
+                    },
+                )
+            })
+            .collect();
+        RemoteReduceExec::new(schema, self.workers.clone(), reduces, "aggregate".into())
+    }
+
+    /// (owner url, fragment) per fragment.
+    fn maps(&self) -> Vec<(String, Fragment)> {
+        self.fragments
+            .iter()
+            .map(|a| (self.urls[a.worker].clone(), a.fragment.clone()))
+            .collect()
     }
 
     fn with_schema(&self, schema: SchemaRef) -> Self {
@@ -446,7 +550,6 @@ impl RemoteScanExec {
             workers: self.workers.clone(),
             urls: self.urls.clone(),
             fragments: self.fragments.clone(),
-            shuffle: self.shuffle.clone(),
             properties,
         }
     }
@@ -490,13 +593,8 @@ impl DisplayAs for RemoteScanExec {
             });
         write!(
             f,
-            "RemoteScanExec: fragments={} files={files} bytes={bytes:?}{filters}{aggregate}{}",
+            "RemoteScanExec: fragments={} files={files} bytes={bytes:?}{filters}{aggregate}",
             self.fragments.len(),
-            if self.shuffle.is_some() {
-                " shuffled"
-            } else {
-                ""
-            }
         )
     }
 }
@@ -544,39 +642,141 @@ impl ExecutionPlan for RemoteScanExec {
                 stream::empty(),
             )));
         };
-        let (body, targets) = match &self.shuffle {
-            // A reduce is not retried elsewhere: its buckets are consumed
-            // when fetched (ADR 0064).
-            Some(shuffle) => (
-                Reduce {
-                    shuffle: shuffle.clone(),
-                    partition,
-                    maps: self
-                        .fragments
-                        .iter()
-                        .map(|a| (self.urls[a.worker].clone(), a.fragment.clone()))
-                        .collect(),
-                }
-                .to_json(),
-                vec![self.urls[assigned.worker].clone()],
-            ),
-            // The owner first, then one other healthy worker (ADR 0060).
-            None => {
-                let n = self.urls.len();
-                (
-                    assigned.fragment.to_json(),
-                    (0..n.min(2))
-                        .map(|i| self.urls[(assigned.worker + i) % n].clone())
-                        .collect(),
-                )
-            }
-        };
+        // The owner first, then one other healthy worker (ADR 0060).
+        let n = self.urls.len();
+        let body = assigned.fragment.to_json();
+        let targets = (0..n.min(2))
+            .map(|i| self.urls[(assigned.worker + i) % n].clone())
+            .collect();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema.clone(),
             with_retry(
                 self.workers.clone(),
                 targets,
                 Arc::new(body.to_string()),
+                tag,
+                schema,
+            ),
+        )))
+    }
+}
+
+/// A unique enough shuffle id: workers key their maps by it.
+fn shuffle_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    format!("{:016x}", h.finish())
+}
+
+/// One partition per shuffle reduce (ADR 0064, 0065), each posted to the
+/// worker that runs it. Not retried elsewhere: a reduce's buckets are
+/// consumed as they are fetched.
+#[derive(Debug)]
+pub struct RemoteReduceExec {
+    schema: SchemaRef,
+    workers: Arc<Workers>,
+    reduces: Vec<(String, Reduce)>,
+    /// What is reduced, for display: `aggregate` or the join type.
+    kind: String,
+    properties: Arc<PlanProperties>,
+}
+
+impl RemoteReduceExec {
+    fn new(
+        schema: SchemaRef,
+        workers: Arc<Workers>,
+        reduces: Vec<(String, Reduce)>,
+        kind: String,
+    ) -> Self {
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(reduces.len().max(1)),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Self {
+            schema,
+            workers,
+            reduces,
+            kind,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for RemoteReduceExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        let maps = self.reduces.first().map_or(0, |(_, r)| {
+            r.maps.len() + r.join.as_ref().map_or(0, |j| j.right.len())
+        });
+        let filters = self
+            .reduces
+            .first()
+            .and_then(|(_, r)| r.maps.first())
+            .filter(|(_, m)| !m.filters.is_empty())
+            .map_or(String::new(), |(_, m)| format!(" filters={:?}", m.filters));
+        write!(
+            f,
+            "RemoteReduceExec: shuffled {} partitions={} maps={maps}{filters}",
+            self.kind,
+            self.reduces.len()
+        )
+    }
+}
+
+impl ExecutionPlan for RemoteReduceExec {
+    fn name(&self) -> &str {
+        "RemoteReduceExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> Result<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        ctx: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let tag = ctx.session_config().get_extension::<QueryTag>();
+        let schema = self.schema.clone();
+        let Some((url, reduce)) = self.reduces.get(partition) else {
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                stream::empty(),
+            )));
+        };
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            with_retry(
+                self.workers.clone(),
+                vec![url.clone()],
+                Arc::new(reduce.to_json().to_string()),
                 tag,
                 schema,
             ),
@@ -684,26 +884,7 @@ fn partial_remote(
         };
         aggregates.push((name, arg));
     }
-    // Down to the remote scan through pass-through nodes only (the
-    // optimizer may put a repartition on either side of the accounting).
-    let pass = |mut p: Arc<dyn ExecutionPlan>| loop {
-        if !matches!(p.name(), "RepartitionExec" | "CoalesceBatchesExec") {
-            return Some(p);
-        }
-        p = p.children().first().map(|c| (*c).clone())?;
-    };
-    let Some(input) = pass(agg.input().clone()) else {
-        return Ok(None);
-    };
-    let Some(accounted) = input.as_ref().downcast_ref::<AccountedExec>() else {
-        return Ok(None);
-    };
-    let Some(below) = accounted
-        .children()
-        .first()
-        .map(|c| (*c).clone())
-        .and_then(pass)
-    else {
+    let Some(below) = remote_under(agg.input()) else {
         return Ok(None);
     };
     let Some(remote) = below.as_ref().downcast_ref::<RemoteScanExec>() else {
@@ -714,6 +895,23 @@ fn partial_remote(
         aggregates,
     };
     Ok(Some(remote.with_aggregate(spec, agg.schema())))
+}
+
+/// The [`RemoteScanExec`] under `input`, reached through pass-through
+/// nodes only (the optimizer may put a repartition on either side of the
+/// scan's accounting), so its rows are `input`'s rows.
+fn remote_under(input: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    let pass = |mut p: Arc<dyn ExecutionPlan>| loop {
+        if !matches!(p.name(), "RepartitionExec" | "CoalesceBatchesExec") {
+            return Some(p);
+        }
+        p = p.children().first().map(|c| (*c).clone())?;
+    };
+    let accounted = pass(input.clone())?;
+    accounted.as_ref().downcast_ref::<AccountedExec>()?;
+    let remote = pass(accounted.children().first().map(|c| (*c).clone())?)?;
+    remote.as_ref().downcast_ref::<RemoteScanExec>()?;
+    Some(remote)
 }
 
 /// Replaces a grouped final aggregation over a pushable partial one with
@@ -728,15 +926,19 @@ fn shuffle(
         if let Some(shuffled) = shuffle_final(&plan, config)? {
             return Ok(shuffled);
         }
+        if let Some(shuffled) = shuffle_join(&plan) {
+            return Ok(shuffled);
+        }
     }
-    // Children stay free below nodes that need no particular
-    // partitioning from them; joins, unions, windows, repartitions and
-    // aggregates are not among them.
+    // Children stay free below nodes that take any partitioning (they
+    // redistribute or gather it), and below nodes that keep their
+    // input's partitioning when they are free themselves. Joins, unions,
+    // windows and final aggregations depend on it.
     let free = matches!(
         plan.name(),
-        "CoalescePartitionsExec" | "SortPreservingMergeExec"
+        "CoalescePartitionsExec" | "SortPreservingMergeExec" | "RepartitionExec"
     ) || (free
-        && matches!(
+        && (matches!(
             plan.name(),
             "ProjectionExec"
                 | "SortExec"
@@ -745,13 +947,92 @@ fn shuffle(
                 | "CoalesceBatchesExec"
                 | "LocalLimitExec"
                 | "GlobalLimitExec"
-        ));
+        ) || plan
+            .as_ref()
+            .downcast_ref::<AggregateExec>()
+            .is_some_and(|a| *a.mode() == AggregateMode::Partial)));
     let children = plan
         .children()
         .into_iter()
         .map(|c| shuffle(c.clone(), free, config))
         .collect::<Result<Vec<_>>>()?;
     datafusion::physical_plan::replace_children_if_necessary(plan, children)
+}
+
+/// A partitioned equi-join of two remote scans, on columns of equal
+/// types, as a shuffle (ADR 0065): every scan fragment is a map hashed by
+/// its join keys into one bucket per healthy worker, and worker `j` joins
+/// bucket `j` of both sides. Equal key types hash equally, so matching
+/// rows meet on one worker.
+fn shuffle_join(node: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    use datafusion::common::{JoinType, NullEquality};
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+    let join = node.as_ref().downcast_ref::<HashJoinExec>()?;
+    // The worker runs the same join: no residual filter, no mark join,
+    // no null-equal keys.
+    if *join.partition_mode() != PartitionMode::Partitioned
+        || join.filter().is_some()
+        || join.null_equality() != NullEquality::NullEqualsNothing
+        || matches!(join.join_type(), JoinType::LeftMark | JoinType::RightMark)
+    {
+        return None;
+    }
+    let (l, r) = (remote_under(join.left())?, remote_under(join.right())?);
+    let left = l.as_ref().downcast_ref::<RemoteScanExec>()?;
+    let right = r.as_ref().downcast_ref::<RemoteScanExec>()?;
+    let plain = |s: &RemoteScanExec| {
+        !s.fragments.is_empty() && s.fragments.iter().all(|a| a.fragment.aggregate.is_none())
+    };
+    if !plain(left) || !plain(right) || left.urls.is_empty() {
+        return None;
+    }
+    let (ls, rs) = (join.left().schema(), join.right().schema());
+    let (mut left_keys, mut right_keys) = (Vec::new(), Vec::new());
+    for (a, b) in join.on() {
+        let a = a.as_ref().downcast_ref::<Column>()?;
+        let b = b.as_ref().downcast_ref::<Column>()?;
+        if ls.field(a.index()).data_type() != rs.field(b.index()).data_type() {
+            return None;
+        }
+        left_keys.push(a.name().to_owned());
+        right_keys.push(b.name().to_owned());
+    }
+    let spec = JoinSpec {
+        join_type: join.join_type().to_string(),
+        right: right.maps(),
+        left_keys,
+        right_keys,
+        projection: join.projection.as_ref().map(|p| p.to_vec()),
+    };
+    let (shuffle, partitions, maps) = (shuffle_id(), left.urls.len(), left.maps());
+    let reduces = left
+        .urls
+        .iter()
+        .enumerate()
+        .map(|(partition, url)| {
+            (
+                url.clone(),
+                Reduce {
+                    shuffle: shuffle.clone(),
+                    partition,
+                    partitions,
+                    maps: maps.clone(),
+                    join: Some(spec.clone()),
+                },
+            )
+        })
+        .collect();
+    let kind = format!("{} join", join.join_type());
+    Some(Arc::new(AccountedExec::new(
+        "RemoteJoin",
+        Arc::new(RemoteReduceExec::new(
+            join.schema(),
+            left.workers.clone(),
+            reduces,
+            kind,
+        )),
+    )))
 }
 
 fn shuffle_final(
@@ -788,19 +1069,9 @@ fn shuffle_final(
     {
         return Ok(None);
     }
-    let id = {
-        use std::hash::{BuildHasher, Hasher};
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u128(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos()),
-        );
-        format!("{:016x}", h.finish())
-    };
     let shuffled: Arc<dyn ExecutionPlan> = Arc::new(AccountedExec::new(
         "RemoteShuffle",
-        Arc::new(remote.with_shuffle(id, agg.schema())),
+        Arc::new(remote.shuffled(agg.schema())),
     ));
     // Same partition count as the node replaced when that was one.
     Ok(Some(
@@ -1130,6 +1401,7 @@ mod tests {
                 map: 1,
                 partitions: 2,
                 index: 0,
+                keys: vec![0],
             }),
         };
         assert_eq!(Fragment::from_json(&f.to_json()).unwrap(), f);
@@ -1139,18 +1411,37 @@ mod tests {
         newer["sample"] = json!(0.1);
         let e = Fragment::from_json(&newer).unwrap_err();
         assert!(e.contains("unknown fragment field `sample`"), "{e}");
-        let r = Reduce {
+        let mut r = Reduce {
             shuffle: "s1".into(),
             partition: 1,
+            partitions: 2,
             maps: vec![
                 ("http://w1".into(), f.clone()),
                 ("http://w2".into(), f.clone()),
             ],
+            join: None,
         };
         assert_eq!(
             Task::from_json(&r.to_json()).unwrap(),
             Task::Reduce(r.clone())
         );
+        let joined = Reduce {
+            join: Some(JoinSpec {
+                join_type: "LeftAnti".into(),
+                right: vec![("http://w2".into(), f.clone())],
+                left_keys: vec!["id".into()],
+                right_keys: vec!["re\"gion".into()],
+                projection: Some(vec![0]),
+            }),
+            ..r.clone()
+        };
+        assert_eq!(
+            Task::from_json(&joined.to_json()).unwrap(),
+            Task::Reduce(joined)
+        );
+        // Without a join, every map must aggregate.
+        r.maps[0].1.aggregate = None;
+        assert!(Task::from_json(&r.to_json()).is_err());
         assert_eq!(Task::from_json(&f.to_json()).unwrap(), Task::Scan(f));
         let mut bad = r.to_json();
         bad["reduce"]["partition"] = json!(2);
