@@ -1060,6 +1060,64 @@ async fn reads_reference_equality_deletes() {
         [4, 5]
     );
     assert_eq!(ids(&ctx, "SELECT count(*) FROM eq").await.unwrap(), [4]);
+    // `region` is an identity partition (ADR 0055): its filters are exact,
+    // so no FilterExec is left for them, and a count over region b (no
+    // deletes there) comes from manifests.
+    let plan_of = async |sql: &str| {
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string()
+    };
+    let plan = plan_of("SELECT id FROM eq WHERE region = 'b'").await;
+    assert!(!plan.contains("FilterExec"), "{plan}");
+    let plan = plan_of("SELECT count(*) FROM eq WHERE region = 'b'").await;
+    assert!(!plan.contains("IcebergScan"), "{plan}");
+    assert_eq!(
+        ids(&ctx, "SELECT count(*) FROM eq WHERE region = 'b'")
+            .await
+            .unwrap(),
+        [2]
+    );
+    // Mixed: the partition part is exact, the id part is still filtered.
+    let plan = plan_of("SELECT id FROM eq WHERE region = 'b' AND id > 4").await;
+    assert!(plan.contains("FilterExec"), "{plan}");
+    assert_eq!(
+        ids(&ctx, "SELECT id FROM eq WHERE region = 'b' AND id > 4")
+            .await
+            .unwrap(),
+        [5]
+    );
+    assert_eq!(
+        ids(
+            &ctx,
+            "SELECT id FROM eq WHERE region IN ('a', 'b') ORDER BY id"
+        )
+        .await
+        .unwrap(),
+        [2, 4, 5, 6]
+    );
+    assert_eq!(
+        ids(&ctx, "SELECT id FROM eq WHERE region IS NULL")
+            .await
+            .unwrap(),
+        Vec::<i64>::new()
+    );
+    // Region a has equality deletes: its count still scans.
+    let plan = plan_of("SELECT count(*) FROM eq WHERE region = 'a'").await;
+    assert!(plan.contains("IcebergScan"), "{plan}");
+    assert_eq!(
+        ids(&ctx, "SELECT count(*) FROM eq WHERE region = 'a'")
+            .await
+            .unwrap(),
+        [2]
+    );
     assert_eq!(pool.used(), 0);
 }
 

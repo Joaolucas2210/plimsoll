@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Exact identity-partition filters: decided per file, no `FilterExec`, partition-filtered `count(*)` from metadata (ADR 0055)
 - [x] `count(*)` from manifest record counts when exact (no deletes, filters or limit) (ADR 0054)
 - [x] Decimal pruning: unscaled `i128` bounds, exact literal rescaling, decimal bucket/truncate partitions (ADR 0053)
 - [x] `LIKE 'prefix%'` / `starts_with` prune as string ranges (ADR 0052)
@@ -87,11 +88,10 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Exact partition filters**: identity-partition predicates (`region =
-'eu'` on `PARTITIONED BY (region)`) are fully decided by manifest pruning,
-yet DataFusion re-applies them as a `FilterExec`. Report them as `Exact`
-pushdown so the filter is dropped, and `count(*) WHERE region = 'eu'`
-also answers from metadata.
+**Spans below the request**: per-query child spans for catalog
+`loadTable`, manifest planning (with `files=` / `manifests=` counts) and
+each phase, so a slow query's trace shows where planning time went
+(ADR 0031's revisit item), still without an OpenTelemetry SDK.
 
 ## Later
 

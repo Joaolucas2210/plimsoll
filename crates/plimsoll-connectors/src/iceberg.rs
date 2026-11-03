@@ -155,8 +155,12 @@ impl IcebergConnector {
         Ok(Self {
             name,
             table: Arc::new(table),
-            // Parquet stats pruning is a hint: every filter is re-checked.
-            policy: PushdownPolicy::uniform(Pushdown::Inexact),
+            // Every filter is evaluated by DataFusion itself (no remote
+            // semantics to distrust, unlike Postgres): the policy lets the
+            // table's own claim stand. It claims Exact only for identity
+            // partition filters it enforces (ADR 0055); the rest are
+            // Inexact and re-checked.
+            policy: PushdownPolicy::uniform(Pushdown::Exact),
         })
     }
 
@@ -226,6 +230,8 @@ struct IcebergTable {
     renamed: bool,
     /// `schema.name-mapping.default`, for files without field ids (ADR 0042).
     name_mapping: Option<Arc<field_ids::NameMapping>>,
+    /// Identity partition sources common to every spec (ADR 0055).
+    identity: HashSet<i64>,
 }
 
 /// A data file the scan will read, from its manifest entry.
@@ -378,6 +384,7 @@ impl IcebergTable {
             .flatten()
             .filter_map(|s| Some((s["spec-id"].as_i64()?, prune::partition_spec(&s["fields"]))))
             .collect();
+        let identity = prune::identity_sources(&specs);
         let unpartitioned = meta["partition-specs"]
             .as_array()
             .into_iter()
@@ -424,6 +431,7 @@ impl IcebergTable {
             names,
             renamed,
             name_mapping,
+            identity,
         })
     }
 
@@ -750,8 +758,19 @@ impl TableProvider for IcebergTable {
         TableType::Base
     }
 
+    /// Filters that identity partitions decide are `Exact` (ADR 0055): the
+    /// scan enforces them per file, so no `FilterExec` is needed above it.
+    /// Everything else is re-checked by DataFusion.
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> Result<Vec<Pushdown>> {
-        Ok(vec![Pushdown::Inexact; filters.len()])
+        Ok(filters
+            .iter()
+            .map(
+                |f| match prune::Exact::new(f, &self.columns, &self.identity) {
+                    Some(_) => Pushdown::Exact,
+                    None => Pushdown::Inexact,
+                },
+            )
+            .collect())
     }
 
     async fn scan(
@@ -762,7 +781,45 @@ impl TableProvider for IcebergTable {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let pruner = Pruner::new(filters, &self.columns);
-        let (files, sets, stats) = self.data_files(state, &pruner).await?;
+        let (mut files, sets, stats) = self.data_files(state, &pruner).await?;
+        // Exact filters (ADR 0055) are this scan's to enforce: decided per
+        // file from its partition tuple. The rest go to Parquet and are
+        // re-checked above the scan.
+        let (mut exact, mut inexact) = (Vec::new(), Vec::new());
+        for f in filters {
+            match prune::Exact::new(f, &self.columns, &self.identity) {
+                Some(e) => exact.push(e),
+                None => inexact.push(f.clone()),
+            }
+        }
+        let filters = inexact.as_slice();
+        if !exact.is_empty() {
+            let mut kept = Vec::with_capacity(files.len());
+            for file in files {
+                let spec = self.specs.get(&file.spec).map_or(&[][..], Vec::as_slice);
+                let mut keep = true;
+                for e in &exact {
+                    match e.decide(spec, file.partition.as_ref()) {
+                        Some(true) => {}
+                        Some(false) => keep = false,
+                        // Declared exact, so undecidable is an error, not a
+                        // silently unfiltered file.
+                        None => {
+                            return Err(DataFusionError::from(ConnectorError::InvalidMetadata(
+                                format!(
+                                    "{}: partition tuple of {} cannot decide an identity filter",
+                                    self.name, file.path
+                                ),
+                            )));
+                        }
+                    }
+                }
+                if keep {
+                    kept.push(file);
+                }
+            }
+            files = kept;
+        }
         // Files sharing the same equality delete sets scan together; a group
         // with sets is anti-joined against their keys (ADR 0016).
         let mut groups: BTreeMap<&[usize], Vec<&DataFile>> = BTreeMap::new();
@@ -818,18 +875,21 @@ impl TableProvider for IcebergTable {
             plans.push(plan);
         }
         // Exact row count from the manifests (ADR 0054), when it is exact:
-        // no deletes apply, every file states its record_count, and nothing
-        // (filter pushed into Parquet, limit) can drop rows inside the scan.
+        // no deletes apply to the files kept, every file states its
+        // record_count, and nothing (filter pushed into Parquet, limit) can
+        // drop rows inside the scan. Exact partition filters (ADR 0055) were
+        // decided per file above, so they do not count.
         // DataFusion then answers `count(*)` without reading data files.
-        let exact_rows = (filters.is_empty() && limit.is_none() && sets.is_empty())
-            .then(|| {
-                files
-                    .iter()
-                    .map(|f| f.rows.filter(|_| f.selection.is_none()))
-                    .sum::<Option<u64>>()
-            })
-            .flatten()
-            .and_then(|n| usize::try_from(n).ok());
+        let exact_rows =
+            (filters.is_empty() && limit.is_none() && files.iter().all(|f| f.eq.is_empty()))
+                .then(|| {
+                    files
+                        .iter()
+                        .map(|f| f.rows.filter(|_| f.selection.is_none()))
+                        .sum::<Option<u64>>()
+                })
+                .flatten()
+                .and_then(|n| usize::try_from(n).ok());
         let scan = AccountedExec::new(
             format!(
                 "IcebergScan[{}] snapshot={} manifests={}/{} files={}/{} deletes={} deleted_rows={} equality_deletes={} delete_cache_hits={} manifest_cache_hits={}",

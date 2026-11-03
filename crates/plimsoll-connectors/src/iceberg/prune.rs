@@ -8,7 +8,7 @@
 //! above the scan, so pruning only ever changes cost, never results.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Datelike};
 use datafusion::common::ScalarValue;
@@ -186,6 +186,23 @@ pub(super) fn partition_spec(fields: &serde_json::Value) -> Vec<Option<Partition
             })
         })
         .collect()
+}
+
+/// Field ids that are `identity` partition sources in every spec: only
+/// those are decided exactly by every file's partition tuple (ADR 0055).
+pub(super) fn identity_sources(specs: &HashMap<i64, Vec<Option<PartitionField>>>) -> HashSet<i64> {
+    let mut specs = specs.values().map(|fields| {
+        fields
+            .iter()
+            .flatten()
+            .filter(|f| f.transform == Transform::Identity)
+            .map(|f| f.source_id)
+            .collect::<HashSet<_>>()
+    });
+    let Some(first) = specs.next() else {
+        return HashSet::new();
+    };
+    specs.fold(first, |acc, s| acc.intersection(&s).copied().collect())
 }
 
 /// The scan filters as a tree of what can be checked against file and
@@ -613,6 +630,182 @@ fn node(e: &Expr, columns: &HashMap<String, (i64, Prim)>) -> Node {
     }
 }
 
+/// A filter that identity partitions decide row by row (ADR 0055): every
+/// row of a file shares the file's identity partition values, so the
+/// filter is true for all of a file's rows or for none. Built strictly:
+/// any part that is not an exact comparison, null check or IN list on an
+/// identity-partitioned column makes the whole filter not exact.
+#[derive(Debug)]
+pub(super) struct Exact {
+    root: Node,
+}
+
+/// One identity partition value of a file.
+enum PartValue {
+    Null,
+    Value(Datum),
+}
+
+impl Exact {
+    /// `identity`: field ids that are identity partition sources in every
+    /// spec of the table, so every file carries their values.
+    pub(super) fn new(
+        e: &Expr,
+        columns: &HashMap<String, (i64, Prim)>,
+        identity: &HashSet<i64>,
+    ) -> Option<Self> {
+        let root = exact_node(e, columns)?;
+        root.only_on(identity).then_some(Self { root })
+    }
+
+    /// Whether the filter holds for the rows of a file with this partition
+    /// tuple; `None` when a value is missing or of another type, which
+    /// the caller must treat as an error (the filter was declared exact).
+    pub(super) fn decide(
+        &self,
+        spec: &[Option<PartitionField>],
+        partition: Option<&apache_avro::types::Value>,
+    ) -> Option<bool> {
+        use apache_avro::types::Value as A;
+        let Some(A::Record(fields)) = partition else {
+            return None;
+        };
+        let value_of = |id: i64| -> Option<PartValue> {
+            let i = spec.iter().position(|f| {
+                f.as_ref()
+                    .is_some_and(|f| f.source_id == id && f.transform == Transform::Identity)
+            })?;
+            let v = match &fields.get(i)?.1 {
+                A::Union(_, inner) => inner.as_ref(),
+                v => v,
+            };
+            Some(match v {
+                A::Null => PartValue::Null,
+                A::Int(x) | A::Date(x) => PartValue::Value(Datum::Int(i64::from(*x))),
+                A::Long(x) | A::TimestampMicros(x) => PartValue::Value(Datum::Int(*x)),
+                A::Boolean(b) => PartValue::Value(Datum::Int(i64::from(*b))),
+                A::String(s) => PartValue::Value(Datum::Bytes(s.as_bytes().to_vec())),
+                _ => return None,
+            })
+        };
+        self.root.decide(&value_of)
+    }
+}
+
+/// Strict counterpart of [`node`]: `None` instead of `True` for anything
+/// not exact, so nothing is silently dropped from an AND.
+fn exact_node(e: &Expr, columns: &HashMap<String, (i64, Prim)>) -> Option<Node> {
+    let strict = |n: Node| (!matches!(n, Node::True)).then_some(n);
+    match e {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: op @ (Operator::And | Operator::Or),
+            right,
+        }) => {
+            let both = vec![exact_node(left, columns)?, exact_node(right, columns)?];
+            Some(if *op == Operator::And {
+                Node::And(both)
+            } else {
+                Node::Or(both)
+            })
+        }
+        Expr::BinaryExpr(_) | Expr::IsNull(_) | Expr::IsNotNull(_) => strict(node(e, columns)),
+        Expr::Not(inner)
+            if !matches!(
+                inner.as_ref(),
+                Expr::BinaryExpr(BinaryExpr {
+                    op: Operator::And | Operator::Or,
+                    ..
+                })
+            ) =>
+        {
+            strict(node(e, columns))
+        }
+        Expr::Between(Between {
+            expr,
+            negated: false,
+            low,
+            high,
+        }) => match (low.as_ref(), high.as_ref()) {
+            (Expr::Literal(lo, _), Expr::Literal(hi, _)) => Some(Node::And(vec![
+                strict(cmp(expr, Op::GtEq, lo, columns))?,
+                strict(cmp(expr, Op::LtEq, hi, columns))?,
+            ])),
+            _ => None,
+        },
+        Expr::InList(InList {
+            expr,
+            list,
+            negated: false,
+        }) => Some(Node::Or(
+            list.iter()
+                .map(|v| match v {
+                    Expr::Literal(v, _) => strict(cmp(expr, Op::Eq, v, columns)),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?,
+        )),
+        _ => None,
+    }
+}
+
+impl Node {
+    /// Every leaf is on one of `ids`, with a type partition values decode to.
+    fn only_on(&self, ids: &HashSet<i64>) -> bool {
+        match self {
+            Node::True => false,
+            Node::Cmp(p) => ids.contains(&p.field_id) && !matches!(p.prim, Prim::Decimal(_)),
+            Node::Null(id, _) => ids.contains(id),
+            Node::And(n) | Node::Or(n) => !n.is_empty() && n.iter().all(|n| n.only_on(ids)),
+        }
+    }
+
+    /// Two-valued evaluation is exact here: there is no NOT above a
+    /// comparison (NOT is only folded into comparisons, ADR 0050), so
+    /// "unknown" filters a row exactly like "false".
+    fn decide(&self, value_of: &dyn Fn(i64) -> Option<PartValue>) -> Option<bool> {
+        match self {
+            Node::True => None,
+            Node::Cmp(p) => match value_of(p.field_id)? {
+                PartValue::Null => Some(false),
+                PartValue::Value(v) => {
+                    let o = v.partial_cmp(&p.value)?;
+                    Some(match p.op {
+                        Op::Eq => o == Ordering::Equal,
+                        Op::Lt => o == Ordering::Less,
+                        Op::LtEq => o != Ordering::Greater,
+                        Op::Gt => o == Ordering::Greater,
+                        Op::GtEq => o != Ordering::Less,
+                    })
+                }
+            },
+            Node::Null(id, is_null) => Some(matches!(value_of(*id)?, PartValue::Null) == *is_null),
+            Node::And(n) => {
+                let mut all = Some(true);
+                for n in n {
+                    match n.decide(value_of) {
+                        Some(false) => return Some(false),
+                        Some(true) => {}
+                        None => all = None,
+                    }
+                }
+                all
+            }
+            Node::Or(n) => {
+                let mut any = Some(false);
+                for n in n {
+                    match n.decide(value_of) {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => any = None,
+                    }
+                }
+                any
+            }
+        }
+    }
+}
+
 /// `e` starts with `prefix`: `e >= prefix AND e < next(prefix)`, where
 /// `next` increments the last byte that can be (bytewise order, as Iceberg
 /// and Arrow compare strings). An empty prefix says nothing.
@@ -1026,5 +1219,60 @@ mod tests {
         assert!(keep(col("amount").eq(lit(15i64))));
         // 10.005 has no exact scale-2 form: not prunable.
         assert!(keep(col("amount").lt(dec(10_005, 3))));
+    }
+
+    #[test]
+    fn identity_partition_filters_are_exact_only_when_decidable() {
+        use apache_avro::types::Value as A;
+        let spec = partition_spec(&serde_json::json!([
+            {"source-id": 2, "field-id": 1000, "name": "city", "transform": "identity"}]));
+        let identity = identity_sources(&HashMap::from([(0, spec.clone())]));
+        assert_eq!(identity, HashSet::from([2]));
+        // Spec evolution: a spec without the field makes nothing exact.
+        let unpartitioned = partition_spec(&serde_json::json!([]));
+        assert!(
+            identity_sources(&HashMap::from([(0, spec.clone()), (1, unpartitioned)])).is_empty()
+        );
+
+        let exact = |e: Expr| Exact::new(&e, &columns(), &identity);
+        let file = |city: Option<&str>| {
+            A::Record(vec![(
+                "city".into(),
+                match city {
+                    Some(c) => A::Union(1, Box::new(A::String(c.into()))),
+                    None => A::Union(0, Box::new(A::Null)),
+                },
+            )])
+        };
+        let decide = |e: Expr, f: &A| exact(e).unwrap().decide(&spec, Some(f));
+        let lisbon = file(Some("lisbon"));
+        let null = file(None);
+        assert_eq!(decide(col("city").eq(lit("lisbon")), &lisbon), Some(true));
+        assert_eq!(decide(col("city").eq(lit("porto")), &lisbon), Some(false));
+        assert_eq!(decide(col("city").eq(lit("lisbon")), &null), Some(false)); // NULL = x
+        assert_eq!(decide(col("city").is_null(), &null), Some(true));
+        assert_eq!(
+            decide(col("city").is_null().or(col("city").eq(lit("x"))), &null),
+            Some(true)
+        );
+        assert_eq!(
+            decide(
+                col("city").in_list(vec![lit("porto"), lit("lisbon")], false),
+                &lisbon
+            ),
+            Some(true)
+        );
+        assert_eq!(decide(col("city").gt(lit("m")).not(), &lisbon), Some(true));
+        // Not exact: other columns, functions, LIKE, an AND with a non-exact side.
+        assert!(exact(col("id").eq(lit(1i64))).is_none());
+        assert!(exact(col("city").like(lit("l%"))).is_none());
+        assert!(exact(col("city").eq(lit("x")).and(col("id").eq(lit(1i64)))).is_none());
+        assert!(exact(col("city").eq(lit("x")).or(col("nope").eq(lit(1i64)))).is_none());
+        assert!(exact(col("city").not_eq(lit("x"))).is_none());
+        // A missing partition record is undecidable (an error for the scan).
+        assert_eq!(
+            exact(col("city").eq(lit("x"))).unwrap().decide(&spec, None),
+            None
+        );
     }
 }
