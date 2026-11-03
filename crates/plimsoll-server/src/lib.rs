@@ -9,6 +9,7 @@ pub mod engine;
 pub mod lakehouse;
 pub mod log;
 pub mod metrics;
+pub mod peers;
 pub mod schedule;
 pub mod system;
 pub mod tables;

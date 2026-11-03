@@ -74,7 +74,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Engine::new(pool.clone(), spill_dir)?
             .with_result_cache(usize::try_from(cfg.result_cache_bytes)?),
     );
-    system::register(engine.context(), admission.registry().clone())?;
     // A private CA for HTTPS between nodes (ADR 0099), before any client.
     if let Some(ca) = &cfg.tls_ca {
         let pem =
@@ -85,6 +84,32 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("PLIMSOLL_TLS_CA {}: no certificate", ca.display()).into());
         }
     }
+    // The other coordinators (ADR 0102): found and health-checked as
+    // workers are, so replicas join and leave without a restart.
+    let peers = match (cfg.coordinators.is_empty(), &cfg.worker_token) {
+        (false, Some(token)) => {
+            let peers = Arc::new(plimsoll_server::peers::Peers(
+                plimsoll_connectors::remote::Workers::new(cfg.coordinators.clone(), token.clone())?,
+            ));
+            let checked = peers.clone();
+            tokio::spawn(async move {
+                loop {
+                    checked
+                        .0
+                        .check_health(std::time::Duration::from_secs(2))
+                        .await;
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            });
+            Some(peers)
+        }
+        _ => None,
+    };
+    system::register(
+        engine.context(),
+        admission.registry().clone(),
+        peers.clone(),
+    )?;
     // Coordinator (ADR 0058): Iceberg scans fan out to these workers.
     if let (false, Some(token)) = (cfg.workers.is_empty(), &cfg.worker_token) {
         let workers = Arc::new(
@@ -203,6 +228,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .worker_token
             .as_deref()
             .map(plimsoll_server::auth::token_digest),
+        peers,
     });
 
     // ADR 0100: the `/metrics` series, pushed to the OTLP endpoint.

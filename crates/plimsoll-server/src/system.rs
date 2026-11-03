@@ -2,6 +2,7 @@
 //!
 //! Rows are scoped to the query's [`Viewer`] (ADR 0022): a user sees their
 //! own queries, an operator sees all. A query without a viewer fails closed.
+//! With peers, the rows are every coordinator's (ADR 0102).
 
 use std::sync::Arc;
 
@@ -25,9 +26,11 @@ use plimsoll_core::datafusion::physical_plan::ExecutionPlan;
 use plimsoll_core::datafusion::prelude::SessionContext;
 
 use crate::auth::Viewer;
+use crate::peers::{self, Peers};
 
 struct QueriesTable {
     registry: Arc<QueryRegistry>,
+    peers: Option<Arc<Peers>>,
     schema: SchemaRef,
 }
 
@@ -38,7 +41,11 @@ impl std::fmt::Debug for QueriesTable {
 }
 
 /// Registers the `system` catalog with `runtime.queries` in `ctx`.
-pub fn register(ctx: &SessionContext, registry: Arc<QueryRegistry>) -> Result<()> {
+pub fn register(
+    ctx: &SessionContext,
+    registry: Arc<QueryRegistry>,
+    peers: Option<Arc<Peers>>,
+) -> Result<()> {
     let fields: Vec<Field> = QUERIES_COLUMNS
         .iter()
         .map(|c| {
@@ -54,6 +61,7 @@ pub fn register(ctx: &SessionContext, registry: Arc<QueryRegistry>) -> Result<()
         .collect();
     let table = QueriesTable {
         registry,
+        peers,
         schema: Arc::new(Schema::new(fields)),
     };
     let runtime = Arc::new(MemorySchemaProvider::new());
@@ -87,6 +95,9 @@ impl TableProvider for QueriesTable {
             )
         })?;
         let mut rows = system::queries_snapshot(&self.registry);
+        if let Some(p) = &self.peers {
+            rows = peers::merge(rows, p.queries().await);
+        }
         if let Some(user) = &viewer.only {
             rows.retain(|r| &r.user == user);
         }

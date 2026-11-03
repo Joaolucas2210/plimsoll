@@ -144,6 +144,12 @@ impl Workers {
             .clone()
     }
 
+    /// A request to a member, authenticated with the shared token: also
+    /// how coordinators reach each other (ADR 0102).
+    pub fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
+        self.client.request(method, url).bearer_auth(&self.token)
+    }
+
     /// Every current worker, healthy or not.
     pub fn urls(&self) -> Vec<String> {
         self.members().into_iter().map(|m| m.url).collect()

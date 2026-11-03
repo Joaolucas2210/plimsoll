@@ -53,6 +53,9 @@ pub struct Config {
     /// entries re-resolved into workers (ADR 0070); set, this node
     /// coordinates.
     pub workers: Vec<String>,
+    /// `PLIMSOLL_COORDINATORS`: the other coordinators, as `workers` are
+    /// given; this node may be among them (ADR 0102).
+    pub coordinators: Vec<String>,
     /// `PLIMSOLL_TLS_CERT` / `PLIMSOLL_TLS_KEY`: serve TLS (ADR 0099).
     pub tls: Option<crate::tls::TlsFiles>,
     /// `PLIMSOLL_TLS_CA`: a PEM bundle trusted, besides the system roots,
@@ -148,33 +151,9 @@ impl Config {
                 reason: "at least 16 characters",
             });
         }
-        let mut workers = Vec::new();
-        for url in lookup("PLIMSOLL_WORKERS").unwrap_or_default().split(',') {
-            let url = url.trim();
-            if url.is_empty() {
-                continue;
-            }
-            // `dns+http://name:port`: every address `name` resolves to is
-            // a worker, re-resolved while running (ADR 0070).
-            let base = url.strip_prefix("dns+").unwrap_or(url);
-            let valid = (base.starts_with("http://") || base.starts_with("https://"))
-                && reqwest::Url::parse(base).is_ok_and(|u| u.host_str().is_some());
-            if !valid {
-                return Err(ConfigError {
-                    var: "PLIMSOLL_WORKERS",
-                    value: url.to_owned(),
-                    reason: "expected http(s):// URLs or dns+http(s)://name:port",
-                });
-            }
-            workers.push(url.to_owned());
-        }
-        if !workers.is_empty() && worker_token.is_none() {
-            return Err(ConfigError {
-                var: "PLIMSOLL_WORKERS",
-                value: String::new(),
-                reason: "needs PLIMSOLL_WORKER_TOKEN",
-            });
-        }
+        let workers = nodes(&lookup, "PLIMSOLL_WORKERS", worker_token.is_some())?;
+        // ADR 0102: the same shapes, and the same token between them.
+        let coordinators = nodes(&lookup, "PLIMSOLL_COORDINATORS", worker_token.is_some())?;
         let slow_ms: u64 = parse(
             &lookup,
             "PLIMSOLL_SLOW_QUERY_MS",
@@ -235,6 +214,7 @@ impl Config {
             slow_query: (slow_ms > 0).then(|| Duration::from_millis(slow_ms)),
             worker_token,
             workers,
+            coordinators,
             tls,
             tls_ca,
             broadcast_max_bytes,
@@ -355,6 +335,42 @@ fn resource_groups(lookup: &impl Fn(&str) -> Option<String>) -> Result<GroupConf
         }
     }
     Ok((groups, shares))
+}
+
+/// `var`: node base URLs, or `dns+http(s)://name:port` entries whose
+/// every address is a node, re-resolved while running (ADR 0070). Nodes
+/// talk with the worker token, so they need one.
+fn nodes(
+    lookup: &impl Fn(&str) -> Option<String>,
+    var: &'static str,
+    token: bool,
+) -> Result<Vec<String>, ConfigError> {
+    let mut nodes = Vec::new();
+    for url in lookup(var).unwrap_or_default().split(',') {
+        let url = url.trim();
+        if url.is_empty() {
+            continue;
+        }
+        let base = url.strip_prefix("dns+").unwrap_or(url);
+        let valid = (base.starts_with("http://") || base.starts_with("https://"))
+            && reqwest::Url::parse(base).is_ok_and(|u| u.host_str().is_some());
+        if !valid {
+            return Err(ConfigError {
+                var,
+                value: url.to_owned(),
+                reason: "expected http(s):// URLs or dns+http(s)://name:port",
+            });
+        }
+        nodes.push(url.to_owned());
+    }
+    if !nodes.is_empty() && !token {
+        return Err(ConfigError {
+            var,
+            value: String::new(),
+            reason: "needs PLIMSOLL_WORKER_TOKEN",
+        });
+    }
+    Ok(nodes)
 }
 
 fn parse<T: std::str::FromStr>(
@@ -505,6 +521,31 @@ mod tests {
         assert!(c.otlp.is_some());
         let e = cfg(&[endpoint, ("OTEL_METRIC_EXPORT_INTERVAL", "0")]).unwrap_err();
         assert_eq!(e.var, "OTEL_METRIC_EXPORT_INTERVAL");
+    }
+
+    #[test]
+    fn coordinators_are_given_as_workers_are() {
+        let token = ("PLIMSOLL_WORKER_TOKEN", "0123456789abcdef");
+        assert!(cfg(&[]).unwrap().coordinators.is_empty());
+        let c = cfg(&[
+            token,
+            (
+                "PLIMSOLL_COORDINATORS",
+                "dns+http://coordinators:8080, http://c2:8080",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.coordinators,
+            ["dns+http://coordinators:8080", "http://c2:8080"]
+        );
+        let e = cfg(&[("PLIMSOLL_COORDINATORS", "http://c2:8080")]).unwrap_err();
+        assert_eq!(
+            (e.var, e.reason),
+            ("PLIMSOLL_COORDINATORS", "needs PLIMSOLL_WORKER_TOKEN")
+        );
+        let e = cfg(&[token, ("PLIMSOLL_COORDINATORS", "c2:8080")]).unwrap_err();
+        assert_eq!(e.var, "PLIMSOLL_COORDINATORS");
     }
 
     #[test]

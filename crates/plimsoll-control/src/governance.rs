@@ -25,7 +25,8 @@ use tokio::sync::{Notify, oneshot};
 
 pub type QueryId = u64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum QueryState {
     Queued,
     Running,
@@ -57,7 +58,8 @@ impl fmt::Display for QueryState {
 }
 
 /// One row of `system.runtime.queries`. Timestamps are Unix epoch millis.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serialized for other coordinators' listings (ADR 0102).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QueryInfo {
     pub id: QueryId,
     pub user: String,

@@ -51,6 +51,8 @@ pub struct AppState {
     /// SHA-256 of the token coordinators present; `None`: not a worker
     /// and `/v1/fragment` does not exist (ADR 0058).
     pub worker_token: Option<[u8; 32]>,
+    /// The other coordinators, for listings and cancels (ADR 0102).
+    pub peers: Option<Arc<crate::peers::Peers>>,
 }
 
 #[derive(Default)]
@@ -83,6 +85,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/sql", post(sql))
         .route("/v1/queries/{id}", delete(cancel_query))
         .route("/v1/fragment", post(fragment))
+        .route("/v1/peer/queries", get(peer_queries))
+        .route("/v1/peer/queries/{id}", delete(peer_cancel))
         .route("/v1/maintenance/compact", post(compact))
         .route("/v1/maintenance/expire-snapshots", post(expire_snapshots))
         .route("/v1/maintenance/remove-orphans", post(remove_orphans))
@@ -325,16 +329,25 @@ async fn cancel_query(
     let registry = st.admission.registry();
     // Auth disabled: development, anyone may cancel (ADR 0021).
     let viewer = principal.as_deref().map(|p| st.auth.viewer(p));
-    let visible = registry.get(query_id).is_some_and(|q| {
-        viewer
-            .as_ref()
-            .and_then(|v| v.only.as_deref())
-            .is_none_or(|only| only == q.user)
-    });
+    let only = viewer.as_ref().and_then(|v| v.only.clone());
+    let visible = registry
+        .get(query_id)
+        .is_some_and(|q| only.as_deref().is_none_or(|only| only == q.user));
     if !visible {
+        // Perhaps another coordinator's (ADR 0102): it checks the owner.
+        if let Some(peers) = &st.peers
+            && let Some((status, body)) = peers.cancel(query_id, only.as_deref()).await
+        {
+            return (status, Json(body)).into_response();
+        }
         return not_found();
     }
-    match registry.cancel(query_id) {
+    cancelled(st, query_id, not_found)
+}
+
+/// The answer to cancelling `query_id`, a query of this node.
+fn cancelled(st: &AppState, query_id: u64, not_found: impl Fn() -> Response) -> Response {
+    match st.admission.registry().cancel(query_id) {
         CancelOutcome::Cancelling => (
             StatusCode::ACCEPTED,
             Json(json!({ "query_id": query_id, "state": "cancelling" })),
@@ -351,6 +364,74 @@ async fn cancel_query(
     }
 }
 
+/// The worker token check of the node-to-node endpoints: they do not
+/// exist without one, and answer 401 to anything else. The refusal, if
+/// any.
+fn node_auth(st: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let Some(expected) = st.worker_token else {
+        return Some(StatusCode::NOT_FOUND.into_response());
+    };
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if token.map(crate::auth::token_digest) != Some(expected) {
+        return Some(
+            ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", false).respond(
+                st,
+                "invalid worker token",
+                None,
+            ),
+        );
+    }
+    None
+}
+
+/// `GET /v1/peer/queries` (ADR 0102): this node's queries, unscoped, for
+/// another coordinator's `system.runtime.queries`, which scopes them.
+async fn peer_queries(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(r) = node_auth(&st, &headers) {
+        return r;
+    }
+    Json(st.admission.registry().snapshot()).into_response()
+}
+
+/// `DELETE /v1/peer/queries/{id}` (ADR 0102): cancels a query of this node
+/// for another coordinator, which authenticated the caller. With
+/// `x-plimsoll-owner`, only a query of that user. Never forwarded.
+async fn peer_cancel(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if let Some(r) = node_auth(&st, &headers) {
+        return r;
+    }
+    let st = st.as_ref();
+    let not_found = || {
+        ApiError::new(StatusCode::NOT_FOUND, "query_not_found", false).respond(
+            st,
+            format!("no query {id} visible to this principal"),
+            None,
+        )
+    };
+    let owner = headers
+        .get("x-plimsoll-owner")
+        .and_then(|v| v.to_str().ok());
+    let Ok(query_id) = id.parse::<u64>() else {
+        return not_found();
+    };
+    let owned = st
+        .admission
+        .registry()
+        .get(query_id)
+        .is_some_and(|q| owner.is_none_or(|o| o == q.user));
+    if !owned {
+        return not_found();
+    }
+    cancelled(st, query_id, not_found)
+}
+
 /// `POST /v1/fragment` (ADR 0058, 0059): a worker scans the data files a
 /// coordinator assigned it and streams the rows back as Arrow IPC. Only
 /// with `PLIMSOLL_WORKER_TOKEN` set, and only for a caller presenting it.
@@ -365,18 +446,12 @@ async fn fragment(
     body: axum::body::Bytes,
 ) -> Response {
     let st = shared.as_ref();
-    let Some(expected) = st.worker_token else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    let token = header("authorization").and_then(|v| v.strip_prefix("Bearer "));
-    if token.map(crate::auth::token_digest) != Some(expected) {
-        return ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", false).respond(
-            st,
-            "invalid worker token",
-            None,
-        );
+    if let Some(r) = node_auth(st, &headers) {
+        return r;
     }
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    // Checked above; a reduce presents it to its peers.
+    let token = header("authorization").and_then(|v| v.strip_prefix("Bearer "));
     // The JSON task, then an optional Arrow IPC attachment: a broadcast
     // join's build side (ADR 0066).
     let (json, attachment) = plimsoll_connectors::remote::split_body(&body);
@@ -1456,6 +1531,7 @@ mod tests {
             latency: Latency::default(),
             auth: Auth::Disabled,
             tracer: None,
+            peers: None,
             slow_query: None,
             worker_token: None,
         })
@@ -1591,7 +1667,7 @@ mod tests {
             },
             Duration::from_secs(10),
         );
-        crate::system::register(engine.context(), st.admission.registry().clone()).unwrap();
+        crate::system::register(engine.context(), st.admission.registry().clone(), None).unwrap();
         Arc::get_mut(&mut st).unwrap().engine = Arc::new(crate::engine::CoreEngine(engine));
 
         let big = "SELECT value, repeat('x', 100) FROM range(200000)";
@@ -1617,7 +1693,7 @@ mod tests {
         let engine =
             Arc::new(Engine::new(Arc::new(CeilingPool::new(64 << 20, 0).unwrap()), None).unwrap());
         let mut st = Arc::into_inner(default_state()).unwrap();
-        crate::system::register(engine.context(), st.admission.registry().clone()).unwrap();
+        crate::system::register(engine.context(), st.admission.registry().clone(), None).unwrap();
         st.engine = Arc::new(crate::engine::CoreEngine(engine.clone()));
         let hex = |t: &str| -> String {
             crate::auth::token_digest(t)
@@ -1678,7 +1754,7 @@ mod tests {
                 .unwrap();
         }
         let mut st = Arc::into_inner(default_state()).unwrap();
-        crate::system::register(engine.context(), st.admission.registry().clone()).unwrap();
+        crate::system::register(engine.context(), st.admission.registry().clone(), None).unwrap();
         st.engine = Arc::new(crate::engine::CoreEngine(engine));
         let hex: String = crate::auth::token_digest("ta")
             .iter()
@@ -2097,6 +2173,83 @@ mod tests {
         assert_eq!(st.admission.load(), (0, 0));
         assert_eq!(pool.used(), 0, "chunks in flight released");
         assert_eq!(st.errors.snapshot().get("client_disconnected"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn queries_are_listed_and_cancelled_across_coordinators() {
+        // ADR 0102: `b` runs ana's query; `a`, its peer, lists and cancels it.
+        const TOKEN: &str = "0123456789abcdef";
+        let hex = |t: &str| -> String {
+            crate::auth::token_digest(t)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        let tokens = format!("ana:sha256:{},bob:sha256:{}", hex("ta"), hex("tb"));
+        let node = |first: u64| {
+            let mut st = Arc::into_inner(default_state()).unwrap();
+            st.admission = Admission::new(
+                st.admission.config().clone(),
+                Arc::new(QueryRegistry::new(100).starting_at(first)),
+            );
+            st.auth = Auth::from_lookup(
+                &|k| (k == "PLIMSOLL_AUTH_TOKENS").then(|| tokens.clone()),
+                &|g| g == DEFAULT_GROUP,
+            )
+            .unwrap();
+            st.worker_token = Some(crate::auth::token_digest(TOKEN));
+            st
+        };
+        let b = Arc::new(node(7 << 32 | 1));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(axum::serve(listener, router(b.clone())).into_future());
+        let mut a = node(1);
+        let peers = crate::peers::Peers(
+            plimsoll_connectors::remote::Workers::new(vec![url.clone()], TOKEN.into()).unwrap(),
+        );
+        a.peers = Some(Arc::new(peers));
+        let a = Arc::new(a);
+
+        let id = 7u64 << 32 | 1;
+        let q = tokio::spawn(call(
+            router(b.clone()),
+            Request::post("/v1/sql")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer ta")
+                .body(Body::from(json!({"sql": "slow"}).to_string()))
+                .unwrap(),
+        ));
+        while !b
+            .admission
+            .registry()
+            .get(id)
+            .is_some_and(|q| q.state == QueryState::Running)
+        {
+            tokio::task::yield_now().await;
+        }
+        let listed = a.peers.as_ref().unwrap().queries().await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!((listed[0].id, listed[0].user.as_str()), (id, "ana"));
+
+        let cancel = |token: &str| {
+            Request::delete(format!("/v1/queries/{id}"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        // Not bob's: not found, through the peer as locally.
+        let (status, body) = call(router(a.clone()), cancel("tb")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let (status, body) = call(router(a.clone()), cancel("ta")).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let (status, body) = q.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(error_code(&body), "query_cancelled");
+
+        // The peer endpoints only answer the worker token.
+        let (status, _) = call(router(b.clone()), get_req("/v1/peer/queries")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
