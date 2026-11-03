@@ -153,6 +153,7 @@ pub trait QueryEngine: Send + Sync {
         &self,
         _fragment: Fragment,
         _build: Option<Build>,
+        _deadline: Instant,
     ) -> Result<Running, EngineError> {
         Err(EngineError::Unsupported("scan fragments".into()))
     }
@@ -460,9 +461,35 @@ type Maps = std::collections::HashMap<(String, usize), (Instant, Arc<MapCell>)>;
 static MAPS: std::sync::LazyLock<std::sync::Mutex<Maps>> =
     std::sync::LazyLock::new(Default::default);
 
-/// ponytail: fixed; tie it to the query deadline if abandoned shuffles
-/// pin worker memory for too long.
-const SHUFFLE_TTL: Duration = Duration::from_secs(300);
+/// Shuffles released on this worker (ADR 0073), by base id (before any
+/// `~`), with when to forget them: a straggling bucket request for one is
+/// refused instead of starting its map again (ADR 0074).
+static RELEASED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// How long a released id is remembered: longer than any query runs.
+const RELEASED_FOR: Duration = Duration::from_secs(600);
+
+/// How often expired maps and released ids are swept (ADR 0074).
+const SWEEP_EVERY: Duration = Duration::from_secs(5);
+static SWEEPER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// The shuffle a (possibly retry-derived, ADR 0072) id belongs to.
+fn base(shuffle: &str) -> &str {
+    shuffle.split('~').next().unwrap_or(shuffle)
+}
+
+/// Drops maps past their query's deadline and forgets old releases.
+fn sweep() {
+    let now = Instant::now();
+    MAPS.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, (expires, _)| *expires > now);
+    RELEASED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, until| *until > now);
+}
 
 struct ShuffleMap {
     schema: plimsoll_core::datafusion::arrow::datatypes::SchemaRef,
@@ -537,6 +564,7 @@ impl CoreEngine {
         &self,
         df: plimsoll_core::datafusion::prelude::DataFrame,
         bucket: Bucket,
+        deadline: Instant,
     ) -> Result<SendableRecordBatchStream, EngineError> {
         use plimsoll_core::datafusion::physical_expr::expressions::Column;
         use plimsoll_core::datafusion::physical_plan::memory::MemoryStream;
@@ -545,15 +573,22 @@ impl CoreEngine {
         use plimsoll_core::datafusion::physical_plan::{ExecutionPlan, Partitioning};
         let lock = || MAPS.lock().unwrap_or_else(|e| e.into_inner());
         let key = (bucket.shuffle.clone(), bucket.map);
-        let cell = {
-            let mut maps = lock();
-            let now = Instant::now();
-            maps.retain(|_, (expires, _)| *expires > now);
-            maps.entry(key.clone())
-                .or_insert_with(|| (now + SHUFFLE_TTL, Arc::default()))
-                .1
-                .clone()
-        };
+        // A map lives no longer than the query that asked for it: its
+        // reducers cannot need it past the deadline (ADR 0074). A sweeper
+        // drops the expired ones, even when no other shuffle comes.
+        SWEEPER.get_or_init(|| {
+            tokio::spawn(async {
+                loop {
+                    tokio::time::sleep(SWEEP_EVERY).await;
+                    sweep();
+                }
+            });
+        });
+        let cell = lock()
+            .entry(key.clone())
+            .or_insert_with(|| (deadline, Arc::default()))
+            .1
+            .clone();
         let partitions = bucket.partitions;
         let keys = bucket.keys.clone();
         let (shuffle, map) = (bucket.shuffle.clone(), bucket.map);
@@ -683,8 +718,26 @@ impl CoreEngine {
 
 #[async_trait]
 impl QueryEngine for CoreEngine {
-    async fn fragment(&self, f: Fragment, build: Option<Build>) -> Result<Running, EngineError> {
+    async fn fragment(
+        &self,
+        f: Fragment,
+        build: Option<Build>,
+        deadline: Instant,
+    ) -> Result<Running, EngineError> {
         let fail = |e: DataFusionError| classify(&e);
+        // A straggler of a query that already ended (ADR 0074).
+        if let Some(b) = &f.bucket {
+            let released = RELEASED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(base(&b.shuffle));
+            if released {
+                return Err(EngineError::InvalidQuery(format!(
+                    "shuffle {} was released: its query has ended",
+                    b.shuffle
+                )));
+            }
+        }
         let state = self.0.context().state();
         let connector = IcebergConnector::fragment(
             &f.metadata_location,
@@ -755,7 +808,10 @@ impl QueryEngine for CoreEngine {
             df = broadcast_join(&ctx, b, schema, batches, df)?;
         }
         match f.bucket {
-            Some(bucket) => self.map_bucket(df, bucket).await.map(Running::from),
+            Some(bucket) => self
+                .map_bucket(df, bucket, deadline)
+                .await
+                .map(Running::from),
             None => run(df).await,
         }
     }
@@ -764,6 +820,10 @@ impl QueryEngine for CoreEngine {
         use plimsoll_core::datafusion::arrow::datatypes::Schema;
         use plimsoll_core::datafusion::physical_plan::stream::RecordBatchStreamAdapter;
         let derived = format!("{shuffle}~");
+        RELEASED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(base(shuffle).to_owned(), Instant::now() + RELEASED_FOR);
         let released = {
             let mut maps = MAPS.lock().unwrap_or_else(|e| e.into_inner());
             let before = maps.len();
@@ -1230,7 +1290,7 @@ mod tests {
             for id in ids {
                 maps.insert(
                     (id.to_owned(), 0),
-                    (Instant::now() + SHUFFLE_TTL, Arc::default()),
+                    (Instant::now() + Duration::from_secs(60), Arc::default()),
                 );
             }
         }
@@ -1247,6 +1307,55 @@ mod tests {
         let mut left = left;
         left.sort();
         assert_eq!(left, ["rel-ab", "rel-b"]);
+        // A straggling bucket request for it, or for one of its retries,
+        // is refused before any table is opened (ADR 0074)...
+        let fragment = |shuffle: &str| Fragment {
+            metadata_location: "file:///nowhere/metadata/v1.metadata.json".into(),
+            snapshot_id: None,
+            files: vec![],
+            columns: vec!["id".into()],
+            aggregate: None,
+            filters: vec![],
+            bucket: Some(Bucket {
+                shuffle: shuffle.into(),
+                map: 0,
+                partitions: 2,
+                index: 0,
+                keys: vec![0],
+                only: false,
+            }),
+            broadcast: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for id in ["rel-a", "rel-a~m1r0"] {
+            let Err(e) = e.fragment(fragment(id), None, deadline).await else {
+                panic!("{id} should be refused");
+            };
+            assert!(e.to_string().contains("was released"), "{e}");
+        }
+        // ...while another shuffle goes on to open its table.
+        let Err(e) = e.fragment(fragment("rel-ab"), None, deadline).await else {
+            panic!("no such table");
+        };
+        assert!(!e.to_string().contains("was released"), "{e}");
+    }
+
+    #[test]
+    fn maps_expire_with_their_query() {
+        let past = Instant::now() - Duration::from_millis(1);
+        MAPS.lock()
+            .unwrap()
+            .insert(("exp-old".into(), 0), (past, Arc::default()));
+        MAPS.lock().unwrap().insert(
+            ("exp-live".into(), 0),
+            (Instant::now() + Duration::from_secs(60), Arc::default()),
+        );
+        RELEASED.lock().unwrap().insert("exp-gone".into(), past);
+        sweep();
+        let maps = MAPS.lock().unwrap();
+        assert!(!maps.contains_key(&("exp-old".into(), 0)));
+        assert!(maps.contains_key(&("exp-live".into(), 0)));
+        assert!(!RELEASED.lock().unwrap().contains_key("exp-gone"));
     }
 
     #[tokio::test]

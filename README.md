@@ -203,7 +203,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 ## Decision records
 
 Index with status, date and the one-line decision of every ADR:
-[docs/adr/README.md](docs/adr/README.md) (0001–0010; template in
+[docs/adr/README.md](docs/adr/README.md) (0001–0074; template in
 [docs/adr/0000-template.md](docs/adr/0000-template.md)).
 
 Roadmap: [ROADMAP.md](ROADMAP.md).
@@ -212,12 +212,10 @@ Roadmap: [ROADMAP.md](ROADMAP.md).
 
 - Not a Databricks/Spark clone: no notebooks, no Spark API, no proprietary
   formats. Open formats (Parquet, Iceberg) and open catalogs only.
-- Not a distributed engine yet: single node first, with plane boundaries that
-  allow splitting later.
-- No in-process TLS or authentication yet; deploy behind a proxy. The `user`
-  field is trusted until authentication lands.
-- No write path (DML/compaction) in the early phases; the read path and its
-  resource safety come first.
+- No in-process TLS yet; deploy the query API behind a TLS-terminating
+  proxy. Authentication is bearer tokens (ADR 0021).
+- No write path (DML/compaction) yet; the read path, its resource safety
+  and its distribution came first. See [ROADMAP.md](ROADMAP.md).
 
 ## License
 

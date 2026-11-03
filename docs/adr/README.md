@@ -81,6 +81,7 @@ are allowed in place.
 | [0071](0071-operator-spans.md) | Execution spans per operator | Accepted | 2026-11-03 | After execution, the plan tree's DataFusion metrics (first start, last end, rows, compute, spill) become one span per operator nested as the plan under `execution`; workers return their plan with the stream and emit operator spans under their `fragment` span, so one trace spans coordinator and workers; no new dependency | 0031, 0056, 0059, 0004 |
 | [0072](0072-shuffles-survive-a-lost-worker.md) | Shuffles survive a lost worker | Accepted | 2026-11-03 | A bucket whose map worker is unreachable before its schema is recomputed on another peer (`only` keeps just that bucket, fresh shuffle id); a reduce failing before its first batch is retried on the next reducer under a fresh id, every map re-running for that bucket; worker calls get a 3 s connect timeout so lost hosts fail over instead of hanging to the deadline | 0060, 0064, 0065, 0070 |
 | [0073](0073-release-shuffles-when-queries-end.md) | Release shuffles when queries end | Accepted | 2026-11-03 | An executed `RemoteReduceExec`, when dropped (query finished, failed or cancelled), sends a best-effort `release` to every worker involved; workers drop the shuffle's maps and its retry-derived ones (`id~…`), freeing memory and spill files at once; the TTL remains the backstop | 0064, 0067, 0072 |
+| [0074](0074-shuffle-maps-expire-with-their-query.md) | Shuffle maps expire with their query | Accepted | 2026-11-03 | Maps expire at the deadline the creating request carried (no fixed TTL); a sweeper drops expired maps every 5 s; released shuffle ids are remembered 10 min and bucket requests for them (or their `~` retries) are refused before opening the table | 0059, 0064, 0072, 0073 |
 
 ## Reading order
 
@@ -88,7 +89,7 @@ are allowed in place.
 - Shape of the system: 0001, 0002, 0004.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
 - Federation: 0005 → 0006.
-- Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073.
+- Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046.
 

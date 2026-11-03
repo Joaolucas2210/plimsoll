@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Shuffle maps expire with their query's deadline, swept every 5 s; bucket requests for released shuffles refused (ADR 0074)
 - [x] Shuffles released when queries end: workers drop a finished, failed or cancelled query's maps (and its retries') at once; the TTL is only a backstop (ADR 0073)
 - [x] Shuffles survive a lost worker: maps re-run elsewhere for one bucket, reduces retried under a fresh shuffle id, 3 s connect timeout for every worker call (ADR 0072)
 - [x] Execution spans per operator, from DataFusion's own metrics, on the coordinator and on workers, nested in one distributed trace (ADR 0071)
@@ -106,11 +107,42 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Shuffle maps expire with their query**: expire maps at the deadline
-the coordinator sent (ADR 0059) instead of a fixed 5-minute TTL, and
-refuse bucket requests for released shuffles (ADR 0073 stragglers).
+**Write path, step 1: append** — `INSERT INTO <iceberg table> SELECT …`
+writes Parquet data files under the table location and commits a new
+snapshot through the REST catalog (optimistic concurrency, retry on
+conflict). The query API is read-only today (ADR 0024); writes need
+their own grant and resource group.
 
-## Later
+## Missing
 
-- SRV-based discovery; shuffle-map operator spans; OTLP metrics.
+**Lakehouse writes** (the largest gap)
+- Append (above), then `DELETE`/`UPDATE`/`MERGE` as position deletes or
+  deletion vectors, then table maintenance: compaction, expire
+  snapshots, remove orphan files.
+- DDL: `CREATE TABLE` / schema and partition evolution through the
+  catalog.
 
+**Distribution**
+- Left, full and left-semi/anti joins against small sides on workers;
+  an explicit cap on broadcast build sides, or caching them per snapshot
+  (ADR 0066).
+- Expression join keys and residual filters in shuffled joins; joins
+  between a remote scan and an aggregate or subquery (ADR 0065).
+- Cheaper recovery: one re-run of a lost map serving every reducer;
+  more than one retry per step (ADR 0072).
+- Postgres (federated) scans stay on the coordinator.
+- Coordinator high availability (several coordinators sharing
+  workers); SRV-based discovery; TLS to workers discovered by IP
+  (ADR 0070).
+
+**Planning and performance**
+- Column statistics from manifests (bounds, null counts) and filter
+  selectivity for estimates; skip the shuffle for few-group
+  aggregations (ADR 0064/0066).
+- Skew: spill the largest bucket first, split hot buckets (ADR 0067).
+- Spilling hash-join build sides (DataFusion upstream, ADR 0068).
+
+**Security and operations**
+- In-process TLS for the query API (today: behind a proxy).
+- OTLP metrics; shuffle-map operator spans; per-kind fragment
+  counters; per-query spill attribution (ADR 0069/0071).
