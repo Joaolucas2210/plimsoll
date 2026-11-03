@@ -144,6 +144,9 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_CATALOG_VENDED_CREDENTIALS` | `false` | `true` asks the catalog for per-table storage credentials (Polaris credential vending) |
 | `PLIMSOLL_CATALOG_REFRESH_MS` | `60000` | How often `SHOW TABLES` / `information_schema` re-list the catalog (new tables and namespaces); `0` = boot only. Queries always resolve tables live (ADR 0033) |
 | `PLIMSOLL_MAINTENANCE_INTERVAL_MS` | `0` (off) | Between scheduled maintenance passes: tables with `plimsoll.maintenance.enabled = 'true'` are compacted, have snapshots expired (Iceberg's `history.expire.*` properties) and, with `plimsoll.maintenance.remove-orphans`, orphan files removed; queued under admission as `plimsoll-maintenance`; run it on one coordinator (ADR 0086) |
+| `PLIMSOLL_TLS_CERT` / `PLIMSOLL_TLS_KEY` | unset | PEM certificate chain and key: the node serves TLS (1.2/1.3) on its listener (API, metrics, worker fragments); the files are reloaded when they change on disk; both or neither (ADR 0099) |
+| `PLIMSOLL_TLS_CA` | unset | PEM bundle trusted (besides system roots) for `https://` workers, e.g. a private CA (ADR 0099) |
+| `PLIMSOLL_BROADCAST_MAX_BYTES` | `67108864` | Largest build side a broadcast join sends to workers (Arrow IPC bytes); a larger one is joined on the coordinator; `0` = no broadcasts (ADR 0099) |
 
 ### SQL API
 
@@ -229,7 +232,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 ## Decision records
 
 Index with status, date and the one-line decision of every ADR:
-[docs/adr/README.md](docs/adr/README.md) (0001–0098; template in
+[docs/adr/README.md](docs/adr/README.md) (0001–0099; template in
 [docs/adr/0000-template.md](docs/adr/0000-template.md)).
 
 Roadmap: [ROADMAP.md](ROADMAP.md).
@@ -238,8 +241,8 @@ Roadmap: [ROADMAP.md](ROADMAP.md).
 
 - Not a Databricks/Spark clone: no notebooks, no Spark API, no proprietary
   formats. Open formats (Parquet, Iceberg) and open catalogs only.
-- No in-process TLS yet; deploy the query API behind a TLS-terminating
-  proxy. Authentication is bearer tokens (ADR 0021).
+- TLS is in-process (ADR 0099) but without client certificates;
+  authentication is bearer tokens (ADR 0021).
 - Writes are `CREATE` (with `AS SELECT`, ADR 0090), `ALTER` (columns,
   nested fields, properties and partition fields) and `DROP TABLE`, `INSERT INTO`, `UPDATE`, `DELETE
   FROM`, `MERGE INTO` and table maintenance (compaction, snapshot

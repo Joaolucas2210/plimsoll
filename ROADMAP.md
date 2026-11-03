@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] In-process TLS (rotating certificates, private CA for workers) and a broadcast build-side limit with a local-join fallback; column-less broadcast results fixed (ADR 0099)
 - [x] Joins with filters on workers: the residual filter shipped as SQL over `f0…` columns mapped to each side, checked by equivalence after simplification; shuffled, broadcast and gathered joins (ADR 0098)
 - [x] Left, full, semi and anti broadcast joins on workers: workers join with numbered build rows and report the matches; the coordinator adds the build-only rows (`EXISTS`, `NOT EXISTS`, `IN`, left and full joins; `NOT IN` stays local) (ADR 0097)
 - [x] Row lineage in rewrites: first row ids inherited on read, `_row_id` / `_last_updated_sequence_number` read where materialized and written into rewritten files; UPDATE, merge-update and compaction work on v3 (ADR 0096)
@@ -137,25 +138,22 @@ aggregation keys, so shuffled and broadcast joins take them too.
 
 ## Missing
 
-**Lakehouse writes** (the largest gap)
+**Lakehouse writes**
+- Writes on workers for broadcast-join rows; a shuffled `MERGE` (and a
+  spilled source) for sources larger than a node.
 - Several deletion vectors per Puffin file; v3 compaction of files with
-  equality deletes; decimal partition values; data
-  a shuffled `MERGE` for sources larger than a node, broadcast-join
-  writes; vectorized partition transforms.
-- `MERGE` beyond the pool (spilled source); deletion vectors for v3
-  tables.
+  equality deletes; decimal partition values; vectorized partition
+  transforms.
 - Maintenance: a per-table lease for several coordinators, per-step
   schedules, metrics.
-- DDL: nested promotions, leaf statistics for nested fields, `CREATE OR
-  REPLACE TABLE … AS SELECT`.
+- DDL: nested type promotions, leaf statistics for nested fields,
+  `CREATE OR REPLACE TABLE … AS SELECT`.
 
 **Distribution**
 - Expression join keys on workers (above); non-equi (nested loop)
-  joins against a small side;
-  an explicit cap on broadcast build sides, or caching them per snapshot
-  (ADR 0066).
-- Expression join keys and residual filters in shuffled joins; joins
-  between a remote scan and an aggregate or subquery (ADR 0065).
+  joins against a small side; an explicit cap on broadcast build sides,
+  or caching them per snapshot (ADR 0066).
+- Joins between a remote scan and an aggregate or subquery (ADR 0065).
 - Cheaper recovery: one re-run of a lost map serving every reducer;
   more than one retry per step (ADR 0072).
 - Postgres (federated) scans stay on the coordinator.
@@ -171,6 +169,5 @@ aggregation keys, so shuffled and broadcast joins take them too.
 - Spilling hash-join build sides (DataFusion upstream, ADR 0068).
 
 **Security and operations**
-- In-process TLS for the query API (today: behind a proxy).
 - OTLP metrics; shuffle-map operator spans; per-kind fragment
   counters; per-query spill attribution (ADR 0069/0071).

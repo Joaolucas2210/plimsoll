@@ -39,6 +39,19 @@ use plimsoll_core::engine::QueryTag;
 use plimsoll_core::memory::AccountedExec;
 use serde_json::{Value as Json, json};
 
+/// Certificates trusted for HTTPS to workers besides the system roots
+/// (`PLIMSOLL_TLS_CA`, ADR 0099): set once, at boot.
+static TRUSTED: std::sync::OnceLock<Vec<reqwest::Certificate>> = std::sync::OnceLock::new();
+
+/// Trusts the certificates of `pem` (a bundle) for every worker client
+/// made from now on; how many. Call before any `Workers` is built.
+pub fn trust(pem: &[u8]) -> Result<usize, reqwest::Error> {
+    let certs = reqwest::Certificate::from_pem_bundle(pem)?;
+    let n = certs.len();
+    let _ = TRUSTED.set(certs);
+    Ok(n)
+}
+
 /// How long a worker connection may take to open.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -54,7 +67,13 @@ pub struct Workers {
     /// The current workers. Static seeds start healthy; discovered ones
     /// join unhealthy and are checked in the round that found them.
     members: Arc<std::sync::RwLock<Vec<Member>>>,
+    /// The largest build side sent to workers, as Arrow IPC (ADR 0099);
+    /// a larger one is joined here. 0: no broadcasts.
+    broadcast_limit: usize,
 }
+
+/// The default [`Workers::with_broadcast_limit`]: 64 MiB.
+pub const DEFAULT_BROADCAST_LIMIT: usize = 64 << 20;
 
 #[derive(Debug, Clone)]
 struct Member {
@@ -97,11 +116,25 @@ impl Workers {
             // refusing it: without a bound, a lost worker would hold the
             // query until its deadline instead of failing over (ADR 0072).
             // ponytail: fixed; a knob if workers sit behind slow links.
-            client: reqwest::Client::builder()
-                .connect_timeout(CONNECT_TIMEOUT)
+            client: TRUSTED
+                .get()
+                .into_iter()
+                .flatten()
+                .fold(
+                    reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT),
+                    |b, ca| b.add_root_certificate(ca.clone()),
+                )
                 .build()?,
             members: Arc::new(std::sync::RwLock::new(members)),
+            broadcast_limit: DEFAULT_BROADCAST_LIMIT,
         })
+    }
+
+    /// Caps the build side a broadcast join sends (ADR 0099): one larger
+    /// runs on the coordinator instead, its build side as collected.
+    pub fn with_broadcast_limit(mut self, bytes: usize) -> Self {
+        self.broadcast_limit = bytes;
+        self
     }
 
     fn members(&self) -> Vec<Member> {
@@ -1148,21 +1181,61 @@ pub struct RemoteBroadcastExec {
     build: Arc<dyn ExecutionPlan>,
     probe: Arc<RemoteScanExec>,
     join_type: String,
-    /// The build side as IPC, and its memory, shared by all partitions.
-    shipped: Arc<tokio::sync::OnceCell<Result<Shipped, String>>>,
+    /// The join as planned, run here when the build side is over the
+    /// limit (ADR 0099).
+    join: Arc<dyn ExecutionPlan>,
+    /// The build side as IPC, and its memory, shared by all partitions;
+    /// or the local join, when it was too large to send.
+    shipped: Arc<tokio::sync::OnceCell<Result<Built, String>>>,
 }
 
-type Shipped = (
-    Bytes,
-    Arc<datafusion::execution::memory_pool::MemoryReservation>,
-);
+/// A collected build side: sent to the workers, or too large and joined
+/// here (ADR 0099).
+#[derive(Debug, Clone)]
+enum Built {
+    Shipped {
+        bytes: Bytes,
+        /// Held as long as the plan: the bytes' reservation.
+        _memory: Arc<datafusion::execution::memory_pool::MemoryReservation>,
+    },
+    Local(Arc<dyn ExecutionPlan>),
+}
+
+/// `join` (a `CollectLeft` hash join as planned) over the build side
+/// already collected, with its probe side as planned: the coordinator's
+/// own join, for a build side over the broadcast limit (ADR 0099).
+fn local_join(
+    join: &Arc<dyn ExecutionPlan>,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let build =
+        datafusion::datasource::memory::MemorySourceConfig::try_new_exec(&[batches], schema, None)?;
+    let probe = join
+        .children()
+        .get(1)
+        .map(|c| (*c).clone())
+        .ok_or_else(|| DataFusionError::Internal("a join without its probe side".into()))?;
+    use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
+    let local = join.clone().replace_children(
+        vec![build, probe],
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )?;
+    Ok(Arc::new(CoalescePartitionsExec::new(local)))
+}
 
 impl RemoteBroadcastExec {
-    fn new(build: Arc<dyn ExecutionPlan>, probe: Arc<RemoteScanExec>, join_type: String) -> Self {
+    fn new(
+        build: Arc<dyn ExecutionPlan>,
+        probe: Arc<RemoteScanExec>,
+        join_type: String,
+        join: Arc<dyn ExecutionPlan>,
+    ) -> Self {
         Self {
             build,
             probe,
             join_type,
+            join,
             shipped: Arc::default(),
         }
     }
@@ -1223,6 +1296,7 @@ impl ExecutionPlan for RemoteBroadcastExec {
             build,
             self.probe.clone(),
             self.join_type.clone(),
+            self.join.clone(),
         )))
     }
 
@@ -1232,10 +1306,16 @@ impl ExecutionPlan for RemoteBroadcastExec {
         ctx: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let tag = ctx.session_config().get_extension::<QueryTag>();
-        let (build, shipped, probe) =
-            (self.build.clone(), self.shipped.clone(), self.probe.clone());
+        let (build, shipped, probe, join) = (
+            self.build.clone(),
+            self.shipped.clone(),
+            self.probe.clone(),
+            self.join.clone(),
+        );
+        let limit = self.probe.workers.broadcast_limit;
+        let task = ctx.clone();
         let body = stream::once(async move {
-            let (bytes, _) = shipped
+            let built = shipped
                 .get_or_init(|| async move {
                     let fail = |e: DataFusionError| e.to_string();
                     let schema = build.schema();
@@ -1250,18 +1330,33 @@ impl ExecutionPlan for RemoteBroadcastExec {
                     }
                     writer.finish().map_err(|e| e.to_string())?;
                     let bytes = writer.into_inner().map_err(|e| e.to_string())?;
+                    // Over the limit (ADR 0099): not sent to every worker;
+                    // the join runs here, on the build side in hand.
+                    if bytes.len() > limit {
+                        return local_join(&join, schema, batches)
+                            .map(Built::Local)
+                            .map_err(fail);
+                    }
                     // Held as long as the plan: the build side is sent
                     // once per fragment.
                     let memory =
                         datafusion::execution::memory_pool::MemoryConsumer::new("broadcast-build")
                             .register(ctx.memory_pool());
                     memory.try_grow(bytes.len()).map_err(fail)?;
-                    Ok((Bytes::from(bytes), Arc::new(memory)))
+                    Ok(Built::Shipped {
+                        bytes: Bytes::from(bytes),
+                        _memory: Arc::new(memory),
+                    })
                 })
                 .await
                 .clone()
                 .map_err(|e| DataFusionError::External(e.into()))?;
-            Ok::<_, DataFusionError>(probe.fragment_stream(partition, tag, Some(bytes)))
+            Ok::<_, DataFusionError>(match built {
+                Built::Shipped { bytes, .. } => probe.fragment_stream(partition, tag, Some(bytes)),
+                // The local join, whole, as the first partition.
+                Built::Local(local) if partition == 0 => local.execute(0, task)?.boxed(),
+                Built::Local(_) => stream::empty().boxed(),
+            })
         })
         .flat_map(|r| match r {
             Ok(s) => s,
@@ -1289,6 +1384,9 @@ pub struct RemoteGatheredJoinExec {
     /// The probe side's schema, for the NULLs of build-only rows.
     probe_schema: SchemaRef,
     projection: Option<Vec<usize>>,
+    /// The join as planned, run here over a build side above the
+    /// broadcast limit (ADR 0099).
+    join: Arc<dyn ExecutionPlan>,
     properties: Arc<PlanProperties>,
 }
 
@@ -1300,6 +1398,7 @@ impl RemoteGatheredJoinExec {
         schema: SchemaRef,
         probe_schema: SchemaRef,
         projection: Option<Vec<usize>>,
+        join: Arc<dyn ExecutionPlan>,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -1314,6 +1413,7 @@ impl RemoteGatheredJoinExec {
             schema,
             probe_schema,
             projection,
+            join,
             properties,
         }
     }
@@ -1368,6 +1468,7 @@ impl ExecutionPlan for RemoteGatheredJoinExec {
             self.schema.clone(),
             self.probe_schema.clone(),
             self.projection.clone(),
+            self.join.clone(),
         )))
     }
 
@@ -1393,6 +1494,7 @@ impl ExecutionPlan for RemoteGatheredJoinExec {
             self.projection.clone(),
         );
         let out = schema.clone();
+        let (join, limit) = (self.join.clone(), self.probe.workers.broadcast_limit);
         let body = stream::once(async move {
             let build_schema = build.schema();
             let batches = datafusion::physical_plan::collect(build, ctx.clone()).await?;
@@ -1403,6 +1505,12 @@ impl ExecutionPlan for RemoteGatheredJoinExec {
             writer.write(&rows)?;
             writer.finish()?;
             let bytes = Bytes::from(writer.into_inner()?);
+            // Over the limit (ADR 0099): joined here, on the build side in
+            // hand, the probe side's rows pulled as a plain scan.
+            if bytes.len() > limit {
+                let local = local_join(&join, build_schema, vec![rows])?;
+                return Ok::<_, DataFusionError>(local.execute(0, ctx)?.boxed());
+            }
             let memory = datafusion::execution::memory_pool::MemoryConsumer::new("broadcast-build")
                 .register(ctx.memory_pool());
             memory.try_grow(bytes.len() + rows.get_array_memory_size())?;
@@ -1424,7 +1532,14 @@ impl ExecutionPlan for RemoteGatheredJoinExec {
                     }
                 }
                 let kept = joined_rows
-                    .then(|| RecordBatch::try_new(schema.clone(), batch.columns()[..last].to_vec()))
+                    .then(|| {
+                        RecordBatch::try_new_with_options(
+                            schema.clone(),
+                            batch.columns()[..last].to_vec(),
+                            &datafusion::arrow::array::RecordBatchOptions::new()
+                                .with_row_count(Some(batch.num_rows())),
+                        )
+                    })
                     .transpose()
                     .map_err(DataFusionError::from);
                 futures::future::ready(kept)
@@ -1441,7 +1556,7 @@ impl ExecutionPlan for RemoteGatheredJoinExec {
                     &out,
                 )
             });
-            Ok::<_, DataFusionError>(joined.chain(tail))
+            Ok::<_, DataFusionError>(joined.chain(tail).boxed())
         })
         .try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -2031,6 +2146,9 @@ fn broadcast_join(
     let Some(probe) = r.as_ref().downcast_ref::<RemoteScanExec>() else {
         return Ok(None);
     };
+    if probe.workers.broadcast_limit == 0 {
+        return Ok(None);
+    }
     if probe.fragments.is_empty()
         || probe
             .fragments
@@ -2085,6 +2203,7 @@ fn broadcast_join(
                 join.schema(),
                 join.right().schema(),
                 join.projection.as_ref().map(|p| p.to_vec()),
+                node.clone(),
             )),
         ))));
     }
@@ -2095,6 +2214,7 @@ fn broadcast_join(
             build,
             probe,
             join.join_type().to_string(),
+            node.clone(),
         )),
     ))))
 }
@@ -2396,7 +2516,16 @@ pub fn conform(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
             }
         })
         .collect::<Result<Vec<_>, _>>()
-        .and_then(|cols| RecordBatch::try_new(schema.clone(), cols))
+        .and_then(|cols| {
+            // A join that needs no column (`count(*)` over `EXISTS`)
+            // returns rows with no columns: only their count says how many.
+            RecordBatch::try_new_with_options(
+                schema.clone(),
+                cols,
+                &datafusion::arrow::array::RecordBatchOptions::new()
+                    .with_row_count(Some(batch.num_rows())),
+            )
+        })
         .map_err(DataFusionError::from)
 }
 

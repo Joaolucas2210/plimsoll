@@ -449,6 +449,15 @@ async fn distributed_scans_match_local_ones() {
                 ),
                 Some(true),
             ),
+            // A join that keeps no column (`count(*)` over `EXISTS`): the
+            // workers' rows carry only their count.
+            (
+                format!(
+                    "SELECT count(*) FROM {t} a WHERE EXISTS \
+                     (SELECT 1 FROM {t} b WHERE b.id = a.id AND b.id < 5)"
+                ),
+                None,
+            ),
             // NOT IN is null-aware: it stays as planned.
             (
                 format!(
@@ -473,6 +482,45 @@ async fn distributed_scans_match_local_ones() {
                 assert_eq!(plan.contains("RemoteBroadcast"), broadcast, "{sql}: {plan}");
             }
             assert_eq!(got, want, "{sql}");
+        }
+    }
+    // Build sides over the broadcast limit (ADR 0099) are joined on the
+    // coordinator instead, with the same answers.
+    let capped = Engine::new(
+        Arc::new(CeilingPool::new(256 << 20, 8 << 20).unwrap()),
+        None,
+    )
+    .unwrap();
+    coordinate(
+        &capped,
+        Workers::new(urls.clone(), TOKEN.into())
+            .unwrap()
+            .with_broadcast_limit(1),
+    );
+    {
+        let state = capped.context().state_ref();
+        let mut state = state.write();
+        let optimizer = &mut state.config_mut().options_mut().optimizer;
+        optimizer.hash_join_single_partition_threshold = 1 << 20;
+        optimizer.hash_join_single_partition_threshold_rows = 128 * 1024;
+    }
+    for (name, location) in &tables {
+        IcebergConnector::try_new(name.to_lowercase(), location, &capped.context().state())
+            .await
+            .unwrap()
+            .register(capped.context())
+            .unwrap();
+        let t = name.to_lowercase();
+        for sql in [
+            format!("SELECT a.id, b.id AS b FROM {t} a JOIN {t} b ON a.id = b.id ORDER BY a.id"),
+            format!(
+                "SELECT a.id, b.id AS b FROM (SELECT id FROM {t} WHERE id < 8) a \
+                 LEFT JOIN (SELECT id FROM {t} WHERE id % 2 = 0) b ON a.id = b.id ORDER BY a.id"
+            ),
+        ] {
+            let (got, plan) = run(&capped, &sql).await;
+            assert!(plan.contains("RemoteBroadcast"), "{sql}: {plan}");
+            assert_eq!(got, run(&local, &sql).await.0, "{sql}");
         }
     }
     collect_left(false);

@@ -50,6 +50,14 @@ pub struct Config {
     /// entries re-resolved into workers (ADR 0070); set, this node
     /// coordinates.
     pub workers: Vec<String>,
+    /// `PLIMSOLL_TLS_CERT` / `PLIMSOLL_TLS_KEY`: serve TLS (ADR 0099).
+    pub tls: Option<crate::tls::TlsFiles>,
+    /// `PLIMSOLL_TLS_CA`: a PEM bundle trusted, besides the system roots,
+    /// for HTTPS to workers (ADR 0099).
+    pub tls_ca: Option<std::path::PathBuf>,
+    /// `PLIMSOLL_BROADCAST_MAX_BYTES`: the largest build side a broadcast
+    /// join sends to workers (ADR 0099); 0 = no broadcasts.
+    pub broadcast_max_bytes: usize,
 }
 
 impl Config {
@@ -95,6 +103,35 @@ impl Config {
             "PLIMSOLL_MAINTENANCE_INTERVAL_MS",
             Some(0),
             "expected a non-negative integer",
+        )?;
+
+        let path = |var: &str| {
+            lookup(var)
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from)
+        };
+        let tls = match (path("PLIMSOLL_TLS_CERT"), path("PLIMSOLL_TLS_KEY")) {
+            (Some(cert), Some(key)) => Some(crate::tls::TlsFiles { cert, key }),
+            (None, None) => None,
+            (cert, _) => {
+                return Err(ConfigError {
+                    var: if cert.is_some() {
+                        "PLIMSOLL_TLS_KEY"
+                    } else {
+                        "PLIMSOLL_TLS_CERT"
+                    },
+                    value: String::new(),
+                    reason: "TLS needs both PLIMSOLL_TLS_CERT and PLIMSOLL_TLS_KEY",
+                });
+            }
+        };
+        let tls_ca = path("PLIMSOLL_TLS_CA");
+        let broadcast_max_bytes: usize = parse(
+            &lookup,
+            "PLIMSOLL_BROADCAST_MAX_BYTES",
+            Some(plimsoll_connectors::remote::DEFAULT_BROADCAST_LIMIT),
+            "expected a non-negative integer (bytes)",
         )?;
 
         let (groups, group_memory) = resource_groups(&lookup)?;
@@ -184,6 +221,9 @@ impl Config {
             slow_query: (slow_ms > 0).then(|| Duration::from_millis(slow_ms)),
             worker_token,
             workers,
+            tls,
+            tls_ca,
+            broadcast_max_bytes,
         })
     }
 }
@@ -436,6 +476,26 @@ mod tests {
         .unwrap_err();
         assert_eq!(e.var, "OTEL_EXPORTER_OTLP_HEADERS");
         assert!(!e.to_string().contains("s3cr3t"), "{e}");
+    }
+
+    #[test]
+    fn tls_needs_both_files_and_broadcasts_have_a_limit() {
+        let c = cfg(&[]).unwrap();
+        assert_eq!(c.tls, None);
+        assert_eq!(c.broadcast_max_bytes, 64 << 20);
+        let c = cfg(&[
+            ("PLIMSOLL_TLS_CERT", "/etc/plimsoll/tls.crt"),
+            ("PLIMSOLL_TLS_KEY", "/etc/plimsoll/tls.key"),
+            ("PLIMSOLL_TLS_CA", "/etc/plimsoll/ca.pem"),
+            ("PLIMSOLL_BROADCAST_MAX_BYTES", "0"),
+        ])
+        .unwrap();
+        assert!(c.tls.is_some() && c.tls_ca.is_some());
+        assert_eq!(c.broadcast_max_bytes, 0);
+        let e = cfg(&[("PLIMSOLL_TLS_CERT", "/etc/plimsoll/tls.crt")]).unwrap_err();
+        assert_eq!(e.var, "PLIMSOLL_TLS_KEY");
+        let e = cfg(&[("PLIMSOLL_TLS_KEY", "/etc/plimsoll/tls.key")]).unwrap_err();
+        assert_eq!(e.var, "PLIMSOLL_TLS_CERT");
     }
 
     #[test]

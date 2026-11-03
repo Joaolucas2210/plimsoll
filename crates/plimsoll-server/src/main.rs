@@ -75,12 +75,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .with_result_cache(usize::try_from(cfg.result_cache_bytes)?),
     );
     system::register(engine.context(), admission.registry().clone())?;
+    // A private CA for HTTPS between nodes (ADR 0099), before any client.
+    if let Some(ca) = &cfg.tls_ca {
+        let pem =
+            std::fs::read(ca).map_err(|e| format!("PLIMSOLL_TLS_CA {}: {e}", ca.display()))?;
+        let n = plimsoll_connectors::remote::trust(&pem)
+            .map_err(|e| format!("PLIMSOLL_TLS_CA {}: {e}", ca.display()))?;
+        if n == 0 {
+            return Err(format!("PLIMSOLL_TLS_CA {}: no certificate", ca.display()).into());
+        }
+    }
     // Coordinator (ADR 0058): Iceberg scans fan out to these workers.
     if let (false, Some(token)) = (cfg.workers.is_empty(), &cfg.worker_token) {
-        let workers = Arc::new(plimsoll_connectors::remote::Workers::new(
-            cfg.workers.clone(),
-            token.clone(),
-        )?);
+        let workers = Arc::new(
+            plimsoll_connectors::remote::Workers::new(cfg.workers.clone(), token.clone())?
+                .with_broadcast_limit(cfg.broadcast_max_bytes),
+        );
         {
             // count/sum/min/max partials computed on workers (ADR 0061),
             // appended after DataFusion's own physical rules.
@@ -189,6 +199,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
+    // Loaded before listening: a bad certificate fails the boot (ADR 0099).
+    let tls = cfg
+        .tls
+        .as_ref()
+        .map(plimsoll_server::tls::acceptor)
+        .transpose()
+        .map_err(|e| format!("TLS: {e}"))?;
     log::emit(
         Level::Info,
         "listening",
@@ -199,6 +216,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "otlp": cfg.otlp.as_ref().map(|o| o.endpoint.as_str()),
             "workers": cfg.workers,
             "worker": cfg.worker_token.is_some(),
+            "tls": tls.is_some(),
         }),
     );
     if cfg.auth == Auth::Disabled {
@@ -217,9 +235,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     state.serving.store(true, Ordering::Relaxed);
     state.ready.store(true, Ordering::Relaxed);
 
-    axum::serve(listener, app::router(state.clone()))
-        .with_graceful_shutdown(shutdown_signal(state.clone(), cfg.drain_delay))
-        .await?;
+    let router = app::router(state.clone());
+    let shutdown = shutdown_signal(state.clone(), cfg.drain_delay);
+    match tls {
+        Some(acceptor) => {
+            let listener = plimsoll_server::tls::TlsListener::new(listener, acceptor)?;
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown)
+                .await?;
+        }
+        None => {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown)
+                .await?;
+        }
+    }
     // Spans of the last queries: flushed, but never allowed to hold the exit.
     if let (Some(tracer), Some(exporter)) = (&state.tracer, exporter) {
         tracer.shutdown();
