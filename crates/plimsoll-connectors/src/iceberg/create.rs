@@ -40,13 +40,7 @@ pub fn create_request(
             let source = schema
                 .index_of(column)
                 .map_err(|_| unsupported(format!("PARTITION BY: no column {column}")))?;
-            // Iceberg's own names: `region`, `id_bucket`, `ts_day`.
-            let base = transform.split('[').next().unwrap_or(transform);
-            let name = match base {
-                "identity" => column.clone(),
-                "truncate" => format!("{column}_trunc"),
-                b => format!("{column}_{b}"),
-            };
+            let name = partition_name(transform, column);
             Ok(json!({
                 "source-id": source + 1,
                 "field-id": FIRST_PARTITION_FIELD + i,
@@ -74,6 +68,15 @@ pub fn create_request(
         "partition-spec": {"spec-id": 0, "fields": spec},
         "properties": props,
     }))
+}
+
+/// Iceberg's own partition field names: `region`, `id_bucket`, `ts_day`.
+pub(super) fn partition_name(transform: &str, column: &str) -> String {
+    match transform.split('[').next().unwrap_or(transform) {
+        "identity" => column.to_owned(),
+        "truncate" => format!("{column}_trunc"),
+        b => format!("{column}_{b}"),
+    }
 }
 
 /// ponytail: primitives only; nested types when the writer takes them.

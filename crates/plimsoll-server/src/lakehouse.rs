@@ -734,6 +734,26 @@ mod tests {
             duplicate.to_string().contains("more than one"),
             "{duplicate}"
         );
+        // Partition evolution (ADR 0085): a second spec; a delete on a file
+        // of each spec, each delete in its file's spec; compaction below
+        // moves the old spec's files to the new one.
+        Box::pin(async {
+            text(&format!(
+                "ALTER TABLE {p} ADD PARTITION FIELD bucket(2, id)"
+            ))
+            .await;
+            text(&format!("INSERT INTO {p} VALUES (40, 'us')")).await;
+            text(&format!("DELETE FROM {p} WHERE id = 40")).await;
+            text(&format!("UPDATE {p} SET region = 'us' WHERE id = 3")).await;
+            let specs = text(&format!(
+                "SELECT DISTINCT content, spec_id FROM bronze.\"{parted}$files\" ORDER BY 1, 2"
+            ))
+            .await;
+            for row in ["| 1       | 0       |", "| 1       | 1       |"] {
+                assert!(specs.contains(row), "{specs}");
+            }
+        })
+        .await;
         // Compaction (ADR 0078): the partition with deletes, and the one
         // with small files, rewritten; the rows unchanged; the position
         // deletes gone with the files they referenced.
@@ -754,6 +774,14 @@ mod tests {
             .collect();
         assert_eq!(ids, ["| 1  |", "| 3  |", "| 11 |"]);
         let after = files(format!("SELECT content, count(*) AS n FROM bronze.\"{parted}$files\" GROUP BY content ORDER BY content")).await;
+        let spec = files(format!(
+            "SELECT DISTINCT spec_id FROM bronze.\"{parted}$files\""
+        ))
+        .await;
+        assert!(
+            spec.contains("| 1       |") && !spec.contains("| 0       |"),
+            "{spec}"
+        );
         assert!(
             !after.contains("| 1       |"),
             "no position deletes after: {after}"

@@ -111,6 +111,13 @@ impl Layout {
 
     /// Why `meta` cannot take an append, as an `Err`.
     pub(super) fn of(meta: &Json) -> std::result::Result<Self, String> {
+        Self::of_spec(meta, meta["default-spec-id"].as_i64().unwrap_or(0))
+    }
+
+    /// [`Self::of`] with partition spec `spec_id`, default or not: the
+    /// manifest of position deletes for files written under an older spec
+    /// (ADR 0085).
+    pub(super) fn of_spec(meta: &Json, spec_id: i64) -> std::result::Result<Self, String> {
         if meta["format-version"].as_i64() != Some(2) {
             return Err(format!(
                 "INSERT supports Iceberg format v2 tables (this one is v{})",
@@ -131,14 +138,13 @@ impl Layout {
                 )
             })
             .collect();
-        let spec_id = meta["default-spec-id"].as_i64().unwrap_or(0);
         let spec_fields = meta["partition-specs"]
             .as_array()
             .into_iter()
             .flatten()
             .find(|s| s["spec-id"].as_i64() == Some(spec_id))
             .map(|s| s["fields"].clone())
-            .unwrap_or_else(|| json!([]));
+            .ok_or_else(|| format!("partition spec {spec_id} is missing"))?;
         let parsed = partition_spec(&spec_fields);
         let mut parts = Vec::new();
         for (raw, field) in spec_fields.as_array().into_iter().flatten().zip(parsed) {
@@ -285,6 +291,9 @@ pub(super) struct Written {
     referenced: Option<String>,
     /// 0: data file; 1: position delete file.
     content: i32,
+    /// The partition spec `partition` is in: the default spec for new
+    /// data, the data file's own for its position deletes (ADR 0085).
+    spec: i64,
 }
 
 /// What a commit adds.
@@ -598,6 +607,7 @@ impl IcebergSink {
                 .collect(),
             referenced: None,
             content: 0,
+            spec: self.layout.spec_id,
         })
     }
 
@@ -630,26 +640,30 @@ impl IcebergSink {
         // Positive, as Java writers make them.
         let snapshot_id = (unique() >> 1) as i64;
         let meta = self.committer.current().await.map_err(failed)?;
-        // One manifest per content: data files, then position deletes.
+        // One manifest per content and partition spec: data files, then
+        // position deletes, each in its data file's spec (ADR 0085).
         let mut manifests = Vec::new();
-        for content in [0, 1] {
-            let group: Vec<&Written> = files.iter().filter(|f| f.content == content).collect();
-            if group.is_empty() {
-                continue;
-            }
-            let path = format!("{}/metadata/{snapshot_id:x}-m{content}.avro", self.location);
-            let bytes = manifest(
-                &meta,
-                &self.layout,
-                &group,
-                snapshot_id,
-                self.schema_id,
-                content,
-            )
-            .map_err(|e| failed(format!("manifest: {e}")))?;
+        let groups: std::collections::BTreeSet<(i32, i64)> =
+            files.iter().map(|f| (f.content, f.spec)).collect();
+        for (content, spec) in groups {
+            let group: Vec<&Written> = files
+                .iter()
+                .filter(|f| (f.content, f.spec) == (content, spec))
+                .collect();
+            let layout = if spec == self.layout.spec_id {
+                self.layout.clone()
+            } else {
+                Layout::of_spec(&meta, spec).map_err(failed)?
+            };
+            let path = format!(
+                "{}/metadata/{snapshot_id:x}-m{content}-s{spec}.avro",
+                self.location
+            );
+            let bytes = manifest(&meta, &layout, &group, snapshot_id, self.schema_id, content)
+                .map_err(|e| failed(format!("manifest: {e}")))?;
             let length = bytes.len() as i64;
             self.put_bytes(&path, bytes, env).await?;
-            manifests.push((content, path, length, group));
+            manifests.push((content, path, length, group, layout));
         }
         let rows_of = |content: i32| -> u64 {
             files
@@ -751,15 +765,15 @@ impl IcebergSink {
             }
             let new_entries: Vec<ManifestFile> = manifests
                 .iter()
-                .map(|(content, path, length, group)| ManifestFile {
+                .map(|(content, path, length, group, layout)| ManifestFile {
                     path: path.clone(),
                     length: *length,
-                    spec_id: self.layout.spec_id,
+                    spec_id: layout.spec_id,
                     sequence,
                     snapshot_id,
                     files: group.len() as i64,
                     rows: group.iter().map(|f| f.rows as i64).sum(),
-                    partitions: summaries(&self.layout, group),
+                    partitions: summaries(layout, group),
                     content: *content,
                 })
                 .collect();
@@ -850,6 +864,9 @@ impl IcebergSink {
 /// a running count is each row's position.
 pub(super) struct Target {
     pub(super) path: String,
+    /// The data file's partition spec and its partition in it: its
+    /// position deletes go there (ADR 0085).
+    pub(super) spec: i64,
     pub(super) partition: Key,
     /// Rows surviving earlier position deletes; `None` = all rows.
     pub(super) selection: Option<datafusion::parquet::arrow::arrow_reader::RowSelection>,
@@ -1179,6 +1196,7 @@ impl IcebergSink {
             ],
             referenced: Some(target.path.clone()),
             content: 1,
+            spec: target.spec,
         })
     }
 }
@@ -1945,6 +1963,7 @@ mod tests {
                 .collect(),
             referenced: None,
             content: 0,
+            spec: 0,
         }];
         let refs: Vec<&Written> = files.iter().collect();
         let bytes = manifest(&meta, &layout, &refs, 7, 0, 0).unwrap();
@@ -2067,6 +2086,7 @@ mod tests {
             stats: vec![],
             content: i32::from(referenced.is_some()),
             referenced: referenced.map(str::to_owned),
+            spec: 0,
         };
         // A data manifest with two files, sequence numbers inherited.
         let data = manifest(

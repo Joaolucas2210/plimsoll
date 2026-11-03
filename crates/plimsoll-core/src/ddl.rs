@@ -1,5 +1,5 @@
 //! `CREATE TABLE` and `ALTER TABLE` through the query API (ADR 0083,
-//! 0084).
+//! 0084, 0085).
 //!
 //! DataFusion would create an in-memory table; Plimsoll instead hands the
 //! statement's schema, partitioning and properties, or the changes to a
@@ -60,6 +60,20 @@ pub enum Alteration {
         data_type: DataType,
     },
     SetProperties(Vec<(String, String)>),
+    /// `ADD PARTITION FIELD bucket(16, id) [AS name]` (ADR 0085), in
+    /// [`NewTable::partition`]'s spelling.
+    AddPartitionField {
+        transform: String,
+        column: String,
+        name: Option<String>,
+    },
+    /// `DROP PARTITION FIELD day(ts)` or `DROP PARTITION FIELD name`: a
+    /// bare name matches a partition field's name, else an identity field
+    /// on that column.
+    DropPartitionField {
+        transform: String,
+        column: String,
+    },
 }
 
 impl Alteration {
@@ -69,7 +83,10 @@ impl Alteration {
             Self::DropColumn { name, .. } => Some(name),
             Self::RenameColumn { from, .. } => Some(from),
             Self::DropNotNull(c) | Self::SetType { column: c, .. } => Some(c),
-            Self::AddColumn { .. } | Self::SetProperties(_) => None,
+            Self::AddColumn { .. }
+            | Self::SetProperties(_)
+            | Self::AddPartitionField { .. }
+            | Self::DropPartitionField { .. } => None,
         }
     }
 }
@@ -125,6 +142,9 @@ fn refuse<T>(why: impl Into<String>) -> Result<T> {
 /// of columns and properties. Executes nothing.
 pub(crate) async fn plan(ctx: &SessionContext, sql: &str) -> Result<Planned> {
     let state = ctx.state();
+    if let Some(planned) = partition_change(ctx, sql) {
+        return planned;
+    }
     let dialect = state.config_options().sql_parser.dialect;
     let DFStatement::Statement(statement) = state.sql_to_statement(sql, &dialect)? else {
         return refuse(ONLY_CREATE_TABLE);
@@ -295,6 +315,70 @@ async fn plan_alter(ctx: &SessionContext, alter: AlterTable) -> Result<Planned> 
     })
 }
 
+/// `ALTER TABLE [IF EXISTS] t ADD PARTITION FIELD expr [AS name]` or
+/// `… DROP PARTITION FIELD expr` (Spark's syntax, ADR 0085), which the SQL
+/// parser has no statement for; `None` when `sql` is not one.
+fn partition_change(ctx: &SessionContext, sql: &str) -> Option<Result<Planned>> {
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
+    use datafusion::sql::sqlparser::keywords::Keyword;
+    use datafusion::sql::sqlparser::parser::Parser;
+    use datafusion::sql::sqlparser::tokenizer::Token;
+    let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?;
+    if !p.parse_keywords(&[Keyword::ALTER, Keyword::TABLE]) {
+        return None;
+    }
+    let if_exists = p.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+    let name = p.parse_object_name(false).ok()?;
+    let add = p.parse_one_of_keywords(&[Keyword::ADD, Keyword::DROP])? == Keyword::ADD;
+    if !p.parse_keyword(Keyword::PARTITION)
+        || !p
+            .parse_identifier()
+            .is_ok_and(|i| i.value.eq_ignore_ascii_case("field"))
+    {
+        return None;
+    }
+    let planned = (|| {
+        let expr = p
+            .parse_expr()
+            .map_err(|e| DataFusionError::Plan(e.to_string()))?;
+        let alias = if add && p.parse_keyword(Keyword::AS) {
+            let i = p
+                .parse_identifier()
+                .map_err(|e| DataFusionError::Plan(e.to_string()))?;
+            Some(match i.quote_style {
+                Some(_) => i.value,
+                None => i.value.to_lowercase(),
+            })
+        } else {
+            None
+        };
+        let _ = p.consume_token(&Token::SemiColon);
+        if p.peek_token().token != Token::EOF {
+            return refuse(format!(
+                "unexpected {} after the partition field",
+                p.peek_token()
+            ));
+        }
+        let (transform, column) = partition_field(&expr)?;
+        let change = if add {
+            Alteration::AddPartitionField {
+                transform,
+                column,
+                name: alias,
+            }
+        } else {
+            Alteration::DropPartitionField { transform, column }
+        };
+        let table = served(ctx, TableReference::from(name.to_string().as_str()))?;
+        Ok(Planned::Alter {
+            table,
+            changes: vec![change],
+            if_exists,
+        })
+    })();
+    Some(planned)
+}
+
 /// A column definition as DataFusion's `CREATE TABLE` would type it.
 async fn field(ctx: &SessionContext, def: ColumnDef) -> Result<Field> {
     let create = CreateTableBuilder::new(ObjectName::from(vec![Ident::new("t")]))
@@ -459,6 +543,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plans_partition_field_changes() {
+        let ctx = served();
+        let changes = |sql: &'static str| {
+            let ctx = ctx.clone();
+            async move {
+                match plan(&ctx, sql).await.unwrap() {
+                    Planned::Alter { changes, .. } => changes,
+                    p => panic!("{p:?}"),
+                }
+            }
+        };
+        assert_eq!(
+            changes("alter table bronze.t add partition field bucket(16, ID) as shard;").await,
+            [Alteration::AddPartitionField {
+                transform: "bucket[16]".into(),
+                column: "id".into(),
+                name: Some("shard".into())
+            }]
+        );
+        assert_eq!(
+            changes("ALTER TABLE IF EXISTS bronze.t DROP PARTITION FIELD days(ts)").await,
+            [Alteration::DropPartitionField {
+                transform: "day".into(),
+                column: "ts".into()
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn plans_column_and_property_changes_and_refuses_the_rest() {
         let ctx = served();
         let Planned::Alter {
@@ -513,6 +626,9 @@ mod tests {
             "ALTER TABLE bronze.t ALTER COLUMN x SET DEFAULT 1",
             "ALTER TABLE nowhere.t ADD COLUMN x INT",
             "ALTER VIEW v AS SELECT 1",
+            "ALTER TABLE bronze.t ADD PARTITION FIELD sqrt(x)",
+            "ALTER TABLE bronze.t ADD PARTITION FIELD x extra",
+            "ALTER TABLE nowhere.t ADD PARTITION FIELD x",
         ] {
             assert!(plan(&ctx, sql).await.is_err(), "{sql}");
         }

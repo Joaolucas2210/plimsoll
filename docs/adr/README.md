@@ -92,6 +92,7 @@ are allowed in place.
 | [0082](0082-merge-into-iceberg.md) | `MERGE INTO` Iceberg tables | Accepted | 2026-11-03 | `MERGE` is allowed under the write grant plus a read grant on every target column, refused under a row filter on the target; `ON` equalities hash the collected source, other conjuncts are a residual; target files are read as for DELETE, the first matching WHEN decides; position deletes and new rows in one `overwrite` snapshot; a target row matched twice is an error | 0081, 0077, 0076, 0024, 0045 |
 | [0083](0083-create-table.md) | `CREATE TABLE` through the catalog | Accepted | 2026-11-03 | A statement starting with `CREATE` is parsed and planned without executing; only a plain `CREATE TABLE` in a served schema passes, under `check_write`; a session `TableCreator` (the REST catalog) creates it as format v2 with `PARTITION BY` transforms and `OPTIONS` properties; CTAS, views, external tables and the rest of DDL refused | 0024, 0075, 0076, 0025 |
 | [0084](0084-alter-table.md) | `ALTER TABLE`: schema evolution and properties | Accepted | 2026-11-03 | Add (nullable, fresh ids), drop (not partition sources or identifier fields), rename (ids kept), `DROP NOT NULL`, Iceberg promotions and `SET TBLPROPERTIES`, committed as one new current schema with schema-id and last-column-id requirements, retried on conflict; write grant plus `check_columns` on touched columns; result cache pinned by schema id too | 0083, 0040, 0044, 0038 |
+| [0085](0085-partition-evolution.md) | Partition evolution | Accepted | 2026-11-03 | `ALTER TABLE … ADD | DROP PARTITION FIELD` (Spark syntax, own small parser) makes a new default spec or reuses an existing one, field ids reused, only writable specs; position deletes go in their data file's spec (one manifest per content and spec), so DELETE/UPDATE/MERGE work on evolved tables; compaction always rewrites old-spec files into the current spec | 0084, 0076, 0077, 0078, 0055 |
 
 ## Reading order
 
@@ -100,7 +101,7 @@ are allowed in place.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
 - Federation: 0005 → 0006.
 - Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074.
-- Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084.
+- Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084 → 0085.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046.
 

@@ -1573,13 +1573,6 @@ impl IcebergTable {
         let (files, _, _) = self.data_files(state, &pruner).await?;
         let mut targets = Vec::with_capacity(files.len());
         for file in files {
-            if file.spec != sink.layout.spec_id() {
-                return Err(DataFusionError::Plan(format!(
-                    "cannot {verb} {}: files written under an older partition spec are not \
-                     supported yet",
-                    self.name
-                )));
-            }
             let whole = DataFile {
                 path: file.path.clone(),
                 size: file.size,
@@ -1593,6 +1586,7 @@ impl IcebergTable {
             let plan = self.parquet_scan(state, &[&whole], None, &[], None).await?;
             targets.push(write::Target {
                 path: file.path,
+                spec: file.spec,
                 partition: prune::partition_values(file.partition.as_ref()),
                 selection: file.selection,
                 plan,
@@ -1612,7 +1606,11 @@ impl IcebergTable {
         let (files, _, _) = planner.data_files(state, &Pruner::default()).await?;
         let mut groups: BTreeMap<String, (bool, Vec<String>)> = BTreeMap::new();
         for file in files {
-            let deletes = file.selection.is_some() || !file.eq.is_empty();
+            // A file under an older partition spec is rewritten into the
+            // current one, alone if need be (ADR 0085).
+            let deletes = file.selection.is_some()
+                || !file.eq.is_empty()
+                || file.spec != sink.layout.spec_id();
             let small = file.size.is_none_or(|s| s < SMALL_FILE_BYTES);
             if !(deletes || small) {
                 continue;

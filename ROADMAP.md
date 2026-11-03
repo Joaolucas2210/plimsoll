@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Partition evolution: `ALTER TABLE … ADD | DROP PARTITION FIELD` (field ids and specs reused); position deletes written in their data file's spec, one manifest per content and spec; compaction moves old-spec files to the current spec (ADR 0085)
 - [x] `ALTER TABLE`: add, drop and rename columns, `DROP NOT NULL`, Iceberg type promotions and `SET TBLPROPERTIES`, one schema per statement with retry; renaming a denied column is denied; result cache keyed by schema too (ADR 0084)
 - [x] `CREATE TABLE [IF NOT EXISTS] … PARTITION BY (…) OPTIONS (…)` through the REST catalog under the write grant; the rest of DDL still refused (ADR 0083)
 - [x] `MERGE INTO … USING … ON …`: equi-join on the source, every WHEN form (matched update/delete, not matched insert, not matched by source); one `overwrite` snapshot; target needs read and write grants, row-filtered writers refused (ADR 0082)
@@ -117,22 +118,20 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Partition evolution** — `DELETE`, `UPDATE`, `MERGE` and compaction
-correct for files written under older partition specs (position deletes
-take the data file's spec), then `ALTER TABLE … ADD | DROP PARTITION
-FIELD`.
+**Scheduled maintenance** — compaction, snapshot expiration and orphan
+removal run by per-table policy (table properties) on a schedule,
+instead of only on demand, under one maintenance principal.
 
 ## Missing
 
 **Lakehouse writes** (the largest gap)
 - Appends to v3 and nested columns; decimal partition values; data
   files written on workers; vectorized partition transforms.
-- `MERGE` beyond the pool (spilled source); deletion vectors for v3 tables;
-  deletes across partition spec evolution.
-- Scheduled maintenance (compaction, expiration, orphans) by policy
-  instead of on demand.
-- DDL: partition evolution (above), nested field evolution, `DROP
-  TABLE` under its own grant, and one-commit `CREATE TABLE … AS SELECT`.
+- `MERGE` beyond the pool (spilled source); deletion vectors for v3
+  tables.
+- Scheduled maintenance (above).
+- DDL: nested field evolution, `DROP TABLE` under its own grant, and
+  one-commit `CREATE TABLE … AS SELECT`.
 
 **Distribution**
 - Left, full and left-semi/anti joins against small sides on workers;

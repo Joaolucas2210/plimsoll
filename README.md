@@ -227,7 +227,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 ## Decision records
 
 Index with status, date and the one-line decision of every ADR:
-[docs/adr/README.md](docs/adr/README.md) (0001–0084; template in
+[docs/adr/README.md](docs/adr/README.md) (0001–0085; template in
 [docs/adr/0000-template.md](docs/adr/0000-template.md)).
 
 Roadmap: [ROADMAP.md](ROADMAP.md).
@@ -238,10 +238,10 @@ Roadmap: [ROADMAP.md](ROADMAP.md).
   formats. Open formats (Parquet, Iceberg) and open catalogs only.
 - No in-process TLS yet; deploy the query API behind a TLS-terminating
   proxy. Authentication is bearer tokens (ADR 0021).
-- Writes are `CREATE TABLE`, `ALTER TABLE` (columns and properties),
-  `INSERT INTO`, `UPDATE`, `DELETE FROM`, `MERGE INTO` and table
-  maintenance (compaction, snapshot expiration, orphan removal; ADR
-  0075–0084): no partition evolution or `DROP` yet. See
+- Writes are `CREATE TABLE`, `ALTER TABLE` (columns, properties and
+  partition fields), `INSERT INTO`, `UPDATE`, `DELETE FROM`, `MERGE INTO`
+  and table maintenance (compaction, snapshot expiration, orphan removal;
+  ADR 0075–0085): no `DROP` yet. See
   [ROADMAP.md](ROADMAP.md).
 
 ## License
