@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] `MERGE` on workers: the source attached to each fragment of target files; workers run `WHEN MATCHED` / `NOT MATCHED BY SOURCE` with clauses as SQL over a renamed merged row and report the source rows they paired; the coordinator inserts the unpaired ones and commits one overwrite (ADR 0094)
 - [x] `DELETE` and `UPDATE` on workers: target files split across workers, each rewriting its own (position deletes, rewritten rows) from the predicate and new values shipped as SQL; the coordinator commits one delete/overwrite (ADR 0093)
 - [x] CTAS and post-shuffle writes on workers: CTAS hands its plan to the create transaction, workers write into the staged table (metadata sent inline); shuffled aggregates and joins are written by their reducers (ADR 0092)
 - [x] Data files written on workers: `INSERT … SELECT` over a remote scan writes its files where the rows are; workers report the files and the coordinator commits one append (ADR 0091)
@@ -126,16 +127,16 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**`MERGE` on workers** — broadcast the source with each fragment of
-target files and ship the `WHEN` clauses as SQL over a qualified merged
-schema, so the last row-level write scales like `DELETE` and `UPDATE`
-(ADR 0093).
+**Appends to v3 tables** — write format v3 (row lineage fields,
+`next-row-id`) and deletion vectors instead of position delete files,
+so v3 tables created by other engines take Plimsoll's writes.
 
 ## Missing
 
 **Lakehouse writes** (the largest gap)
-- Appends to v3; decimal partition values; data
-  `MERGE` on workers (above), broadcast-join writes; vectorized partition transforms.
+- Appends to v3 (above); decimal partition values; data
+  a shuffled `MERGE` for sources larger than a node, broadcast-join
+  writes; vectorized partition transforms.
 - `MERGE` beyond the pool (spilled source); deletion vectors for v3
   tables.
 - Maintenance: a per-table lease for several coordinators, per-step

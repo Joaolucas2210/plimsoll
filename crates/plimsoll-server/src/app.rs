@@ -435,6 +435,7 @@ async fn fragment(
     let kind = match &task {
         Task::Scan(f) if f.write.is_some() => "write",
         Task::Scan(f) if f.change.is_some() => "row_change",
+        Task::Scan(f) if f.merge.is_some() => "merge",
         Task::Scan(f) if f.bucket.is_some() => "shuffle_map",
         Task::Scan(f) if f.broadcast.is_some() => "broadcast_probe",
         Task::Scan(f) if f.aggregate.is_some() => "partial_aggregate",

@@ -215,6 +215,77 @@ pub struct Fragment {
     /// position deletes (and rewritten rows) written, the files returned
     /// as for `write`.
     pub change: Option<RowChange>,
+    /// A `MERGE`'s pass over this fragment's files (ADR 0094), with the
+    /// source attached: `WHEN MATCHED` and `NOT MATCHED BY SOURCE` applied,
+    /// the files written returned, then which source rows paired.
+    pub merge: Option<MergeSpec>,
+}
+
+/// A `MERGE` as a worker runs it (ADR 0094): SQL over the merged row,
+/// whose columns are named `t0…` (target, in table order) then `s0…`
+/// (source, in the attachment's order), so equal names on both sides
+/// stay apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeSpec {
+    pub target_keys: Vec<String>,
+    pub source_keys: Vec<String>,
+    pub residual: Option<String>,
+    pub matched: Vec<ClauseSpec>,
+    pub not_matched_by_source: Vec<ClauseSpec>,
+}
+
+/// One `WHEN` clause: its condition, and `DELETE` or the updated row (a
+/// value per target column).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClauseSpec {
+    pub predicate: Option<String>,
+    pub update: Option<Vec<String>>,
+}
+
+impl MergeSpec {
+    fn to_json(&self) -> Json {
+        let clauses = |c: &[ClauseSpec]| {
+            c.iter()
+                .map(|c| json!({"predicate": c.predicate, "update": c.update}))
+                .collect::<Vec<_>>()
+        };
+        json!({
+            "target_keys": self.target_keys,
+            "source_keys": self.source_keys,
+            "residual": self.residual,
+            "matched": clauses(&self.matched),
+            "not_matched_by_source": clauses(&self.not_matched_by_source),
+        })
+    }
+
+    fn from_json(v: &Json) -> Result<Option<Self>, String> {
+        if v.is_null() {
+            return Ok(None);
+        }
+        let clauses = |key: &str| -> Result<Vec<ClauseSpec>, String> {
+            v[key]
+                .as_array()
+                .ok_or(format!("`merge.{key}` must be an array"))?
+                .iter()
+                .map(|c| {
+                    Ok(ClauseSpec {
+                        predicate: c["predicate"].as_str().map(str::to_owned),
+                        update: match &c["update"] {
+                            Json::Null => None,
+                            u => Some(names(u, "merge clause update")?),
+                        },
+                    })
+                })
+                .collect()
+        };
+        Ok(Some(Self {
+            target_keys: names(&v["target_keys"], "merge.target_keys")?,
+            source_keys: names(&v["source_keys"], "merge.source_keys")?,
+            residual: v["residual"].as_str().map(str::to_owned),
+            matched: clauses("matched")?,
+            not_matched_by_source: clauses("not_matched_by_source")?,
+        }))
+    }
 }
 
 /// A row-level change of a fragment's files (ADR 0093), as SQL over the
@@ -429,6 +500,8 @@ impl Reduce {
 
 /// What `/v1/fragment` is asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// One per request, parsed and consumed at once: its size does not matter.
+#[allow(clippy::large_enum_variant)]
 pub enum Task {
     Scan(Fragment),
     Reduce(Reduce),
@@ -484,6 +557,7 @@ impl Fragment {
             })),
             "write": self.write.as_ref().map(WriteTo::to_json),
             "change": self.change.as_ref().map(|c| json!({"predicate": c.predicate, "update": c.update})),
+            "merge": self.merge.as_ref().map(MergeSpec::to_json),
             "aggregate": self.aggregate.as_ref().map(|a| json!({
                 "group_by": a.group_by,
                 "aggregates": a.aggregates.iter().map(|(f, c)| json!({"fn": f, "column": c})).collect::<Vec<_>>(),
@@ -494,7 +568,8 @@ impl Fragment {
     pub fn from_json(v: &Json) -> Result<Self, String> {
         // A field this worker does not know could change the answer (a
         // filter it would skip): refuse it rather than ignore it.
-        const KNOWN: [&str; 10] = [
+        const KNOWN: [&str; 11] = [
+            "merge",
             "change",
             "write",
             "metadata_location",
@@ -537,6 +612,7 @@ impl Fragment {
             files: strings("files")?,
             columns: strings("columns")?,
             write: WriteTo::from_json(&v["write"])?,
+            merge: MergeSpec::from_json(&v["merge"])?,
             change: match &v["change"] {
                 Json::Null => None,
                 c => Some(RowChange {
@@ -687,6 +763,7 @@ impl RemoteScanExec {
                     broadcast: None,
                     write: None,
                     change: None,
+                    merge: None,
                 },
             })
             .collect();
@@ -804,6 +881,27 @@ impl RemoteScanExec {
             a.fragment.change = Some(change.clone());
         }
         out
+    }
+
+    /// The same fragments, each running `spec` over its files with the
+    /// source attached (ADR 0094).
+    pub(crate) fn merging(&self, spec: MergeSpec) -> Self {
+        let mut out = self.with_schema(written_schema());
+        for a in &mut out.fragments {
+            a.fragment.merge = Some(spec.clone());
+        }
+        out
+    }
+
+    /// Fragment `partition`'s output, with `attachment` (Arrow IPC) after
+    /// its JSON (ADR 0066, 0094).
+    pub(crate) fn attached_stream(
+        &self,
+        partition: usize,
+        tag: Option<Arc<QueryTag>>,
+        attachment: Bytes,
+    ) -> BoxStream<'static, Result<RecordBatch>> {
+        self.fragment_stream(partition, tag, Some(attachment))
     }
 
     /// The columns each fragment returns, by name.
@@ -2051,6 +2149,22 @@ mod tests {
             change: Some(RowChange {
                 predicate: "id > 3".into(),
                 update: Some(vec!["id".into(), "upper(name)".into()]),
+            }),
+            merge: Some(MergeSpec {
+                target_keys: vec!["t0".into()],
+                source_keys: vec!["s0".into()],
+                residual: Some("t1 > s1".into()),
+                matched: vec![
+                    ClauseSpec {
+                        predicate: Some("s1 IS NULL".into()),
+                        update: None,
+                    },
+                    ClauseSpec {
+                        predicate: None,
+                        update: Some(vec!["t0".into(), "s1".into()]),
+                    },
+                ],
+                not_matched_by_source: vec![],
             }),
         };
         assert_eq!(Fragment::from_json(&f.to_json()).unwrap(), f);

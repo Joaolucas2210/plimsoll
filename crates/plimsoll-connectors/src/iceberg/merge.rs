@@ -25,7 +25,8 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use futures::StreamExt;
 
-use super::write::{IcebergSink, Target};
+use super::write::{IcebergSink, Target, Written};
+use crate::remote::{ClauseSpec, MergeSpec, RemoteScanExec};
 
 type Expr = Arc<dyn PhysicalExpr>;
 
@@ -79,6 +80,9 @@ pub(super) struct IcebergMergeExec {
     targets: Arc<Vec<Target>>,
     source: Arc<dyn ExecutionPlan>,
     merge: Arc<Merge>,
+    /// The target files as worker fragments running the merge (ADR 0094);
+    /// `None`: all of it here.
+    remote: Option<Arc<RemoteScanExec>>,
     properties: Arc<datafusion::physical_plan::PlanProperties>,
 }
 
@@ -101,8 +105,14 @@ impl IcebergMergeExec {
             targets: Arc::new(targets),
             source,
             merge: Arc::new(merge),
+            remote: None,
             properties,
         }
+    }
+
+    pub(super) fn with_remote(mut self, remote: Option<Arc<RemoteScanExec>>) -> Self {
+        self.remote = remote;
+        self
     }
 }
 
@@ -128,7 +138,11 @@ impl DisplayAs for IcebergMergeExec {
             self.sink.name(),
             self.targets.len(),
             self.merge.target_keys.len()
-        )
+        )?;
+        if let Some(remote) = &self.remote {
+            write!(f, " fragments={}", remote.fragment_count())?;
+        }
+        Ok(())
     }
 }
 
@@ -164,6 +178,7 @@ impl ExecutionPlan for IcebergMergeExec {
             targets: self.targets.clone(),
             source,
             merge: self.merge.clone(),
+            remote: self.remote.clone(),
             properties: self.properties.clone(),
         }))
     }
@@ -173,14 +188,18 @@ impl ExecutionPlan for IcebergMergeExec {
         _partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let (sink, targets, source, merge) = (
+        let (sink, targets, source, merge, remote) = (
             self.sink.clone(),
             self.targets.clone(),
             self.source.clone(),
             self.merge.clone(),
+            self.remote.clone(),
         );
         let run = async move {
-            let changed = run(&sink, &targets, source, &merge, &context).await?;
+            let changed = match remote {
+                Some(remote) => run_remote(&sink, &remote, source, &merge, &context).await?,
+                None => run(&sink, &targets, source, &merge, &context).await?,
+            };
             Ok(RecordBatch::try_new(
                 count_schema(),
                 vec![Arc::new(datafusion::arrow::array::UInt64Array::from(vec![
@@ -320,28 +339,290 @@ async fn run(
     let source = concat_batches(&source_schema, &batches)?;
     drop(batches);
     memory.try_grow(source.get_array_memory_size())?;
-    let rows = source.num_rows();
-    let as_source = merged(&merge.row, merge.width, None, Some(&source), rows)?;
-    let source_keys = merge
-        .source_keys
-        .iter()
-        .map(|e| evaluate(e, &as_source))
-        .collect::<Result<Vec<_>>>()?;
-    let types: Vec<_> = source_keys.iter().map(|k| k.data_type().clone()).collect();
-    let converter = RowConverter::new(types.iter().cloned().map(SortField::new).collect())?;
-    let encoded = converter.convert_columns(&source_keys)?;
-    let mut index: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
-    for i in 0..rows {
-        // A NULL key matches nothing, as in SQL.
-        if source_keys.iter().any(|k| k.is_null(i)) {
-            continue;
-        }
-        index
-            .entry(encoded.row(i).as_ref().to_vec())
-            .or_default()
-            .push(i as u32);
+    let index = Index::new(merge, source)?;
+    let mut probed = probe(sink, targets, &index, merge, context).await?;
+    probed.changed += not_matched(
+        merge,
+        &index.source,
+        &probed.matched,
+        sink,
+        &mut probed.new_rows,
+    )?;
+    if probed.changed == 0 {
+        return Ok(0);
     }
-    let mut source_matched = vec![false; rows];
+    finish(sink, probed.files, probed.new_rows, context).await?;
+    memory.resize(0);
+    Ok(probed.changed)
+}
+
+/// The merge with its target files on workers (ADR 0094): the source,
+/// collected here, goes to every fragment as Arrow IPC; each worker runs
+/// `WHEN MATCHED` and `NOT MATCHED BY SOURCE` over its files and reports
+/// its files and the source rows that paired; `WHEN NOT MATCHED` then
+/// runs here over the source rows no worker paired, and everything
+/// commits as one `overwrite`.
+async fn run_remote(
+    sink: &IcebergSink,
+    remote: &RemoteScanExec,
+    source: Arc<dyn ExecutionPlan>,
+    merge: &Merge,
+    context: &Arc<TaskContext>,
+) -> Result<u64> {
+    use futures::TryStreamExt;
+    let memory = MemoryConsumer::new(format!("IcebergMerge[{}]", sink.name()))
+        .register(context.memory_pool());
+    let source_schema = source.schema();
+    let batches = datafusion::physical_plan::collect(source, context.clone()).await?;
+    let source = concat_batches(&source_schema, &batches)?;
+    drop(batches);
+    memory.try_grow(source.get_array_memory_size())?;
+    let mut ipc = Vec::new();
+    {
+        let mut writer =
+            datafusion::arrow::ipc::writer::StreamWriter::try_new(&mut ipc, &source_schema)?;
+        writer.write(&source)?;
+        writer.finish()?;
+    }
+    memory.try_grow(ipc.len())?;
+    let ipc = bytes::Bytes::from(ipc);
+    let tag = context
+        .session_config()
+        .get_extension::<plimsoll_core::engine::QueryTag>();
+    let replies = futures::future::try_join_all((0..remote.fragment_count()).map(|p| {
+        remote
+            .attached_stream(p, tag.clone(), ipc.clone())
+            .try_collect::<Vec<_>>()
+    }))
+    .await?;
+    let bad = |e: String| DataFusionError::Execution(format!("merge fragment: {e}"));
+    let mut files = Vec::new();
+    let mut matched = vec![false; source.num_rows()];
+    let mut changed = 0u64;
+    for batch in replies.iter().flatten() {
+        for json in batch.column(0).as_string::<i32>().iter().flatten() {
+            let v: serde_json::Value =
+                serde_json::from_str(json).map_err(|e| bad(e.to_string()))?;
+            match v.get("matched") {
+                Some(rows) => {
+                    for j in rows.as_array().into_iter().flatten() {
+                        let j = j.as_u64().and_then(|j| usize::try_from(j).ok());
+                        match j.and_then(|j| matched.get_mut(j)) {
+                            Some(m) => *m = true,
+                            None => return Err(bad("source row out of range".into())),
+                        }
+                    }
+                    changed += v["changed"].as_u64().unwrap_or(0);
+                }
+                None => files.push(sink.written_from_json(&v).map_err(bad)?),
+            }
+        }
+    }
+    let mut new_rows = Vec::new();
+    changed += not_matched(merge, &source, &matched, sink, &mut new_rows)?;
+    if changed == 0 {
+        return Ok(0);
+    }
+    finish(sink, files, new_rows, context).await?;
+    memory.resize(0);
+    Ok(changed)
+}
+
+/// The merged row with every column renamed `t0…` (target) then `s0…`
+/// (source): names unique on both sides, as clauses travel to workers in
+/// (ADR 0094).
+fn renamed(row: &SchemaRef, width: usize) -> SchemaRef {
+    Arc::new(Schema::new(
+        row.fields()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let name = if i < width {
+                    format!("t{i}")
+                } else {
+                    format!("s{}", i - width)
+                };
+                Field::new(name, f.data_type().clone(), true)
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+/// `merge`'s target-file pass as SQL for workers (ADR 0094); `None` when
+/// an expression does not round-trip, or a clause the pass runs inserts.
+pub(super) fn spec(
+    merge: &Merge,
+    config: &datafusion::common::config::ConfigOptions,
+) -> Option<MergeSpec> {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    use datafusion::physical_expr::expressions::Column;
+    let schema = renamed(&merge.row, merge.width);
+    let sql = |e: &Expr| {
+        let e = e
+            .clone()
+            .transform(|node| {
+                Ok(match node.as_ref().downcast_ref::<Column>() {
+                    Some(c) => Transformed::yes(Arc::new(Column::new(
+                        schema.field(c.index()).name(),
+                        c.index(),
+                    )) as Expr),
+                    None => Transformed::no(node),
+                })
+            })
+            .ok()?
+            .data;
+        crate::portable::physical_sql(&e, &schema, config)
+    };
+    let all = |es: &[Expr]| es.iter().map(sql).collect::<Option<Vec<_>>>();
+    let clauses = |cs: &[Clause]| {
+        cs.iter()
+            .map(|c| {
+                Some(ClauseSpec {
+                    predicate: match &c.predicate {
+                        Some(p) => Some(sql(p)?),
+                        None => None,
+                    },
+                    update: match &c.action {
+                        Action::Delete => None,
+                        Action::Update(row) => Some(all(row)?),
+                        Action::Insert(_) => return None,
+                    },
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+    };
+    Some(MergeSpec {
+        target_keys: all(&merge.target_keys)?,
+        source_keys: all(&merge.source_keys)?,
+        residual: match &merge.residual {
+            Some(r) => Some(sql(r)?),
+            None => None,
+        },
+        matched: clauses(&merge.matched)?,
+        not_matched_by_source: clauses(&merge.not_matched_by_source)?,
+    })
+}
+
+/// A worker's [`Merge`] from `spec` (ADR 0094): the merged row is the
+/// table's columns then the source's, renamed as [`spec`] named them.
+/// `WHEN NOT MATCHED` is the coordinator's.
+pub(super) fn from_spec(
+    spec: &MergeSpec,
+    table: &Schema,
+    source: &Schema,
+    state: &dyn datafusion::catalog::Session,
+) -> std::result::Result<Merge, crate::ConnectorError> {
+    let width = table.fields().len();
+    let row = Arc::new(Schema::new(
+        table
+            .fields()
+            .iter()
+            .chain(source.fields().iter())
+            .map(|f| Field::new(f.name(), f.data_type().clone(), true))
+            .collect::<Vec<_>>(),
+    ));
+    let schema = renamed(&row, width);
+    let df = datafusion::common::DFSchema::try_from(schema.as_ref().clone())?;
+    let expr = |sql: &str| -> std::result::Result<Expr, crate::ConnectorError> {
+        let e = crate::portable::parse(sql, &df).ok_or_else(|| {
+            crate::ConnectorError::Unsupported(format!("expression {sql:?} does not parse here"))
+        })?;
+        Ok(state.create_physical_expr(e, &df)?)
+    };
+    let all = |sqls: &[String]| {
+        sqls.iter()
+            .map(|s| expr(s))
+            .collect::<std::result::Result<Vec<_>, _>>()
+    };
+    let clauses = |cs: &[ClauseSpec]| {
+        cs.iter()
+            .map(|c| {
+                Ok(Clause {
+                    predicate: c.predicate.as_deref().map(expr).transpose()?,
+                    action: match &c.update {
+                        None => Action::Delete,
+                        Some(row) => Action::Update(all(row)?),
+                    },
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, crate::ConnectorError>>()
+    };
+    Ok(Merge {
+        target_keys: all(&spec.target_keys)?,
+        source_keys: all(&spec.source_keys)?,
+        residual: spec.residual.as_deref().map(expr).transpose()?,
+        matched: clauses(&spec.matched)?,
+        not_matched: Vec::new(),
+        not_matched_by_source: clauses(&spec.not_matched_by_source)?,
+        row: schema,
+        width,
+    })
+}
+
+/// The source, hashed by its side of the `ON` equalities.
+pub(super) struct Index {
+    pub(super) source: RecordBatch,
+    converter: RowConverter,
+    types: Vec<datafusion::arrow::datatypes::DataType>,
+    index: HashMap<Vec<u8>, Vec<u32>>,
+}
+
+impl Index {
+    pub(super) fn new(merge: &Merge, source: RecordBatch) -> Result<Self> {
+        let rows = source.num_rows();
+        let as_source = merged(&merge.row, merge.width, None, Some(&source), rows)?;
+        let source_keys = merge
+            .source_keys
+            .iter()
+            .map(|e| evaluate(e, &as_source))
+            .collect::<Result<Vec<_>>>()?;
+        let types: Vec<_> = source_keys.iter().map(|k| k.data_type().clone()).collect();
+        let converter = RowConverter::new(types.iter().cloned().map(SortField::new).collect())?;
+        let encoded = converter.convert_columns(&source_keys)?;
+        let mut index: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
+        for i in 0..rows {
+            // A NULL key matches nothing, as in SQL.
+            if source_keys.iter().any(|k| k.is_null(i)) {
+                continue;
+            }
+            index
+                .entry(encoded.row(i).as_ref().to_vec())
+                .or_default()
+                .push(i as u32);
+        }
+        Ok(Self {
+            source,
+            converter,
+            types,
+            index,
+        })
+    }
+}
+
+/// The target files' pass: position deletes written, new rows to write,
+/// which source rows paired with a target row, and the rows changed.
+pub(super) struct Probed {
+    pub(super) files: Vec<Written>,
+    pub(super) new_rows: Vec<RecordBatch>,
+    pub(super) matched: Vec<bool>,
+    pub(super) changed: u64,
+}
+
+/// `WHEN MATCHED` and `WHEN NOT MATCHED BY SOURCE` over `targets`: what
+/// each target file decides on its own, so a worker can run it for its
+/// share of the files (ADR 0094).
+pub(super) async fn probe(
+    sink: &IcebergSink,
+    targets: &[Target],
+    index: &Index,
+    merge: &Merge,
+    context: &Arc<TaskContext>,
+) -> Result<Probed> {
+    let memory = MemoryConsumer::new(format!("IcebergMergeRows[{}]", sink.name()))
+        .register(context.memory_pool());
+    let source = &index.source;
+    let (converter, types) = (&index.converter, &index.types);
+    let mut source_matched = vec![false; source.num_rows()];
     let target_schema = sink.schema_ref();
     let env = context.runtime_env();
     let run_id = super::write::unique_id();
@@ -361,7 +642,7 @@ async fn run(
             let keys = merge
                 .target_keys
                 .iter()
-                .zip(&types)
+                .zip(types)
                 .map(|(e, t)| Ok(cast(&evaluate(e, &as_target)?, t)?))
                 .collect::<Result<Vec<_>>>()?;
             let probe = converter.convert_columns(&keys)?;
@@ -374,7 +655,7 @@ async fn run(
                 if !alive || keys.iter().any(|k| k.is_null(i)) {
                     continue;
                 }
-                if let Some(hits) = index.get(probe.row(i).as_ref()) {
+                if let Some(hits) = index.index.get(probe.row(i).as_ref()) {
                     for &j in hits {
                         t.push(i as u32);
                         s.push(j);
@@ -385,7 +666,7 @@ async fn run(
                 &merge.row,
                 merge.width,
                 Some(&take_rows(&batch, &t)?),
-                Some(&take_rows(&source, &s)?),
+                Some(&take_rows(source, &s)?),
                 t.len(),
             )?;
             let on = holds(merge.residual.as_ref(), &pairs)?;
@@ -468,42 +749,66 @@ async fn run(
             );
         }
     }
-    // WHEN NOT MATCHED: source rows no target row paired with.
-    let lone: Vec<u32> = (0..rows)
-        .filter(|j| !source_matched[*j])
+    // The new rows are the caller's to write: ownership passes with them.
+    memory.resize(0);
+    Ok(Probed {
+        files,
+        new_rows,
+        matched: source_matched,
+        changed,
+    })
+}
+
+/// `WHEN NOT MATCHED`: the source rows no target row paired with, over
+/// every target file (on the coordinator when distributed, ADR 0094).
+/// The rows inserted.
+pub(super) fn not_matched(
+    merge: &Merge,
+    source: &RecordBatch,
+    matched: &[bool],
+    sink: &IcebergSink,
+    new_rows: &mut Vec<RecordBatch>,
+) -> Result<u64> {
+    let lone: Vec<u32> = (0..source.num_rows())
+        .filter(|j| !matched.get(*j).copied().unwrap_or(false))
         .map(|j| j as u32)
         .collect();
-    if !lone.is_empty() && !merge.not_matched.is_empty() {
-        let rows = merged(
-            &merge.row,
-            merge.width,
-            None,
-            Some(&take_rows(&source, &lone)?),
-            lone.len(),
-        )?;
-        let mut deleted = Vec::new();
-        changed += apply(
-            &merge.not_matched,
-            &rows,
-            &target_schema,
-            &mut deleted,
-            &mut new_rows,
-        )?;
-    }
-    if changed == 0 {
+    if lone.is_empty() || merge.not_matched.is_empty() {
         return Ok(0);
     }
+    let rows = merged(
+        &merge.row,
+        merge.width,
+        None,
+        Some(&take_rows(source, &lone)?),
+        lone.len(),
+    )?;
+    let mut deleted = Vec::new();
+    apply(
+        &merge.not_matched,
+        &rows,
+        &sink.schema_ref(),
+        &mut deleted,
+        new_rows,
+    )
+}
+
+/// Writes `new_rows` beside `files` and commits all as one `overwrite`.
+pub(super) async fn finish(
+    sink: &IcebergSink,
+    mut files: Vec<Written>,
+    new_rows: Vec<RecordBatch>,
+    context: &Arc<TaskContext>,
+) -> Result<()> {
     if !new_rows.is_empty() {
         let rows = datafusion::physical_plan::memory::MemoryStream::try_new(
             new_rows,
-            target_schema,
+            sink.schema_ref(),
             None,
         )?;
         files.extend(sink.write_rows(Box::pin(rows), context).await?);
     }
-    sink.commit_overwrite(&files, &env).await?;
-    memory.resize(0);
-    Ok(changed)
+    sink.commit_overwrite(&files, &context.runtime_env()).await
 }
 
 /// The rows of `batch` at `indices`, in that order.

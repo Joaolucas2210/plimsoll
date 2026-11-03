@@ -848,6 +848,25 @@ impl QueryEngine for CoreEngine {
             .map_err(|e| fail(e.into()))?;
             return files_written(files);
         }
+        // A MERGE's pass over these files (ADR 0094), the source attached.
+        if let Some(spec) = &f.merge {
+            let Some(source) = build else {
+                return Err(EngineError::InvalidQuery(
+                    "a merge fragment needs its source attached".into(),
+                ));
+            };
+            let files = IcebergConnector::merge_files(
+                &f.metadata_location,
+                f.snapshot_id,
+                f.files.iter().cloned().collect(),
+                spec,
+                source,
+                &state,
+            )
+            .await
+            .map_err(|e| fail(e.into()))?;
+            return files_written(files);
+        }
         let connector = IcebergConnector::fragment(
             &f.metadata_location,
             f.snapshot_id,
@@ -1501,6 +1520,7 @@ mod tests {
             broadcast: None,
             write: None,
             change: None,
+            merge: None,
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         for id in ["rel-a", "rel-a~m1r0"] {

@@ -866,7 +866,56 @@ async fn writes_on_workers_through_the_rest_catalog() {
     );
     let negative = text(&format!("SELECT count(*) AS n FROM {c1} WHERE v < 0")).await;
     assert_eq!(negative.lines().nth(3), before.lines().nth(3), "{negative}");
-    for t in [src, dst, c1, c2] {
+    // MERGE (ADR 0094): the target files on the workers, the source sent
+    // along; the result is the one a single node computes. `id` and `v`
+    // are on both sides, so the clauses rely on qualified names.
+    let local = Engine::new(
+        Arc::new(CeilingPool::new(256 << 20, 8 << 20).unwrap()),
+        None,
+    )
+    .unwrap();
+    plimsoll_server::lakehouse::register(local.context(), catalog.clone())
+        .await
+        .unwrap();
+    let (m1, m2) = (format!("{src}_m1"), format!("{src}_m2"));
+    for t in [&m1, &m2] {
+        text(&format!(
+            "CREATE TABLE {t} PARTITION BY (region) AS SELECT id, region, v FROM {src}"
+        ))
+        .await;
+    }
+    let merge = |t: &str| {
+        format!(
+            "MERGE INTO {t} t USING (SELECT id, v FROM {src} WHERE id % 7 = 0 \
+             UNION ALL SELECT id + 100000 AS id, v FROM {src} WHERE id % 50 = 0) s \
+             ON t.id = s.id WHEN MATCHED AND s.v > 200 THEN DELETE \
+             WHEN MATCHED THEN UPDATE SET v = s.v + 1 \
+             WHEN NOT MATCHED THEN INSERT (id, region, v) VALUES (s.id, 'new', s.v) \
+             WHEN NOT MATCHED BY SOURCE AND t.id % 100 = 1 THEN DELETE"
+        )
+    };
+    let plan = text(&format!("EXPLAIN {}", merge(&m1))).await;
+    assert!(plan.contains("fragments=2"), "{plan}");
+    let distributed = text(&merge(&m1)).await;
+    let single = pretty_format_batches(&local.sql(&merge(&m2)).await.unwrap().batches)
+        .unwrap()
+        .to_string();
+    assert_eq!(distributed, single);
+    let differ = text(&format!(
+        "SELECT count(*) AS n FROM {m1} a FULL JOIN {m2} b ON a.id = b.id \
+         WHERE a.id IS NULL OR b.id IS NULL OR a.v <> b.v OR a.region <> b.region"
+    ))
+    .await;
+    assert!(differ.contains("| 0 |"), "{differ}");
+    let inserted = text(&format!(
+        "SELECT count(*) AS n FROM {m1} WHERE region = 'new'"
+    ))
+    .await;
+    assert!(
+        inserted.contains("| 16 |"),
+        "ids 50..200 step 50, of 4 inserts: {inserted}"
+    );
+    for t in [src, dst, c1, c2, m1, m2] {
         text(&format!("DROP TABLE {t} PURGE")).await;
     }
 }

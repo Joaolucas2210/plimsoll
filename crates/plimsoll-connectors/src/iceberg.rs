@@ -176,6 +176,47 @@ impl IcebergConnector {
         Ok(connector)
     }
 
+    /// A worker's part of a distributed `MERGE` (ADR 0094): `spec`'s
+    /// `WHEN MATCHED` and `NOT MATCHED BY SOURCE` over `files` (the table
+    /// at `metadata_path` and `snapshot`), `source` being the whole source.
+    /// The files written, then `{"matched": [...], "changed": n}`: the
+    /// source rows that paired, and the target rows changed.
+    pub async fn merge_files(
+        metadata_path: &str,
+        snapshot: Option<i64>,
+        files: HashSet<String>,
+        spec: &crate::remote::MergeSpec,
+        source: (datafusion::arrow::datatypes::SchemaRef, Vec<RecordBatch>),
+        state: &dyn Session,
+    ) -> Result<Vec<Json>, ConnectorError> {
+        let connector = Self::fragment(metadata_path, snapshot, files, state).await?;
+        let table = &connector.table;
+        let (sink, targets, _, _) = table
+            .rows_with(table.file_writer()?, state, Vec::new())
+            .await?;
+        let (schema, batches) = source;
+        let source = datafusion::arrow::compute::concat_batches(&schema, &batches)?;
+        let merge = merge::from_spec(spec, &table.schema, &schema, state)?;
+        let index = merge::Index::new(&merge, source)?;
+        let task = state.task_ctx();
+        let probed = merge::probe(&sink, &targets, &index, &merge, &task).await?;
+        let mut written = probed.files;
+        if !probed.new_rows.is_empty() {
+            let rows = datafusion::physical_plan::memory::MemoryStream::try_new(
+                probed.new_rows,
+                sink.schema_ref(),
+                None,
+            )?;
+            written.extend(sink.write_rows(Box::pin(rows), &task).await?);
+        }
+        let mut out: Vec<Json> = written.iter().map(write::Written::to_json).collect();
+        let matched: Vec<usize> = (0..probed.matched.len())
+            .filter(|i| probed.matched[*i])
+            .collect();
+        out.push(serde_json::json!({"matched": matched, "changed": probed.changed}));
+        Ok(out)
+    }
+
     /// A worker's part of a distributed `DELETE` or `UPDATE` (ADR 0093):
     /// the rows of `files` (the table at `metadata_path` and `snapshot`)
     /// matching `predicate` are deleted by position, and with `update`
@@ -1183,9 +1224,15 @@ impl TableProvider for IcebergTable {
             row,
             width,
         };
-        Ok(Arc::new(merge::IcebergMergeExec::new(
-            sink, targets, source, merge,
-        )))
+        // Distributed (ADR 0094) when the files may go to workers and every
+        // clause travels as SQL.
+        let remote = self
+            .split_targets(state, &sink, &targets)
+            .zip(merge::spec(&merge, state.config_options()))
+            .map(|(fragments, spec)| Arc::new(fragments.merging(spec)));
+        Ok(Arc::new(
+            merge::IcebergMergeExec::new(sink, targets, source, merge).with_remote(remote),
+        ))
     }
 
     /// `UPDATE t SET … WHERE …` (ADR 0081): the rows a `DELETE` with the
@@ -1730,22 +1777,9 @@ impl IcebergTable {
         exec: write::IcebergDeleteExec,
     ) -> Arc<dyn ExecutionPlan> {
         let local = |exec| Arc::new(exec) as Arc<dyn ExecutionPlan>;
-        let Some(workers) = state.config().get_extension::<crate::remote::Workers>() else {
+        let Some(fragments) = self.split_targets(state, &exec.sink, &exec.targets) else {
             return local(exec);
         };
-        let urls = workers.healthy_urls();
-        // Workers read the files at the snapshot, with its schema: it must
-        // be the schema the predicate and new values are written against.
-        let same_schema = self
-            .snapshot_schema_id
-            .is_none_or(|id| id == self.schema_id);
-        if urls.is_empty()
-            || exec.targets.is_empty()
-            || !exec.sink.workers_may_write()
-            || !same_schema
-        {
-            return local(exec);
-        }
         let config = state.config_options();
         let sql = |e: &Arc<dyn PhysicalExpr>| portable::physical_sql(e, &self.schema, config);
         let Some(predicate) = sql(&exec.predicate) else {
@@ -1758,21 +1792,7 @@ impl IcebergTable {
                 None => return local(exec),
             },
         };
-        let files = exec
-            .targets
-            .iter()
-            .map(|t| (t.path.clone(), t.size))
-            .collect();
-        let fragments = crate::remote::RemoteScanExec::new(
-            crate::remote::written_schema(),
-            workers,
-            &urls,
-            &self.metadata_path,
-            self.snapshot_id,
-            files,
-            Vec::new(),
-        )
-        .changing(crate::remote::RowChange {
+        let fragments = fragments.changing(crate::remote::RowChange {
             predicate,
             update: update.clone(),
         });
@@ -1781,6 +1801,38 @@ impl IcebergTable {
             Arc::new(fragments),
             remote_write::count_schema(),
             Some(update.is_some()),
+        ))
+    }
+
+    /// `targets` split across the healthy workers by bytes (ADR 0093,
+    /// 0094), as fragments to be given a task; `None` when the write must
+    /// stay here: no healthy workers, a table read with vended credentials
+    /// (they never leave the coordinator), or a snapshot whose schema is
+    /// not the current one (workers read at the snapshot, while
+    /// predicates and values are written against the current schema).
+    fn split_targets(
+        &self,
+        state: &dyn Session,
+        sink: &write::IcebergSink,
+        targets: &[write::Target],
+    ) -> Option<crate::remote::RemoteScanExec> {
+        let workers = state.config().get_extension::<crate::remote::Workers>()?;
+        let urls = workers.healthy_urls();
+        let same_schema = self
+            .snapshot_schema_id
+            .is_none_or(|id| id == self.schema_id);
+        if urls.is_empty() || targets.is_empty() || !sink.workers_may_write() || !same_schema {
+            return None;
+        }
+        let files = targets.iter().map(|t| (t.path.clone(), t.size)).collect();
+        Some(crate::remote::RemoteScanExec::new(
+            crate::remote::written_schema(),
+            workers,
+            &urls,
+            &self.metadata_path,
+            self.snapshot_id,
+            files,
+            Vec::new(),
         ))
     }
 
