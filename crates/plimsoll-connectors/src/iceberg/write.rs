@@ -408,10 +408,11 @@ impl IcebergSink {
     }
 
     /// Whether files for this table may be written on workers: they open
-    /// it by its metadata file, with their own storage credentials (vended
-    /// ones are not sent, ADR 0058), and never for a staged create.
+    /// it by its metadata file, or a staged create's metadata sent along
+    /// (ADR 0092), with their own storage credentials (vended ones are not
+    /// sent, ADR 0058).
     pub(super) fn workers_may_write(&self) -> bool {
-        self.scoped.is_none() && self.staged.is_none() && !self.metadata_path.is_empty()
+        self.scoped.is_none() && (self.staged.is_some() || !self.metadata_path.is_empty())
     }
 }
 

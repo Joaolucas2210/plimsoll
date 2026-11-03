@@ -305,6 +305,20 @@ impl Engine {
         params: &[ScalarValue],
         access: Option<&dyn TableAccess>,
     ) -> Result<QueryStream> {
+        self.plan_query(ctx, sql, params, access, true).await
+    }
+
+    /// [`Self::plan_stream`]; without `run`, planned and checked but not
+    /// executed: an empty stream, the plan for the caller to run (a
+    /// CTAS's query, ADR 0092).
+    async fn plan_query(
+        &self,
+        ctx: &SessionContext,
+        sql: &str,
+        params: &[ScalarValue],
+        access: Option<&dyn TableAccess>,
+        run: bool,
+    ) -> Result<QueryStream> {
         let started = Instant::now();
         // `CREATE TABLE` and `ALTER TABLE`, the only DDL, go to the
         // catalog (ADR 0083, 0084).
@@ -485,6 +499,9 @@ impl Engine {
         };
         let key = cache.and_then(|_| result_cache::key(&statement, &physical));
         let stream = match (cache, key) {
+            _ if !run => Box::pin(datafusion::physical_plan::EmptyRecordBatchStream::new(
+                physical.schema(),
+            )) as SendableRecordBatchStream,
             (Some(cache), Some(key)) => match cache.get(&key) {
                 Some(hit) => hit,
                 None => cache.tee(key, execute_stream(physical.clone(), state.task_ctx())?),
@@ -544,16 +561,10 @@ impl Engine {
             // (grants, row filters, column checks), then one commit.
             Planned::Create(table, mut new) if new.query.is_some() => {
                 let select = new.query.take().unwrap_or_default();
-                let mut query = Box::pin(self.plan_stream(ctx, &select, &[], access)).await?;
-                let schema = query.stream.schema();
-                let rows = std::mem::replace(
-                    &mut query.stream,
-                    Box::pin(datafusion::physical_plan::EmptyRecordBatchStream::new(
-                        schema,
-                    )),
-                );
+                let mut query = Box::pin(self.plan_query(ctx, &select, &[], access, false)).await?;
                 reads = std::mem::take(&mut query.reads);
-                count = Some(ddl.0.create_table_as(&table, new, rows, &state).await?);
+                let plan = query.physical.clone();
+                count = Some(ddl.0.create_table_as(&table, new, plan, &state).await?);
             }
             Planned::Create(table, new) => ddl.0.create_table(&table, new).await?,
             Planned::Alter {

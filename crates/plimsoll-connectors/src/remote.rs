@@ -208,9 +208,42 @@ pub struct Fragment {
     /// Join the fragment's rows (the probe side) with the build side sent
     /// alongside (ADR 0066).
     pub broadcast: Option<Broadcast>,
-    /// Write the rows as data files of the table at this metadata file,
-    /// and return the files written (ADR 0091), one JSON per row.
-    pub write: Option<String>,
+    /// Write the rows as data files of this table and return the files
+    /// written (ADR 0091), one JSON per row.
+    pub write: Option<WriteTo>,
+}
+
+/// The table a worker writes its rows into (ADR 0091, 0092).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteTo {
+    /// The table's metadata file, as the coordinator loaded it.
+    pub metadata_location: String,
+    /// A staged create's metadata, which has no file yet (CTAS, ADR
+    /// 0092): used instead of reading `metadata_location`.
+    pub metadata: Option<Json>,
+    /// The output columns written, by position, in the table's order (a
+    /// reduce's output, ADR 0092); `None`: all, as they are.
+    pub picks: Option<Vec<usize>>,
+}
+
+impl WriteTo {
+    fn to_json(&self) -> Json {
+        json!({"metadata_location": self.metadata_location, "metadata": self.metadata, "picks": self.picks})
+    }
+
+    fn from_json(v: &Json) -> Result<Option<Self>, String> {
+        if v.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            metadata_location: v["metadata_location"]
+                .as_str()
+                .ok_or("`write.metadata_location` is required")?
+                .to_owned(),
+            metadata: Some(v["metadata"].clone()).filter(|m| !m.is_null()),
+            picks: projection(&v["picks"], "write.picks")?,
+        }))
+    }
 }
 
 /// A broadcast hash join on a worker: the build side (attached to the
@@ -256,6 +289,9 @@ pub struct Reduce {
     /// A retried reduce (ADR 0072): every map runs again for this bucket
     /// only, under this reduce's own shuffle id.
     pub only: bool,
+    /// Write the reduced rows as data files and return the files written
+    /// (ADR 0092).
+    pub write: Option<WriteTo>,
 }
 
 /// An equi-join of two shuffled sides, on columns of their fragments.
@@ -325,6 +361,7 @@ impl Reduce {
             "partition": self.partition,
             "partitions": self.partitions,
             "only": self.only,
+            "write": self.write.as_ref().map(WriteTo::to_json),
             "maps": maps_json(&self.maps),
             "join": self.join.as_ref().map(|j| json!({
                 "join_type": j.join_type,
@@ -370,6 +407,7 @@ impl Reduce {
             maps,
             join,
             only: r["only"].as_bool().unwrap_or(false),
+            write: WriteTo::from_json(&r["write"])?,
         })
     }
 }
@@ -429,7 +467,7 @@ impl Fragment {
                 "probe_keys": b.probe_keys,
                 "projection": b.projection,
             })),
-            "write": self.write,
+            "write": self.write.as_ref().map(WriteTo::to_json),
             "aggregate": self.aggregate.as_ref().map(|a| json!({
                 "group_by": a.group_by,
                 "aggregates": a.aggregates.iter().map(|(f, c)| json!({"fn": f, "column": c})).collect::<Vec<_>>(),
@@ -481,7 +519,7 @@ impl Fragment {
             snapshot_id: v["snapshot_id"].as_i64(),
             files: strings("files")?,
             columns: strings("columns")?,
-            write: v["write"].as_str().map(str::to_owned),
+            write: WriteTo::from_json(&v["write"])?,
             filters: match &v["filters"] {
                 Json::Null => Vec::new(),
                 _ => strings("filters")?,
@@ -675,6 +713,7 @@ impl RemoteScanExec {
                         maps: maps.clone(),
                         join: None,
                         only: false,
+                        write: None,
                     },
                 )
             })
@@ -710,7 +749,7 @@ impl RemoteScanExec {
     /// table at `target` instead of returning them (ADR 0091), with
     /// `columns` in the target's order. `None` for fragments that do not
     /// return plain rows (aggregated, joined or shuffled).
-    pub(crate) fn writing(&self, target: &str, columns: Vec<String>) -> Option<Self> {
+    pub(crate) fn writing(&self, target: WriteTo, columns: Vec<String>) -> Option<Self> {
         if self.fragments.iter().any(|a| {
             a.fragment.aggregate.is_some()
                 || a.fragment.broadcast.is_some()
@@ -720,7 +759,7 @@ impl RemoteScanExec {
         }
         let mut out = self.with_schema(written_schema());
         for a in &mut out.fragments {
-            a.fragment.write = Some(target.to_owned());
+            a.fragment.write = Some(target.clone());
             a.fragment.columns = columns.clone();
         }
         Some(out)
@@ -732,15 +771,6 @@ impl RemoteScanExec {
             .first()
             .map(|a| a.fragment.columns.clone())
             .unwrap_or_default()
-    }
-
-    /// Fragment `partition`'s output (see [`Self::fragment_stream`]).
-    pub(crate) fn partition_stream(
-        &self,
-        partition: usize,
-        tag: Option<Arc<QueryTag>>,
-    ) -> BoxStream<'static, Result<RecordBatch>> {
-        self.fragment_stream(partition, tag, None)
     }
 
     /// Fragments, i.e. shuffle partitions when shuffled.
@@ -1032,6 +1062,26 @@ pub struct RemoteReduceExec {
 }
 
 impl RemoteReduceExec {
+    /// The same reduces, each writing its rows as data files of `target`
+    /// instead of returning them (ADR 0092).
+    pub(crate) fn writing(&self, target: WriteTo) -> Self {
+        let reduces = self
+            .reduces
+            .iter()
+            .map(|(url, r)| {
+                let mut r = r.clone();
+                r.write = Some(target.clone());
+                (url.clone(), r)
+            })
+            .collect();
+        Self::new(
+            written_schema(),
+            self.workers.clone(),
+            reduces,
+            self.kind.clone(),
+        )
+    }
+
     fn new(
         schema: SchemaRef,
         workers: Arc<Workers>,
@@ -1447,6 +1497,7 @@ fn shuffle_join(node: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>>
                     maps: maps.clone(),
                     join: Some(spec.clone()),
                     only: false,
+                    write: None,
                 },
             )
         })
@@ -1951,7 +2002,11 @@ mod tests {
                 probe_keys: vec!["id".into()],
                 projection: None,
             }),
-            write: Some("s3://b/u/metadata/v1.metadata.json".into()),
+            write: Some(WriteTo {
+                metadata_location: "s3://b/u/metadata/v1.metadata.json".into(),
+                metadata: Some(json!({"format-version": 2})),
+                picks: Some(vec![1, 0]),
+            }),
         };
         assert_eq!(Fragment::from_json(&f.to_json()).unwrap(), f);
         assert!(Fragment::from_json(&json!({"files": []})).is_err());
@@ -1970,6 +2025,7 @@ mod tests {
             ],
             join: None,
             only: true,
+            write: None,
         };
         assert_eq!(
             Task::from_json(&r.to_json()).unwrap(),

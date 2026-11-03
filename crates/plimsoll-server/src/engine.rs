@@ -294,6 +294,41 @@ fn maintainer(
         .map_err(|e| classify(&e))
 }
 
+/// A worker's part of a distributed write (ADR 0091, 0092): `df`'s rows as
+/// data files of `target`, and the files written, one JSON per row, for
+/// the coordinator to commit.
+async fn write_rows(
+    ctx: &plimsoll_core::datafusion::prelude::SessionContext,
+    df: plimsoll_core::datafusion::prelude::DataFrame,
+    target: &plimsoll_connectors::remote::WriteTo,
+) -> Result<Running, EngineError> {
+    use plimsoll_core::datafusion::arrow::array::StringArray;
+    use plimsoll_core::datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    let fail = |e: DataFusionError| classify(&e);
+    let state = ctx.state();
+    let rows = df.execute_stream().await.map_err(fail)?;
+    let files = IcebergConnector::write_files(
+        &target.metadata_location,
+        target.metadata.as_ref(),
+        rows,
+        &state,
+    )
+    .await
+    .map_err(|e| fail(e.into()))?;
+    let schema = plimsoll_connectors::remote::written_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(
+            files.iter().map(|f| f.to_string()).collect::<Vec<_>>(),
+        ))],
+    )
+    .map_err(|e| fail(e.into()))?;
+    Ok(Running::from(Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        futures::stream::iter([Ok(batch)]),
+    )) as SendableRecordBatchStream))
+}
+
 /// A worker task's output, and the plan producing it when there is one,
 /// for its operator spans (ADR 0071).
 pub struct Running {
@@ -864,25 +899,7 @@ impl QueryEngine for CoreEngine {
         // target table here; the files written go back, one JSON per row,
         // for the coordinator to commit.
         if let Some(target) = &f.write {
-            use plimsoll_core::datafusion::arrow::array::StringArray;
-            use plimsoll_core::datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-            let state = ctx.state();
-            let rows = df.execute_stream().await.map_err(fail)?;
-            let files = IcebergConnector::write_files(target, rows, &state)
-                .await
-                .map_err(|e| fail(e.into()))?;
-            let schema = plimsoll_connectors::remote::written_schema();
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(StringArray::from(
-                    files.iter().map(|f| f.to_string()).collect::<Vec<_>>(),
-                ))],
-            )
-            .map_err(|e| fail(e.into()))?;
-            return Ok(Running::from(Box::pin(RecordBatchStreamAdapter::new(
-                schema,
-                futures::stream::iter([Ok(batch)]),
-            )) as SendableRecordBatchStream));
+            return write_rows(&ctx, df, target).await;
         }
         match f.bucket {
             Some(bucket) => self
@@ -1078,6 +1095,25 @@ impl QueryEngine for CoreEngine {
                 left.aggregate(groups, merges).map_err(fail)?
             }
         };
+        // Reduced rows written here (ADR 0092), the columns the coordinator
+        // picked in the table's order.
+        if let Some(target) = &r.write {
+            let df = match &target.picks {
+                Some(picks) => {
+                    let columns = df.schema().columns();
+                    let picked = picks
+                        .iter()
+                        .map(|&i| columns.get(i).cloned().map(Expr::Column))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| {
+                            EngineError::InvalidQuery("a picked column is out of range".into())
+                        })?;
+                    df.select(picked).map_err(fail)?
+                }
+                None => df,
+            };
+            return write_rows(&ctx, df, target).await;
+        }
         run(df).await
     }
 

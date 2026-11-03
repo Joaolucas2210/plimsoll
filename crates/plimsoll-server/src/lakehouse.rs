@@ -197,7 +197,7 @@ impl plimsoll_core::ddl::TableDdl for CatalogDdl {
         &self,
         table: &plimsoll_core::datafusion::common::ResolvedTableReference,
         new: plimsoll_core::ddl::NewTable,
-        rows: plimsoll_core::datafusion::execution::SendableRecordBatchStream,
+        plan: Arc<dyn plimsoll_core::datafusion::physical_plan::ExecutionPlan>,
         state: &dyn plimsoll_core::datafusion::catalog::Session,
     ) -> Result<u64> {
         // Staged: nothing is visible until the data commits with it.
@@ -221,7 +221,7 @@ impl plimsoll_core::ddl::TableDdl for CatalogDdl {
             ident,
         }));
         connector
-            .create_as(state, &staged.metadata, rows)
+            .create_as(state, &staged.metadata, plan)
             .await
             .map_err(DataFusionError::from)
     }

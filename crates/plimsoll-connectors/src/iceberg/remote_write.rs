@@ -25,16 +25,17 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 use futures::{StreamExt, TryStreamExt};
-use plimsoll_core::engine::QueryTag;
+use plimsoll_core::memory::AccountedExec;
 
 use super::write::{IcebergSink, Written};
-use crate::remote::{RemoteScanExec, remote_under};
+use crate::remote::{RemoteReduceExec, RemoteScanExec, WriteTo};
 
-/// The writing fragments, and the commit of what they wrote.
+/// The writing fragments or reduces, and the commit of what they wrote.
 #[derive(Debug)]
 pub(crate) struct RemoteWriteExec {
     sink: IcebergSink,
-    remote: Arc<RemoteScanExec>,
+    /// Partitions returning [`crate::remote::written_schema`] rows.
+    source: Arc<dyn ExecutionPlan>,
     /// The write's output: the rows written.
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
@@ -47,13 +48,24 @@ pub(crate) fn push_write(node: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn Execut
     let exec = node.as_ref().downcast_ref::<DataSinkExec>()?;
     let sink: &dyn Any = exec.sink();
     let sink = sink.downcast_ref::<IcebergSink>()?;
+    distribute(sink, exec.input(), node.schema()).map(|e| Arc::new(e) as Arc<dyn ExecutionPlan>)
+}
+
+/// The write of `input`'s rows into `sink`'s table, done where the rows
+/// are (ADR 0091, 0092): when they come, through pass-through nodes and a
+/// projection that only picks, reorders or losslessly casts columns, from
+/// a remote scan's fragments (plain rows) or a shuffle's reduces
+/// (aggregated or joined rows). `schema` is the write's output.
+pub(super) fn distribute(
+    sink: &IcebergSink,
+    input: &Arc<dyn ExecutionPlan>,
+    schema: SchemaRef,
+) -> Option<RemoteWriteExec> {
     if !sink.workers_may_write() {
         return None;
     }
-    // A projection that only picks, reorders or losslessly casts columns
-    // (as INSERT plans one to match the table) is done by the worker.
     // Merges and repartitions only move rows between partitions: the
-    // fragments' rows are the write's rows all the same.
+    // remote rows are the write's rows all the same.
     let pass = |mut p: Arc<dyn ExecutionPlan>| {
         while matches!(
             p.name(),
@@ -66,7 +78,7 @@ pub(crate) fn push_write(node: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn Execut
         }
         p
     };
-    let mut input = pass(exec.input().clone());
+    let mut input = pass(input.clone());
     let mut picks: Option<Vec<usize>> = None;
     if let Some(p) = input.as_ref().downcast_ref::<ProjectionExec>() {
         let columns = p
@@ -83,38 +95,58 @@ pub(crate) fn push_write(node: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn Execut
         picks = Some(columns);
         input = pass(p.input().clone());
     }
-    let remote = remote_under(&input)?;
-    let remote = remote.as_ref().downcast_ref::<RemoteScanExec>()?;
-    let names = remote.columns();
-    let source = remote.schema();
+    // The scan's or shuffle's accounting wrapper.
+    if input.as_ref().downcast_ref::<AccountedExec>().is_some() {
+        input = pass(input.children().first().map(|c| (*c).clone())?);
+    }
+    let source = input.schema();
     let picks = picks.unwrap_or_else(|| (0..source.fields().len()).collect());
     let target = sink.schema.fields();
     if picks.len() != target.len() {
         return None;
     }
     for (&i, t) in picks.iter().zip(target.iter()) {
-        if !lossless(source.field(i).data_type(), t.data_type()) {
+        if !lossless(source.fields().get(i)?.data_type(), t.data_type()) {
             return None;
         }
     }
-    let columns = picks
-        .iter()
-        .map(|&i| names.get(i).cloned())
-        .collect::<Option<Vec<_>>>()?;
-    let writing = remote.writing(&sink.metadata_path, columns)?;
-    let schema = node.schema();
+    let to = |picks: Option<Vec<usize>>| WriteTo {
+        metadata_location: sink.metadata_path.clone(),
+        metadata: sink.staged.clone(),
+        picks,
+    };
+    let writing: Arc<dyn ExecutionPlan> =
+        if let Some(scan) = input.as_ref().downcast_ref::<RemoteScanExec>() {
+            // A scan's columns travel by name: picked in the target's order.
+            let names = scan.columns();
+            let columns = picks
+                .iter()
+                .map(|&i| names.get(i).cloned())
+                .collect::<Option<Vec<_>>>()?;
+            Arc::new(scan.writing(to(None), columns)?)
+        } else {
+            let reduce = input.as_ref().downcast_ref::<RemoteReduceExec>()?;
+            Arc::new(reduce.writing(to(Some(picks))))
+        };
     let properties = Arc::new(PlanProperties::new(
         EquivalenceProperties::new(schema.clone()),
         Partitioning::UnknownPartitioning(1),
         EmissionType::Final,
         Boundedness::Bounded,
     ));
-    Some(Arc::new(RemoteWriteExec {
+    Some(RemoteWriteExec {
         sink: sink.clone(),
-        remote: Arc::new(writing),
+        source: writing,
         schema,
         properties,
-    }))
+    })
+}
+
+/// A write's output: the rows written.
+pub(super) fn count_schema() -> SchemaRef {
+    Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+        datafusion::arrow::datatypes::Field::new("count", DataType::UInt64, false),
+    ]))
 }
 
 /// Whether the writer's cast from `from` to `to` keeps every value: the
@@ -139,9 +171,10 @@ impl DisplayAs for RemoteWriteExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "RemoteWriteExec: table={} fragments={}",
+            "RemoteWriteExec: table={} source={} partitions={}",
             self.sink.name(),
-            self.remote.fragment_count()
+            self.source.name(),
+            self.source.properties().partitioning.partition_count()
         )
     }
 }
@@ -185,15 +218,19 @@ impl ExecutionPlan for RemoteWriteExec {
                 "RemoteWriteExec has one partition, not {partition}"
             )));
         }
-        let tag = ctx.session_config().get_extension::<QueryTag>();
-        // Every fragment at once, each on its worker.
-        let parts: Vec<_> = (0..self.remote.fragment_count())
-            .map(|p| self.remote.partition_stream(p, tag.clone()))
-            .collect();
+        // Every fragment or reduce at once, each on its worker.
+        let parts = (0..self.source.properties().partitioning.partition_count())
+            .map(|p| self.source.execute(p, ctx.clone()))
+            .collect::<Result<Vec<_>>>()?;
         let sink = self.sink.clone();
         let schema = self.schema.clone();
         let out = schema.clone();
+        // Held until the commit: a shuffle's reduce releases its maps when
+        // dropped (ADR 0073), and the caller may drop this plan as soon as
+        // it has the stream.
+        let source = self.source.clone();
         let commit = async move {
+            let _source = source;
             let batches =
                 futures::future::try_join_all(parts.into_iter().map(|s| s.try_collect::<Vec<_>>()))
                     .await?;

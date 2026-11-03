@@ -1,6 +1,6 @@
 # ADR 0091 — Data files written on workers
 
-- Status: Accepted
+- Status: Accepted (extended by ADR 0092: CTAS and post-shuffle writes on workers)
 - Date: 2026-11-03
 - Owner: JoaoLucas2210
 - Related: ADR 0058 (remote scans), ADR 0062/0063 (filters and projections on workers), ADR 0075/0076 (writer), ADR 0060 (fragment retry)

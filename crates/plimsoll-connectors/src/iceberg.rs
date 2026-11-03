@@ -180,13 +180,22 @@ impl IcebergConnector {
     /// as data files of the table at `metadata_path` (its current schema
     /// and partition spec), not committed. Each file as the coordinator
     /// commits it.
+    ///
+    /// `staged`: a staged create's metadata, which has no file yet (ADR
+    /// 0092), used instead of reading `metadata_path`.
     pub async fn write_files(
         metadata_path: &str,
+        staged: Option<&Json>,
         rows: datafusion::execution::SendableRecordBatchStream,
         state: &dyn Session,
     ) -> Result<Vec<Json>, ConnectorError> {
-        let raw = read(metadata_path, state, None).await?;
-        let meta: Json = serde_json::from_slice(&raw).map_err(|e| invalid(metadata_path, e))?;
+        let meta: Json = match staged {
+            Some(meta) => meta.clone(),
+            None => {
+                let raw = read(metadata_path, state, None).await?;
+                serde_json::from_slice(&raw).map_err(|e| invalid(metadata_path, e))?
+            }
+        };
         let connector = Self::from_metadata("write", metadata_path, &meta)?;
         let sink = connector.table.file_writer()?;
         let written = sink.write_rows(rows, &state.task_ctx()).await?;
@@ -289,15 +298,30 @@ impl IcebergConnector {
     /// `CREATE TABLE … AS SELECT` (ADR 0090): this connector is built on
     /// `staged`, a staged create's metadata; `rows` are written into it and
     /// one commit creates the table with them. The rows written.
+    ///
+    /// `plan` is the query: when its rows come from workers, they write
+    /// them into the staged table where they are (ADR 0092).
     pub async fn create_as(
         &self,
         state: &dyn Session,
         staged: &Json,
-        rows: datafusion::execution::SendableRecordBatchStream,
+        plan: Arc<dyn ExecutionPlan>,
     ) -> Result<u64, ConnectorError> {
-        let sink = self.table.writable("create")?;
+        let mut sink = self.table.writable("create")?;
         self.table.register_scoped(state);
-        Ok(sink.create(staged.clone(), rows, &state.task_ctx()).await?)
+        let task = state.task_ctx();
+        sink.staged = Some(staged.clone());
+        if let Some(write) = remote_write::distribute(&sink, &plan, remote_write::count_schema()) {
+            use datafusion::arrow::array::AsArray;
+            use datafusion::arrow::datatypes::UInt64Type;
+            let batches = datafusion::physical_plan::collect(Arc::new(write), task).await?;
+            return Ok(batches
+                .iter()
+                .map(|b| b.column(0).as_primitive::<UInt64Type>().value(0))
+                .sum());
+        }
+        let rows = datafusion::physical_plan::execute_stream(plan, task.clone())?;
+        Ok(sink.create(staged.clone(), rows, &task).await?)
     }
 
     pub fn with_committer(mut self, committer: Arc<dyn write::Committer>) -> Self {

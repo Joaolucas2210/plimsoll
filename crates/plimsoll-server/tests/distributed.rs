@@ -758,7 +758,7 @@ async fn writes_on_workers_through_the_rest_catalog() {
     let insert = format!("INSERT INTO {dst} SELECT region, id, v FROM {src} WHERE v > 100");
     let plan = text(&format!("EXPLAIN {insert}")).await;
     assert!(
-        plan.contains("RemoteWriteExec") && plan.contains("fragments=2"),
+        plan.contains("RemoteWriteExec") && plan.contains("source=RemoteScanExec partitions=2"),
         "{plan}"
     );
     assert!(text(&insert).await.contains("| 536   |"));
@@ -777,13 +777,59 @@ async fn writes_on_workers_through_the_rest_catalog() {
     let snapshots = meta["snapshots"].as_array().unwrap();
     assert_eq!(snapshots.len(), 1, "one commit");
     assert_eq!(snapshots[0]["summary"]["operation"], "append");
-    // An aggregate's rows are not a fragment's: written here, as before.
+    // A computed column is not a fragment's output: written here.
     let plan = text(&format!(
         "EXPLAIN INSERT INTO {dst} SELECT region, max(id), 0.0 FROM {src} GROUP BY region"
     ))
     .await;
     assert!(!plan.contains("RemoteWriteExec"), "{plan}");
-    for t in [src, dst] {
+    // Post-shuffle (ADR 0092): an aggregate's reducers write its rows.
+    let insert =
+        format!("INSERT INTO {dst} SELECT region, max(id), max(v) FROM {src} GROUP BY region");
+    let plan = text(&format!("EXPLAIN {insert}")).await;
+    assert!(plan.contains("source=RemoteReduceExec"), "{plan}");
+    assert!(text(&insert).await.contains("| 2     |"));
+    // A shuffled join's reducers too.
+    {
+        let state = coordinator.context().state_ref();
+        let mut state = state.write();
+        let optimizer = &mut state.config_mut().options_mut().optimizer;
+        optimizer.hash_join_single_partition_threshold = 0;
+        optimizer.hash_join_single_partition_threshold_rows = 0;
+    }
+    let insert = format!(
+        "INSERT INTO {dst} SELECT a.region, a.id, b.v FROM {src} a JOIN {src} b ON a.id = b.id \
+         WHERE a.v > 290"
+    );
+    let plan = text(&format!("EXPLAIN {insert}")).await;
+    assert!(plan.contains("source=RemoteReduceExec"), "{plan}");
+    assert!(
+        text(&insert).await.contains("| 28    |"),
+        "values 194..200 of each of the 4 inserts"
+    );
+    // CTAS (ADR 0092): a scan's and an aggregate's rows written into the
+    // staged table on the workers, one create commit each.
+    let (c1, c2) = (format!("{src}_c1"), format!("{src}_c2"));
+    assert!(
+        text(&format!(
+            "CREATE TABLE {c1} AS SELECT id, v FROM {src} WHERE v > 100"
+        ))
+        .await
+        .contains("| 536   |")
+    );
+    assert!(
+        text(&format!(
+            "CREATE TABLE {c2} AS SELECT region, count(*) AS n FROM {src} GROUP BY region"
+        ))
+        .await
+        .contains("| 2     |")
+    );
+    let counts = text(&format!("SELECT region, n FROM {c2} ORDER BY region")).await;
+    assert!(
+        counts.contains("| eu     | 400 |") && counts.contains("| us     | 400 |"),
+        "{counts}"
+    );
+    for t in [src, dst, c1, c2] {
         text(&format!("DROP TABLE {t} PURGE")).await;
     }
 }

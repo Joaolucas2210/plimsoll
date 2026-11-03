@@ -130,14 +130,15 @@ pub trait TableDdl: Send + Sync {
         if_exists: bool,
     ) -> Result<()>;
 
-    /// Creates `table` with `rows` as its first snapshot, in one commit
-    /// (`CREATE TABLE … AS SELECT`, ADR 0090). The rows written; 0 when
+    /// Creates `table` with the rows of `plan` (the query, planned and
+    /// checked, not yet run) as its first snapshot, in one commit (`CREATE
+    /// TABLE … AS SELECT`, ADR 0090, 0092). The rows written; 0 when
     /// `new.if_not_exists` and the table exists.
     async fn create_table_as(
         &self,
         table: &ResolvedTableReference,
         _new: NewTable,
-        _rows: datafusion::execution::SendableRecordBatchStream,
+        _plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
         _state: &dyn datafusion::catalog::Session,
     ) -> Result<u64> {
         refuse(format!(
