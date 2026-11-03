@@ -9,7 +9,8 @@
 //! `bronze."trips@audit"` reads the table as of that snapshot. The reference stays in its schema, so grants apply unchanged.
 //! `bronze."trips$snapshots"`, `$history` and `$refs` list them (ADR 0030);
 //! `$files` and `$manifests` list the current snapshot's files (ADR 0032).
-//! `CREATE TABLE ns.t (…)` creates through the catalog (ADR 0083).
+//! `CREATE TABLE ns.t (…)` creates through the catalog (ADR 0083), and
+//! `ALTER TABLE` changes its schema and properties there (ADR 0084).
 
 use std::sync::{Arc, PoisonError, RwLock};
 
@@ -138,12 +139,15 @@ impl iceberg::write::Committer for CatalogCommitter {
     }
 }
 
-/// `CREATE TABLE` in the REST catalog (ADR 0083): the table's schema is
-/// the catalog namespace.
-struct CatalogCreator(Arc<dyn Catalog>);
+/// `CREATE TABLE` (ADR 0083) and `ALTER TABLE` (ADR 0084) in the REST
+/// catalog: the table's schema is the catalog namespace.
+struct CatalogDdl(Arc<dyn Catalog>);
+
+/// Commit attempts of an `ALTER TABLE` racing other writers.
+const ALTER_ATTEMPTS: usize = 4;
 
 #[async_trait]
-impl plimsoll_core::ddl::TableCreator for CatalogCreator {
+impl plimsoll_core::ddl::TableDdl for CatalogDdl {
     async fn create_table(
         &self,
         table: &plimsoll_core::datafusion::common::ResolvedTableReference,
@@ -168,6 +172,43 @@ impl plimsoll_core::ddl::TableCreator for CatalogCreator {
                 "cannot create {ident}: {message}"
             ))),
             Err(e) => Err(DataFusionError::External(Box::new(e))),
+        }
+    }
+
+    async fn alter_table(
+        &self,
+        table: &plimsoll_core::datafusion::common::ResolvedTableReference,
+        changes: Vec<plimsoll_core::ddl::Alteration>,
+        if_exists: bool,
+    ) -> Result<()> {
+        let ident = TableIdent::new(Namespace::new(&[&table.schema]), &table.table);
+        let external = |e: CatalogError| DataFusionError::External(Box::new(e));
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            // Changes apply to the metadata as of now; on a conflict
+            // (another commit in between), to the fresh metadata.
+            let meta = match self.0.load_table(&ident).await {
+                Ok(t) => t.metadata,
+                Err(CatalogError::TableNotFound(_)) if if_exists => return Ok(()),
+                Err(e) => return Err(external(e)),
+            };
+            let Some((requirements, updates)) = iceberg::alter_updates(&meta, &changes)? else {
+                return Ok(());
+            };
+            match self.0.update_table(&ident, requirements, updates).await {
+                Ok(_) => return Ok(()),
+                Err(CatalogError::CommitConflict(_)) if attempt < ALTER_ATTEMPTS => {}
+                Err(CatalogError::Status {
+                    status: 400,
+                    message,
+                }) => {
+                    return Err(DataFusionError::Plan(format!(
+                        "cannot alter {ident}: {message}"
+                    )));
+                }
+                Err(e) => return Err(external(e)),
+            }
         }
     }
 }
@@ -243,9 +284,9 @@ pub async fn register(
     ctx.state_ref()
         .write()
         .config_mut()
-        .set_extension(Arc::new(plimsoll_core::ddl::Creator(Arc::new(
-            CatalogCreator(catalog),
-        ))));
+        .set_extension(Arc::new(plimsoll_core::ddl::Ddl(Arc::new(CatalogDdl(
+            catalog,
+        )))));
     for (namespace, reason) in &r.skipped {
         crate::log::emit(
             crate::log::Level::Warn,
@@ -592,6 +633,35 @@ mod tests {
             left.contains("| 1  |") && left.contains("| 11 |") && !left.contains("| 12 |"),
             "{left}"
         );
+        // ALTER TABLE (ADR 0084): a column added and one renamed; old files
+        // read the new column as NULL and the renamed one by field id; a
+        // promotion reads old int files as long.
+        // Boxed: the test's future would otherwise outgrow the stack.
+        Box::pin(async {
+            text(&format!(
+                "ALTER TABLE {t} ADD COLUMN score INT, RENAME COLUMN name TO label"
+            ))
+            .await;
+            text(&format!("INSERT INTO {t} VALUES (30, 'z', 7)")).await;
+            text(&format!(
+                "ALTER TABLE {t} ALTER COLUMN score SET DATA TYPE BIGINT"
+            ))
+            .await;
+            let evolved = text(&format!("SELECT id, label, score FROM {t} ORDER BY id")).await;
+            for row in ["| 1  | a     |       |", "| 30 | z     | 7     |"] {
+                assert!(evolved.contains(row), "{evolved}");
+            }
+            assert!(
+                engine
+                    .sql(&format!(
+                        "ALTER TABLE {t} ALTER COLUMN score SET DATA TYPE INT"
+                    ))
+                    .await
+                    .is_err()
+            );
+            text(&format!("DELETE FROM {t} WHERE id = 30")).await;
+        })
+        .await;
         let meta = catalog
             .load_table(&TableIdent::new(Namespace::new(&["bronze"]), &parted))
             .await

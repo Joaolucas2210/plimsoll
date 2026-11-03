@@ -327,7 +327,7 @@ async fn iceberg_scans_are_pinned_to_their_snapshot() {
         .await
         .unwrap();
     let key = plimsoll_core::result_cache::key("q", &physical).unwrap();
-    assert!(key.ends_with("t@1"), "{key:?}");
+    assert!(key.ends_with("t@1#0"), "{key:?}");
 }
 
 /// `count(*)` from manifest record counts (ADR 0054): no data file is

@@ -77,7 +77,7 @@ pub fn create_request(
 }
 
 /// ponytail: primitives only; nested types when the writer takes them.
-fn iceberg_type(t: &DataType) -> Option<String> {
+pub(super) fn iceberg_type(t: &DataType) -> Option<String> {
     Some(match t {
         DataType::Boolean => "boolean".into(),
         DataType::Int8 | DataType::Int16 | DataType::Int32 => "int".into(),

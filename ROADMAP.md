@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] `ALTER TABLE`: add, drop and rename columns, `DROP NOT NULL`, Iceberg type promotions and `SET TBLPROPERTIES`, one schema per statement with retry; renaming a denied column is denied; result cache keyed by schema too (ADR 0084)
 - [x] `CREATE TABLE [IF NOT EXISTS] … PARTITION BY (…) OPTIONS (…)` through the REST catalog under the write grant; the rest of DDL still refused (ADR 0083)
 - [x] `MERGE INTO … USING … ON …`: equi-join on the source, every WHEN form (matched update/delete, not matched insert, not matched by source); one `overwrite` snapshot; target needs read and write grants, row-filtered writers refused (ADR 0082)
 - [x] `UPDATE … SET … WHERE`: position deletes plus rewritten rows (partition moves included) in one `overwrite` snapshot; subqueries in SET refused (ADR 0081)
@@ -116,9 +117,10 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Schema and partition evolution: `ALTER TABLE`** — add, rename and
-drop columns and change the partition spec through `updateTable`, so
-tables Plimsoll creates can change without another engine.
+**Partition evolution** — `DELETE`, `UPDATE`, `MERGE` and compaction
+correct for files written under older partition specs (position deletes
+take the data file's spec), then `ALTER TABLE … ADD | DROP PARTITION
+FIELD`.
 
 ## Missing
 
@@ -129,8 +131,8 @@ tables Plimsoll creates can change without another engine.
   deletes across partition spec evolution.
 - Scheduled maintenance (compaction, expiration, orphans) by policy
   instead of on demand.
-- DDL: `ALTER TABLE` (above), `DROP TABLE` under its own grant, and
-  one-commit `CREATE TABLE … AS SELECT`.
+- DDL: partition evolution (above), nested field evolution, `DROP
+  TABLE` under its own grant, and one-commit `CREATE TABLE … AS SELECT`.
 
 **Distribution**
 - Left, full and left-semi/anti joins against small sides on workers;

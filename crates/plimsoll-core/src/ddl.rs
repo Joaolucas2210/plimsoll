@@ -1,21 +1,24 @@
-//! `CREATE TABLE` through the query API (ADR 0083).
+//! `CREATE TABLE` and `ALTER TABLE` through the query API (ADR 0083,
+//! 0084).
 //!
 //! DataFusion would create an in-memory table; Plimsoll instead hands the
-//! statement's schema, partitioning and properties to a [`TableCreator`]
-//! (the server's REST catalog), under the same write grant as `INSERT`.
-//! Nothing else DDL is accepted.
+//! statement's schema, partitioning and properties, or the changes to a
+//! table's schema, to a [`TableDdl`] (the server's REST catalog), under
+//! the same write grant as `INSERT`. Nothing else DDL is accepted.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::common::ResolvedTableReference;
+use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
+use datafusion::common::{ResolvedTableReference, TableReference};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::{DdlStatement, LogicalPlan};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::Statement as DFStatement;
+use datafusion::sql::sqlparser::ast::helpers::stmt_create_table::CreateTableBuilder;
 use datafusion::sql::sqlparser::ast::{
-    CreateTable, CreateTableOptions, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
+    AlterColumnOperation, AlterTable, AlterTableOperation, ColumnDef, CreateTable,
+    CreateTableOptions, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
     SqlOption, Statement, Value,
 };
 
@@ -32,44 +35,115 @@ pub struct NewTable {
     pub if_not_exists: bool,
 }
 
-/// Creates tables in a catalog; installed as a session config extension
-/// ([`Creator`]) by whoever serves catalog-backed schemas.
+/// One change of `ALTER TABLE` (ADR 0084). Column names as the table
+/// spells them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Alteration {
+    /// Always nullable: Iceberg v2 cannot add a required column.
+    AddColumn {
+        field: Field,
+        if_not_exists: bool,
+    },
+    DropColumn {
+        name: String,
+        if_exists: bool,
+    },
+    RenameColumn {
+        from: String,
+        to: String,
+    },
+    DropNotNull(String),
+    /// A promotion Iceberg allows: `int` to `long`, `float` to `double`,
+    /// a wider decimal.
+    SetType {
+        column: String,
+        data_type: DataType,
+    },
+    SetProperties(Vec<(String, String)>),
+}
+
+impl Alteration {
+    /// The existing column this change reads or rewrites, if any.
+    pub fn column(&self) -> Option<&str> {
+        match self {
+            Self::DropColumn { name, .. } => Some(name),
+            Self::RenameColumn { from, .. } => Some(from),
+            Self::DropNotNull(c) | Self::SetType { column: c, .. } => Some(c),
+            Self::AddColumn { .. } | Self::SetProperties(_) => None,
+        }
+    }
+}
+
+/// Creates and alters tables in a catalog; installed as a session config
+/// extension ([`Ddl`]) by whoever serves catalog-backed schemas.
 #[async_trait]
-pub trait TableCreator: Send + Sync {
+pub trait TableDdl: Send + Sync {
     async fn create_table(&self, table: &ResolvedTableReference, new: NewTable) -> Result<()>;
+
+    /// Applies `changes` in order, as one commit. `if_exists`: a missing
+    /// table is not an error.
+    async fn alter_table(
+        &self,
+        table: &ResolvedTableReference,
+        changes: Vec<Alteration>,
+        if_exists: bool,
+    ) -> Result<()>;
 }
 
-/// The session config extension carrying the [`TableCreator`].
-pub struct Creator(pub Arc<dyn TableCreator>);
+/// The session config extension carrying the [`TableDdl`].
+pub struct Ddl(pub Arc<dyn TableDdl>);
 
-/// Whether `sql` is a `CREATE …` statement (by its first word).
-pub(crate) fn is_create(sql: &str) -> bool {
-    sql.trim_start()
-        .get(..7)
-        .is_some_and(|w| w.eq_ignore_ascii_case("create "))
+/// A planned DDL statement.
+#[derive(Debug)]
+pub(crate) enum Planned {
+    Create(ResolvedTableReference, NewTable),
+    Alter {
+        table: ResolvedTableReference,
+        changes: Vec<Alteration>,
+        if_exists: bool,
+    },
 }
 
-const ONLY_CREATE_TABLE: &str =
-    "of DDL, only CREATE TABLE is allowed; the query API is otherwise read-only";
+/// Whether `sql` is a `CREATE …` or `ALTER …` statement (by its first
+/// word).
+pub(crate) fn is_ddl(sql: &str) -> bool {
+    let sql = sql.trim_start();
+    ["create ", "alter "].iter().any(|w| {
+        sql.get(..w.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(w))
+    })
+}
+
+const ONLY_CREATE_TABLE: &str = "of DDL, only CREATE TABLE and ALTER TABLE are allowed; \
+     the query API is otherwise read-only";
 
 fn refuse<T>(why: impl Into<String>) -> Result<T> {
     Err(DataFusionError::Plan(why.into()))
 }
 
-/// Plans `sql`, which must be a plain `CREATE TABLE`: the table it names
-/// (resolved) and what to create. Executes nothing.
-pub(crate) async fn plan(
-    ctx: &SessionContext,
-    sql: &str,
-) -> Result<(ResolvedTableReference, NewTable)> {
+/// Plans `sql`, which must be a plain `CREATE TABLE` or an `ALTER TABLE`
+/// of columns and properties. Executes nothing.
+pub(crate) async fn plan(ctx: &SessionContext, sql: &str) -> Result<Planned> {
     let state = ctx.state();
     let dialect = state.config_options().sql_parser.dialect;
     let DFStatement::Statement(statement) = state.sql_to_statement(sql, &dialect)? else {
         return refuse(ONLY_CREATE_TABLE);
     };
-    let Statement::CreateTable(mut create) = *statement else {
-        return refuse(ONLY_CREATE_TABLE);
-    };
+    match *statement {
+        Statement::CreateTable(create) => {
+            let (table, new) = plan_create(ctx, create).await?;
+            Ok(Planned::Create(table, new))
+        }
+        Statement::AlterTable(alter) => plan_alter(ctx, alter).await,
+        _ => refuse(ONLY_CREATE_TABLE),
+    }
+}
+
+async fn plan_create(
+    ctx: &SessionContext,
+    mut create: CreateTable,
+) -> Result<(ResolvedTableReference, NewTable)> {
+    let state = ctx.state();
     if create.query.is_some() {
         // ponytail: CREATE TABLE, then INSERT INTO … SELECT.
         return refuse("CREATE TABLE … AS SELECT is not supported: create, then INSERT INTO");
@@ -101,19 +175,7 @@ pub(crate) async fn plan(
     if !c.constraints.is_empty() || !c.column_defaults.is_empty() || c.temporary {
         return refuse("CREATE TABLE takes column names, types and NOT NULL only");
     }
-    let options = state.config_options();
-    let table = c.name.resolve(
-        &options.catalog.default_catalog,
-        &options.catalog.default_schema,
-    );
-    // Only into a schema the engine serves (catalogs may not check).
-    if ctx
-        .catalog(&table.catalog)
-        .and_then(|c| c.schema(&table.schema))
-        .is_none()
-    {
-        return refuse(format!("no schema {}.{}", table.catalog, table.schema));
-    }
+    let table = served(ctx, c.name)?;
     let new = NewTable {
         schema: Arc::new(c.input.schema().as_arrow().clone()),
         partition,
@@ -121,6 +183,136 @@ pub(crate) async fn plan(
         if_not_exists: c.if_not_exists,
     };
     Ok((table, new))
+}
+
+/// `name` resolved, in a schema the engine serves (catalogs may not
+/// check).
+fn served(ctx: &SessionContext, name: TableReference) -> Result<ResolvedTableReference> {
+    let state = ctx.state();
+    let options = state.config_options();
+    let table = name.resolve(
+        &options.catalog.default_catalog,
+        &options.catalog.default_schema,
+    );
+    if ctx
+        .catalog(&table.catalog)
+        .and_then(|c| c.schema(&table.schema))
+        .is_none()
+    {
+        return refuse(format!("no schema {}.{}", table.catalog, table.schema));
+    }
+    Ok(table)
+}
+
+/// `ALTER TABLE t ADD COLUMN …, DROP COLUMN …, RENAME COLUMN a TO b,
+/// ALTER COLUMN c DROP NOT NULL | SET DATA TYPE …, SET TBLPROPERTIES (…)`.
+async fn plan_alter(ctx: &SessionContext, alter: AlterTable) -> Result<Planned> {
+    let name = |i: Ident| match i.quote_style {
+        Some(_) => i.value,
+        None => i.value.to_lowercase(),
+    };
+    let mut changes = Vec::new();
+    for op in alter.operations {
+        changes.push(match op {
+            AlterTableOperation::AddColumn {
+                if_not_exists,
+                column_def,
+                column_position: None,
+                ..
+            } => {
+                let field = field(ctx, column_def).await?;
+                if !field.is_nullable() {
+                    return refuse("ADD COLUMN … NOT NULL: Iceberg v2 adds nullable columns only");
+                }
+                Alteration::AddColumn {
+                    field,
+                    if_not_exists,
+                }
+            }
+            AlterTableOperation::DropColumn {
+                column_names,
+                if_exists,
+                drop_behavior: None,
+                ..
+            } => {
+                for c in column_names {
+                    changes.push(Alteration::DropColumn {
+                        name: name(c),
+                        if_exists,
+                    });
+                }
+                continue;
+            }
+            AlterTableOperation::RenameColumn {
+                old_column_name,
+                new_column_name,
+            } => Alteration::RenameColumn {
+                from: name(old_column_name),
+                to: name(new_column_name),
+            },
+            AlterTableOperation::AlterColumn { column_name, op } => match op {
+                AlterColumnOperation::DropNotNull => Alteration::DropNotNull(name(column_name)),
+                AlterColumnOperation::SetDataType {
+                    data_type,
+                    using: None,
+                    ..
+                } => {
+                    let column = name(column_name);
+                    let def = ColumnDef {
+                        name: Ident::new(&column),
+                        data_type,
+                        options: Vec::new(),
+                    };
+                    Alteration::SetType {
+                        data_type: field(ctx, def).await?.data_type().clone(),
+                        column,
+                    }
+                }
+                op => return refuse(format!("unsupported ALTER COLUMN {op}")),
+            },
+            AlterTableOperation::SetTblProperties { table_properties } => {
+                Alteration::SetProperties(properties(CreateTableOptions::TableProperties(
+                    table_properties,
+                ))?)
+            }
+            op => {
+                return refuse(format!(
+                    "unsupported ALTER TABLE operation {op} (supported: ADD COLUMN, \
+                     DROP COLUMN, RENAME COLUMN, ALTER COLUMN … DROP NOT NULL | SET DATA \
+                     TYPE, SET TBLPROPERTIES)"
+                ));
+            }
+        });
+    }
+    if changes.is_empty() {
+        return refuse("ALTER TABLE without a change");
+    }
+    let table = served(ctx, TableReference::from(alter.name.to_string().as_str()))?;
+    Ok(Planned::Alter {
+        table,
+        changes,
+        if_exists: alter.if_exists,
+    })
+}
+
+/// A column definition as DataFusion's `CREATE TABLE` would type it.
+async fn field(ctx: &SessionContext, def: ColumnDef) -> Result<Field> {
+    let create = CreateTableBuilder::new(ObjectName::from(vec![Ident::new("t")]))
+        .columns(vec![def])
+        .build();
+    let plan = ctx
+        .state()
+        .statement_to_plan(DFStatement::Statement(Box::new(Statement::CreateTable(
+            create,
+        ))))
+        .await?;
+    let LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(c)) = plan else {
+        return refuse("unsupported column definition");
+    };
+    if !c.constraints.is_empty() || !c.column_defaults.is_empty() {
+        return refuse("a column takes a name, a type and NOT NULL only");
+    }
+    Ok(c.input.schema().field(0).as_ref().clone())
 }
 
 /// `region`, `bucket(16, id)`, `truncate(4, name)`, `day(ts)` (or Spark's
@@ -194,8 +386,14 @@ fn properties(options: CreateTableOptions) -> Result<Vec<(String, String)>> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn plans_columns_partitions_and_properties_and_refuses_the_rest() {
+    async fn create(ctx: &SessionContext, sql: &str) -> Result<(ResolvedTableReference, NewTable)> {
+        match plan(ctx, sql).await? {
+            Planned::Create(table, new) => Ok((table, new)),
+            p => panic!("{p:?}"),
+        }
+    }
+
+    fn served() -> SessionContext {
         let ctx = SessionContext::new();
         ctx.catalog("datafusion")
             .unwrap()
@@ -204,7 +402,13 @@ mod tests {
                 Arc::new(datafusion::catalog::MemorySchemaProvider::new()),
             )
             .unwrap();
-        let (table, new) = plan(
+        ctx
+    }
+
+    #[tokio::test]
+    async fn plans_columns_partitions_and_properties_and_refuses_the_rest() {
+        let ctx = served();
+        let (table, new) = create(
             &ctx,
             "CREATE TABLE IF NOT EXISTS bronze.t (id BIGINT NOT NULL, region VARCHAR, ts TIMESTAMP) \
              PARTITION BY (region, bucket(16, id), days(ts)) OPTIONS ('write.format' = 'parquet', n = 3)",
@@ -229,7 +433,7 @@ mod tests {
                 ("n".into(), "3".into())
             ]
         );
-        let (_, single) = plan(
+        let (_, single) = create(
             &ctx,
             "CREATE TABLE t (r VARCHAR) WITH (a = 'b') PARTITION BY r",
         )
@@ -249,6 +453,68 @@ mod tests {
         ] {
             assert!(plan(&ctx, sql).await.is_err(), "{sql}");
         }
-        assert!(is_create("  create table t (x int)") && !is_create("SELECT 1"));
+        assert!(
+            is_ddl("  create table t (x int)") && is_ddl("ALTER table t") && !is_ddl("SELECT 1")
+        );
+    }
+
+    #[tokio::test]
+    async fn plans_column_and_property_changes_and_refuses_the_rest() {
+        let ctx = served();
+        let Planned::Alter {
+            table,
+            changes,
+            if_exists,
+        } = plan(
+            &ctx,
+            "ALTER TABLE IF EXISTS bronze.t ADD COLUMN IF NOT EXISTS Note VARCHAR, \
+             DROP COLUMN a, DROP COLUMN IF EXISTS \"B\", RENAME COLUMN c TO d, \
+             ALTER COLUMN n SET DATA TYPE BIGINT, ALTER COLUMN m DROP NOT NULL, \
+             SET TBLPROPERTIES ('k' = 'v')",
+        )
+        .await
+        .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(table.to_string(), "datafusion.bronze.t");
+        assert!(if_exists);
+        assert_eq!(
+            changes,
+            [
+                Alteration::AddColumn {
+                    field: Field::new("note", DataType::Utf8View, true),
+                    if_not_exists: true
+                },
+                Alteration::DropColumn {
+                    name: "a".into(),
+                    if_exists: false
+                },
+                Alteration::DropColumn {
+                    name: "B".into(),
+                    if_exists: true
+                },
+                Alteration::RenameColumn {
+                    from: "c".into(),
+                    to: "d".into()
+                },
+                Alteration::SetType {
+                    column: "n".into(),
+                    data_type: DataType::Int64
+                },
+                Alteration::DropNotNull("m".into()),
+                Alteration::SetProperties(vec![("k".into(), "v".into())]),
+            ]
+        );
+        for sql in [
+            "ALTER TABLE bronze.t ADD COLUMN x INT NOT NULL",
+            "ALTER TABLE bronze.t RENAME TO u",
+            "ALTER TABLE bronze.t ALTER COLUMN x SET NOT NULL",
+            "ALTER TABLE bronze.t ALTER COLUMN x SET DEFAULT 1",
+            "ALTER TABLE nowhere.t ADD COLUMN x INT",
+            "ALTER VIEW v AS SELECT 1",
+        ] {
+            assert!(plan(&ctx, sql).await.is_err(), "{sql}");
+        }
     }
 }

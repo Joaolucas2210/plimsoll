@@ -298,9 +298,10 @@ impl Engine {
         access: Option<&dyn TableAccess>,
     ) -> Result<QueryStream> {
         let started = Instant::now();
-        // `CREATE TABLE`, the one DDL, goes to the catalog (ADR 0083).
-        if crate::ddl::is_create(sql) {
-            return self.create_table(ctx, sql, params, access, started).await;
+        // `CREATE TABLE` and `ALTER TABLE`, the only DDL, go to the
+        // catalog (ADR 0083, 0084).
+        if crate::ddl::is_ddl(sql) {
+            return self.ddl(ctx, sql, params, access, started).await;
         }
         // Read-only SQL (ADR 0024): DDL would let any caller read or write
         // server files (`CREATE EXTERNAL TABLE ... LOCATION '/etc/...'`,
@@ -493,10 +494,11 @@ impl Engine {
 }
 
 impl Engine {
-    /// `CREATE TABLE` (ADR 0083): planned without executing, checked
-    /// against the write grant on the new table's name, then created by the
-    /// session's [`crate::ddl::Creator`]. The result is empty.
-    async fn create_table(
+    /// `CREATE TABLE` (ADR 0083) and `ALTER TABLE` (ADR 0084): planned
+    /// without executing, checked against the write grant on the table's
+    /// name, then done by the session's [`crate::ddl::Ddl`]. The result is
+    /// empty.
+    async fn ddl(
         &self,
         ctx: &SessionContext,
         sql: &str,
@@ -504,18 +506,35 @@ impl Engine {
         access: Option<&dyn TableAccess>,
         started: Instant,
     ) -> Result<QueryStream> {
+        use crate::ddl::Planned;
         if !params.is_empty() {
-            return plan_err!("CREATE TABLE takes no parameters");
+            return plan_err!("DDL takes no parameters");
         }
-        let (table, new) = crate::ddl::plan(ctx, sql).await?;
+        let planned = crate::ddl::plan(ctx, sql).await?;
         if let Some(access) = access {
-            access.check_write(&table)?;
+            match &planned {
+                Planned::Create(table, _) => access.check_write(table)?,
+                Planned::Alter { table, changes, .. } => {
+                    access.check_write(table)?;
+                    // Renaming or dropping a column the caller may not
+                    // read would move it out from under its deny rule.
+                    let columns: Vec<&str> = changes.iter().filter_map(|c| c.column()).collect();
+                    access.check_columns(table, &columns)?;
+                }
+            }
         }
         let state = ctx.state();
-        let Some(creator) = state.config().get_extension::<crate::ddl::Creator>() else {
-            return plan_err!("CREATE TABLE needs a REST catalog (PLIMSOLL_CATALOG_URI)");
+        let Some(ddl) = state.config().get_extension::<crate::ddl::Ddl>() else {
+            return plan_err!("DDL needs a REST catalog (PLIMSOLL_CATALOG_URI)");
         };
-        creator.0.create_table(&table, new).await?;
+        match planned {
+            Planned::Create(table, new) => ddl.0.create_table(&table, new).await?,
+            Planned::Alter {
+                table,
+                changes,
+                if_exists,
+            } => ddl.0.alter_table(&table, changes, if_exists).await?,
+        }
         let physical: Arc<dyn ExecutionPlan> =
             Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
                 datafusion::arrow::datatypes::Schema::empty(),
@@ -996,7 +1015,7 @@ mod tests {
         assert!(err.to_string().contains("needs a REST catalog"), "{err}");
         struct Created(std::sync::Mutex<Vec<String>>);
         #[async_trait::async_trait]
-        impl crate::ddl::TableCreator for Created {
+        impl crate::ddl::TableDdl for Created {
             async fn create_table(
                 &self,
                 table: &ResolvedTableReference,
@@ -1008,19 +1027,74 @@ mod tests {
                     .push(format!("{table} {:?}", new.partition));
                 Ok(())
             }
+            async fn alter_table(
+                &self,
+                table: &ResolvedTableReference,
+                changes: Vec<crate::ddl::Alteration>,
+                _: bool,
+            ) -> Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("{table} {}", changes.len()));
+                Ok(())
+            }
         }
         let created = Arc::new(Created(Default::default()));
         e.context()
             .state_ref()
             .write()
             .config_mut()
-            .set_extension(Arc::new(crate::ddl::Creator(created.clone())));
+            .set_extension(Arc::new(crate::ddl::Ddl(created.clone())));
         e.sql_with(&create.replace("{t}", "bronze.n"), &[], bronze.clone())
             .await
             .unwrap();
+        // ALTER TABLE (ADR 0084): the write grant, and every column it
+        // renames or drops readable by the caller.
+        let err = e
+            .sql_with("ALTER TABLE silver.s ADD COLUMN y INT", &[], bronze.clone())
+            .await
+            .unwrap_err();
+        assert!(denied(&err), "{err}");
+        struct NoSecret;
+        impl TableAccess for NoSecret {
+            fn check(&self, _: &ResolvedTableReference) -> Result<()> {
+                Ok(())
+            }
+            fn check_write(&self, _: &ResolvedTableReference) -> Result<()> {
+                Ok(())
+            }
+            fn check_columns(&self, t: &ResolvedTableReference, c: &[&str]) -> Result<()> {
+                if c.contains(&"secret") {
+                    return Err(DataFusionError::External(Box::new(AccessDenied {
+                        table: t.to_string(),
+                    })));
+                }
+                Ok(())
+            }
+        }
+        let err = e
+            .sql_with(
+                "ALTER TABLE bronze.n RENAME COLUMN secret TO s",
+                &[],
+                Arc::new(NoSecret),
+            )
+            .await
+            .unwrap_err();
+        assert!(denied(&err), "{err}");
+        e.sql_with(
+            "ALTER TABLE bronze.n ADD COLUMN y INT, RENAME COLUMN id TO key",
+            &[],
+            Arc::new(NoSecret),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             *created.0.lock().unwrap(),
-            ["datafusion.bronze.n [(\"bucket[4]\", \"id\")]"]
+            [
+                "datafusion.bronze.n [(\"bucket[4]\", \"id\")]",
+                "datafusion.bronze.n 2"
+            ]
         );
         // 3 (deleted), then 2 (appended): one row left.
         let rows = e.sql("SELECT x FROM bronze.b").await.unwrap();

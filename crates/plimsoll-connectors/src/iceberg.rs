@@ -50,12 +50,14 @@ use serde_json::Value as Json;
 
 use crate::{Connector, ConnectorError, portable};
 
+mod alter;
 mod create;
 mod deletes;
 mod field_ids;
 mod files;
 pub mod meta;
 
+pub use alter::alter_updates;
 pub use create::create_request;
 pub mod expire;
 mod merge;
@@ -1360,6 +1362,8 @@ impl TableProvider for IcebergTable {
                 })
                 .flatten()
                 .and_then(|n| usize::try_from(n).ok());
+        // Pinned to the snapshot and the schema: `ALTER TABLE` (ADR 0084)
+        // changes what `SELECT *` returns without a new snapshot.
         let scan = AccountedExec::new(
             format!(
                 "IcebergScan[{}] snapshot={} manifests={}/{} files={}/{} deletes={} deleted_rows={} equality_deletes={} delete_cache_hits={} manifest_cache_hits={}",
@@ -1379,9 +1383,10 @@ impl TableProvider for IcebergTable {
             input,
         )
 .with_pinned(format!(
-            "{}@{}",
+            "{}@{}#{}",
             self.name,
-            self.snapshot_id.map_or("none".to_owned(), |id| id.to_string())
+            self.snapshot_id.map_or("none".to_owned(), |id| id.to_string()),
+            self.schema_id
         ));
         // Otherwise the manifests' record counts are an upper bound (rows
         // may be deleted or filtered): inexact, but enough for DataFusion
