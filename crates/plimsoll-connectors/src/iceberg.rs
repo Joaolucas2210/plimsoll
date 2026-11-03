@@ -267,6 +267,20 @@ impl IcebergConnector {
     }
 
     /// Accept `INSERT INTO`, committing through `committer` (ADR 0075).
+    /// `CREATE TABLE … AS SELECT` (ADR 0090): this connector is built on
+    /// `staged`, a staged create's metadata; `rows` are written into it and
+    /// one commit creates the table with them. The rows written.
+    pub async fn create_as(
+        &self,
+        state: &dyn Session,
+        staged: &Json,
+        rows: datafusion::execution::SendableRecordBatchStream,
+    ) -> Result<u64, ConnectorError> {
+        let sink = self.table.writable("create")?;
+        self.table.register_scoped(state);
+        Ok(sink.create(staged.clone(), rows, &state.task_ctx()).await?)
+    }
+
     pub fn with_committer(mut self, committer: Arc<dyn write::Committer>) -> Self {
         let mut table = (*self.table).clone();
         table.committer = Some(committer);
@@ -1676,6 +1690,7 @@ impl IcebergTable {
             schema_id: self.schema_id,
             layout,
             base: self.snapshot_id,
+            staged: None,
         })
     }
 

@@ -228,6 +228,9 @@ pub(super) struct IcebergSink {
     /// The snapshot rows were read from when planning: deletes and
     /// rewrites commit only if nothing but appends happened since.
     pub(super) base: Option<i64>,
+    /// A staged create's metadata (`CREATE TABLE … AS SELECT`, ADR
+    /// 0090): the commit creates the table with its first snapshot.
+    pub(super) staged: Option<Json>,
 }
 
 impl IcebergSink {
@@ -459,6 +462,21 @@ impl DataSink for IcebergSink {
 
 impl IcebergSink {
     /// Writes `data` as data files, routed by partition (ADR 0076).
+    /// `CREATE TABLE … AS SELECT` (ADR 0090): `data` written into the
+    /// staged table, which the commit creates. The rows written.
+    pub(super) async fn create(
+        mut self,
+        staged: Json,
+        data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+    ) -> Result<u64> {
+        self.staged = Some(staged);
+        let written = self.write_rows(data, context).await?;
+        self.commit(&written, Change::Append, None, &context.runtime_env())
+            .await?;
+        Ok(written.iter().map(|w| w.rows).sum())
+    }
+
     pub(super) async fn write_rows(
         &self,
         mut data: SendableRecordBatchStream,
@@ -655,7 +673,11 @@ impl IcebergSink {
         let failed = |m: String| DataFusionError::Execution(format!("{}: {m}", self.name));
         // Positive, as Java writers make them.
         let snapshot_id = (unique() >> 1) as i64;
-        let meta = self.committer.current().await.map_err(failed)?;
+        // A staged table does not exist yet: its metadata is the staged one.
+        let meta = match &self.staged {
+            Some(staged) => staged.clone(),
+            None => self.committer.current().await.map_err(failed)?,
+        };
         // One manifest per content and partition spec: data files, then
         // position deletes, each in its data file's spec (ADR 0085).
         let mut manifests = Vec::new();
@@ -855,17 +877,32 @@ impl IcebergSink {
             if let Some(parent) = parent {
                 snapshot["parent-snapshot-id"] = json!(parent);
             }
-            let requirements = vec![
-                json!({"type": "assert-table-uuid", "uuid": meta["table-uuid"]}),
-                json!({"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": parent}),
-                json!({"type": "assert-default-spec-id", "default-spec-id": self.layout.spec_id}),
-            ];
-            let updates = vec![
-                json!({"action": "add-snapshot", "snapshot": snapshot}),
-                json!({"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": snapshot_id}),
-            ];
+            let (requirements, mut updates) = match &self.staged {
+                // The table and its first snapshot in one commit, which
+                // fails if the table was created meanwhile (ADR 0090).
+                Some(_) => (
+                    vec![json!({"type": "assert-create"})],
+                    creation_updates(&meta),
+                ),
+                None => (
+                    vec![
+                        json!({"type": "assert-table-uuid", "uuid": meta["table-uuid"]}),
+                        json!({"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": parent}),
+                        json!({"type": "assert-default-spec-id", "default-spec-id": self.layout.spec_id}),
+                    ],
+                    Vec::new(),
+                ),
+            };
+            updates.push(json!({"action": "add-snapshot", "snapshot": snapshot}));
+            updates.push(json!({"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": snapshot_id}));
             match self.committer.commit(requirements, updates).await {
                 Ok(()) => return Ok(()),
+                Err(CommitError::Conflict(m)) if self.staged.is_some() => {
+                    return Err(failed(format!(
+                        "the table was created by someone else meanwhile; nothing was \
+                         committed ({m})"
+                    )));
+                }
                 Err(CommitError::Conflict(_)) if attempt + 1 < COMMIT_ATTEMPTS => continue,
                 Err(CommitError::Conflict(m) | CommitError::Failed(m)) => {
                     return Err(failed(format!("commit failed: {m}")));
@@ -874,6 +911,38 @@ impl IcebergSink {
         }
         Err(failed("commit failed".into()))
     }
+}
+
+/// The updates that create the table a staged `meta` describes, as
+/// Iceberg's create transaction sends them (ADR 0090).
+fn creation_updates(meta: &Json) -> Vec<Json> {
+    let find = |list: &str, key: &str, id: &Json| {
+        meta[list]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|x| x[key] == *id)
+            .cloned()
+            .unwrap_or(Json::Null)
+    };
+    let schema = find("schemas", "schema-id", &meta["current-schema-id"]);
+    let spec = find("partition-specs", "spec-id", &meta["default-spec-id"]);
+    let order = find("sort-orders", "order-id", &meta["default-sort-order-id"]);
+    let mut updates = vec![
+        json!({"action": "assign-uuid", "uuid": meta["table-uuid"]}),
+        json!({"action": "upgrade-format-version", "format-version": meta["format-version"]}),
+        json!({"action": "add-schema", "schema": schema, "last-column-id": meta["last-column-id"]}),
+        json!({"action": "set-current-schema", "schema-id": -1}),
+        json!({"action": "add-spec", "spec": spec}),
+        json!({"action": "set-default-spec", "spec-id": -1}),
+    ];
+    if !order.is_null() {
+        updates.push(json!({"action": "add-sort-order", "sort-order": order}));
+        updates.push(json!({"action": "set-default-sort-order", "sort-order-id": -1}));
+    }
+    updates.push(json!({"action": "set-location", "location": meta["location"]}));
+    updates.push(json!({"action": "set-properties", "updates": meta["properties"]}));
+    updates
 }
 
 /// A data file a `DELETE` reads (ADR 0077): every row, in file order, so
@@ -2283,6 +2352,7 @@ mod tests {
             schema_id: 0,
             layout,
             base: None,
+            staged: None,
         };
         let groups = sink.split(&batch).unwrap();
         // ("a", bucket(1)) twice, then ("b", ...), then (NULL, ...).

@@ -9,7 +9,8 @@
 //! `bronze."trips@audit"` reads the table as of that snapshot. The reference stays in its schema, so grants apply unchanged.
 //! `bronze."trips$snapshots"`, `$history` and `$refs` list them (ADR 0030);
 //! `$files` and `$manifests` list the current snapshot's files (ADR 0032).
-//! `CREATE TABLE ns.t (…)` creates through the catalog (ADR 0083), and
+//! `CREATE TABLE ns.t (…)` creates through the catalog (ADR 0083; `… AS
+//! SELECT` staged, then committed with its rows, ADR 0090), and
 //! `ALTER TABLE` changes its schema and properties there (ADR 0084).
 
 use std::sync::{Arc, PoisonError, RwLock};
@@ -144,23 +145,25 @@ impl iceberg::write::Committer for CatalogCommitter {
 /// namespace.
 struct CatalogDdl(Arc<dyn Catalog>);
 
-/// Commit attempts of an `ALTER TABLE` racing other writers.
-const ALTER_ATTEMPTS: usize = 4;
-
-#[async_trait]
-impl plimsoll_core::ddl::TableDdl for CatalogDdl {
-    async fn create_table(
+impl CatalogDdl {
+    /// `createTable` (`stage-create` when `staged`, ADR 0090): the table as
+    /// created or staged; `None` when it exists and `IF NOT EXISTS`.
+    async fn create(
         &self,
         table: &plimsoll_core::datafusion::common::ResolvedTableReference,
-        new: plimsoll_core::ddl::NewTable,
-    ) -> Result<()> {
+        new: &plimsoll_core::ddl::NewTable,
+        staged: bool,
+    ) -> Result<Option<LoadedTable>> {
         let ident = TableIdent::new(Namespace::new(&[&table.schema]), &table.table);
-        let request =
+        let mut request =
             iceberg::create_request(&table.table, &new.schema, &new.partition, &new.properties)
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        if staged {
+            request["stage-create"] = serde_json::json!(true);
+        }
         match self.0.create_table(&ident, request).await {
-            Ok(_) => Ok(()),
-            Err(CatalogError::TableExists(_)) if new.if_not_exists => Ok(()),
+            Ok(t) => Ok(Some(t)),
+            Err(CatalogError::TableExists(_)) if new.if_not_exists => Ok(None),
             Err(CatalogError::TableExists(_)) => Err(DataFusionError::Plan(format!(
                 "table {ident} already exists"
             ))),
@@ -174,6 +177,53 @@ impl plimsoll_core::ddl::TableDdl for CatalogDdl {
             ))),
             Err(e) => Err(DataFusionError::External(Box::new(e))),
         }
+    }
+}
+
+/// Commit attempts of an `ALTER TABLE` racing other writers.
+const ALTER_ATTEMPTS: usize = 4;
+
+#[async_trait]
+impl plimsoll_core::ddl::TableDdl for CatalogDdl {
+    async fn create_table(
+        &self,
+        table: &plimsoll_core::datafusion::common::ResolvedTableReference,
+        new: plimsoll_core::ddl::NewTable,
+    ) -> Result<()> {
+        self.create(table, &new, false).await.map(|_| ())
+    }
+
+    async fn create_table_as(
+        &self,
+        table: &plimsoll_core::datafusion::common::ResolvedTableReference,
+        new: plimsoll_core::ddl::NewTable,
+        rows: plimsoll_core::datafusion::execution::SendableRecordBatchStream,
+        state: &dyn plimsoll_core::datafusion::catalog::Session,
+    ) -> Result<u64> {
+        // Staged: nothing is visible until the data commits with it.
+        let Some(staged) = self.create(table, &new, true).await? else {
+            return Ok(0); // IF NOT EXISTS, and it does
+        };
+        let ident = TableIdent::new(Namespace::new(&[&table.schema]), &table.table);
+        let location = staged.metadata["location"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let connector = IcebergConnector::from_metadata(
+            format!("{}.{}", table.schema, table.table),
+            &location,
+            &staged.metadata,
+        )
+        .and_then(|c| c.with_storage_properties(&staged.storage))
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .with_committer(Arc::new(CatalogCommitter {
+            catalog: self.0.clone(),
+            ident,
+        }));
+        connector
+            .create_as(state, &staged.metadata, rows)
+            .await
+            .map_err(DataFusionError::from)
     }
 
     async fn alter_table(
@@ -1004,9 +1054,42 @@ mod tests {
             }
         })
         .await;
+        // CTAS (ADR 0090): table and rows in one commit; a query failing
+        // midway leaves no table behind.
+        let ctas = format!("{name}_c");
+        Box::pin(async {
+            let out = text(&format!(
+                "CREATE TABLE bronze.{ctas} PARTITION BY (region) AS SELECT id, region FROM {p}"
+            ))
+            .await;
+            // 1, 3, 11, and the two scheduled maintenance appended.
+            assert!(out.contains("| 5     |"), "{out}");
+            let meta = catalog
+                .load_table(&TableIdent::new(Namespace::new(&["bronze"]), &ctas))
+                .await
+                .unwrap()
+                .metadata;
+            assert_eq!(meta["snapshots"].as_array().unwrap().len(), 1);
+            let failed = format!("{name}_f");
+            assert!(
+                engine
+                    .sql(&format!(
+                        "CREATE TABLE bronze.{failed} AS SELECT 1 / (id - id) AS boom FROM {p}"
+                    ))
+                    .await
+                    .is_err()
+            );
+            assert!(matches!(
+                catalog
+                    .load_table(&TableIdent::new(Namespace::new(&["bronze"]), &failed))
+                    .await,
+                Err(CatalogError::TableNotFound(_))
+            ));
+        })
+        .await;
         // DROP TABLE (ADR 0089) cleans up: gone for queries, and a second
         // drop only passes with IF EXISTS.
-        for t in [name, parted, nested] {
+        for t in [name, parted, nested, ctas] {
             text(&format!("DROP TABLE bronze.{t} PURGE")).await;
             assert!(
                 engine

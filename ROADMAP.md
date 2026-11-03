@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] `CREATE TABLE … AS SELECT` in one commit: staged create, rows written, `assert-create` commit carrying table and first snapshot; the query is governed like any read (ADR 0090)
 - [x] `DROP TABLE [IF EXISTS] … [PURGE]` under its own grant (`PLIMSOLL_AUTH_DROP_GRANTS`), through the catalog's `dropTable` (ADR 0089)
 - [x] Nested field evolution: nested fields resolve by id in the scan (renamed, moved and re-added fields read right); `ALTER TABLE … ADD | RENAME | DROP COLUMN a.b` in Spark's syntax (ADR 0088)
 - [x] Writes to nested columns: field ids at every level (struct fields, list elements, map keys and values), no statistics under a nested column's id; `CREATE TABLE` / `ADD COLUMN` with `STRUCT` and `ARRAY`; read by Spark and pyiceberg (ADR 0087)
@@ -122,21 +123,22 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**`CREATE TABLE … AS SELECT` in one commit** — create the table staged,
-write the query's rows, and commit table and data together, so a failed
-query leaves no empty table behind.
+**Data files written on workers** — `INSERT … SELECT` and CTAS whose
+query is distributed write their files where the rows are (each worker
+returns its written files), and the coordinator commits them in one
+snapshot, so large writes are not bound by one node.
 
 ## Missing
 
 **Lakehouse writes** (the largest gap)
 - Appends to v3; decimal partition values; data
-  files written on workers; vectorized partition transforms.
+  files written on workers (above); vectorized partition transforms.
 - `MERGE` beyond the pool (spilled source); deletion vectors for v3
   tables.
 - Maintenance: a per-table lease for several coordinators, per-step
   schedules, metrics.
-- DDL: nested promotions and leaf statistics for nested fields, and
-  one-commit `CREATE TABLE … AS SELECT`.
+- DDL: nested promotions, leaf statistics for nested fields, `CREATE OR
+  REPLACE TABLE … AS SELECT`.
 
 **Distribution**
 - Left, full and left-semi/anti joins against small sides on workers;

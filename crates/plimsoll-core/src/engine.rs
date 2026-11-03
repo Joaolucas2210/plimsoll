@@ -537,7 +537,24 @@ impl Engine {
         let Some(ddl) = state.config().get_extension::<crate::ddl::Ddl>() else {
             return plan_err!("DDL needs a REST catalog (PLIMSOLL_CATALOG_URI)");
         };
+        let mut reads = Vec::new();
+        let mut count = None;
         match planned {
+            // CTAS (ADR 0090): the query goes through the full read path
+            // (grants, row filters, column checks), then one commit.
+            Planned::Create(table, mut new) if new.query.is_some() => {
+                let select = new.query.take().unwrap_or_default();
+                let mut query = Box::pin(self.plan_stream(ctx, &select, &[], access)).await?;
+                let schema = query.stream.schema();
+                let rows = std::mem::replace(
+                    &mut query.stream,
+                    Box::pin(datafusion::physical_plan::EmptyRecordBatchStream::new(
+                        schema,
+                    )),
+                );
+                reads = std::mem::take(&mut query.reads);
+                count = Some(ddl.0.create_table_as(&table, new, rows, &state).await?);
+            }
             Planned::Create(table, new) => ddl.0.create_table(&table, new).await?,
             Planned::Alter {
                 table,
@@ -550,14 +567,34 @@ impl Engine {
                 purge,
             } => ddl.0.drop_table(&table, if_exists, purge).await?,
         }
-        let physical: Arc<dyn ExecutionPlan> =
-            Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
+        let physical: Arc<dyn ExecutionPlan> = match count {
+            // Like an INSERT: the rows written.
+            Some(n) => {
+                use datafusion::arrow::array::UInt64Array;
+                use datafusion::arrow::datatypes::{DataType, Field, Schema};
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    "count",
+                    DataType::UInt64,
+                    false,
+                )]));
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(UInt64Array::from(vec![n]))],
+                )?;
+                datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+                    &[vec![batch]],
+                    schema,
+                    None,
+                )?
+            }
+            None => Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
                 datafusion::arrow::datatypes::Schema::empty(),
-            )));
+            ))),
+        };
         Ok(QueryStream {
             stream: execute_stream(physical.clone(), state.task_ctx())?,
             planning: started.elapsed(),
-            reads: Vec::new(),
+            reads,
             physical,
             spilled_total: self.spilled_total.clone(),
         })
@@ -1113,6 +1150,17 @@ mod tests {
         )
         .await
         .unwrap();
+        // CTAS (ADR 0090): its query is a read like any other, denied on a
+        // table the caller may not read, before anything is created.
+        let err = e
+            .sql_with(
+                "CREATE TABLE bronze.c AS SELECT x FROM gold.g",
+                &[],
+                bronze.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(denied(&err), "{err}");
         // DROP TABLE (ADR 0089): its own grant; a write grant is not one.
         let err = e
             .sql_with("DROP TABLE bronze.n", &[], bronze.clone())

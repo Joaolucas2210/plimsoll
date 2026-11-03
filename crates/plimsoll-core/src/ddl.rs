@@ -33,6 +33,9 @@ pub struct NewTable {
     /// `OPTIONS (…)` after it.
     pub properties: Vec<(String, String)>,
     pub if_not_exists: bool,
+    /// `CREATE TABLE … AS <query>` (ADR 0090): the query's SQL, whose
+    /// output schema is [`Self::schema`].
+    pub query: Option<String>,
 }
 
 /// One change of `ALTER TABLE` (ADR 0084). Column names as the table
@@ -126,6 +129,21 @@ pub trait TableDdl: Send + Sync {
         changes: Vec<Alteration>,
         if_exists: bool,
     ) -> Result<()>;
+
+    /// Creates `table` with `rows` as its first snapshot, in one commit
+    /// (`CREATE TABLE … AS SELECT`, ADR 0090). The rows written; 0 when
+    /// `new.if_not_exists` and the table exists.
+    async fn create_table_as(
+        &self,
+        table: &ResolvedTableReference,
+        _new: NewTable,
+        _rows: datafusion::execution::SendableRecordBatchStream,
+        _state: &dyn datafusion::catalog::Session,
+    ) -> Result<u64> {
+        refuse(format!(
+            "{table}: CREATE TABLE … AS SELECT is not supported here"
+        ))
+    }
 
     /// Drops `table` from its catalog (ADR 0089); `purge` asks the catalog
     /// to delete its files too. `if_exists`: a missing table is not an
@@ -223,10 +241,12 @@ async fn plan_create(
     mut create: CreateTable,
 ) -> Result<(ResolvedTableReference, NewTable)> {
     let state = ctx.state();
-    if create.query.is_some() {
-        // ponytail: CREATE TABLE, then INSERT INTO … SELECT.
-        return refuse("CREATE TABLE … AS SELECT is not supported: create, then INSERT INTO");
-    }
+    let query = match &create.query {
+        Some(_) if !create.columns.is_empty() => {
+            return refuse("CREATE TABLE … AS SELECT takes its columns from the query");
+        }
+        q => q.as_ref().map(|q| q.to_string()),
+    };
     let partition = match create.partition_by.take() {
         None => Vec::new(),
         Some(e) => match *e {
@@ -260,6 +280,7 @@ async fn plan_create(
         partition,
         properties,
         if_not_exists: c.if_not_exists,
+        query,
     };
     Ok((table, new))
 }
@@ -687,8 +708,18 @@ mod tests {
         .unwrap();
         assert_eq!(single.partition, [("identity".into(), "r".into())]);
         assert_eq!(single.properties, [("a".into(), "b".into())]);
+        // CTAS: the schema is the query's (ADR 0090).
+        let (_, ctas) = create(
+            &ctx,
+            "CREATE TABLE t PARTITION BY x AS SELECT 1 AS x, 'a' AS y",
+        )
+        .await
+        .unwrap();
+        assert_eq!(ctas.query.as_deref(), Some("SELECT 1 AS x, 'a' AS y"));
+        assert_eq!(ctas.schema.field(1).name(), "y");
+        assert_eq!(ctas.partition, [("identity".into(), "x".into())]);
         for sql in [
-            "CREATE TABLE t AS SELECT 1 AS x",
+            "CREATE TABLE t (x INT) AS SELECT 1 AS x",
             "CREATE OR REPLACE TABLE t (x INT)",
             "CREATE TABLE t (x INT) PARTITION BY (sqrt(x))",
             "CREATE TABLE t (x INT) PARTITION BY (bucket(0, x))",
