@@ -75,6 +75,7 @@ are allowed in place.
 | [0065](0065-join-shuffle-between-workers.md) | Join shuffle between workers | Accepted | 2026-11-02 | Partitioned hash joins of two remote scans on same-typed column keys (no residual filter, no mark join) become reduces on every healthy worker: both sides' fragments are maps hashed by join key, worker j joins bucket j of each with the same join type and projection; one `RemoteReduceExec` serves aggregation and join shuffles; repartitions and free partial aggregations no longer block shuffling | 0064, 0062, 0058 |
 | [0066](0066-broadcast-joins-on-workers.md) | Broadcast joins on workers | Accepted | 2026-11-03 | Iceberg scans report manifest row counts as inexact statistics so DataFusion collects small sides; `CollectLeft` inner/right/right-semi/right-anti joins over a remote probe scan run the build side once on the coordinator and send it as Arrow IPC after each fragment's JSON; workers join it with their fragment; nodes with an output ordering are never replaced by remote ones | 0065, 0064, 0054, 0060 |
 | [0067](0067-shuffle-buckets-spill-to-disk.md) | Shuffle buckets spill to disk | Accepted | 2026-11-03 | Shuffle maps drain their buckets concurrently and reserve each batch before keeping it; the first refusal spills that bucket (held batches, then the rest) as Arrow IPC to a DiskManager spill file, served back through the incremental decoder that requires the end-of-stream marker; no spill dir means the query fails as before | 0064, 0065, 0066, 0003 |
+| [0068](0068-streaming-shuffle-reducers.md) | Streaming shuffle reducers | Accepted | 2026-11-03 | Reducers open every bucket concurrently and return once its IPC schema arrives; each reduce side is a `StreamingTable` of one read-once partition per map (batches conformed to the first map's schema), so the merge or join consumes buckets as they arrive and owns the memory; the end-of-stream marker is still required | 0064, 0065, 0067, 0060 |
 
 ## Reading order
 
@@ -82,7 +83,7 @@ are allowed in place.
 - Shape of the system: 0001, 0002, 0004.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
 - Federation: 0005 → 0006.
-- Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067.
+- Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046.
 

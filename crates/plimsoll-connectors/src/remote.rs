@@ -1523,37 +1523,56 @@ async fn open(
         .boxed())
 }
 
-/// A shuffle bucket from the worker at `url` (ADR 0064), whole: its
-/// schema and batches as that worker typed them. `token` is the worker
-/// token the reducing worker was called with.
-pub async fn fetch_bucket(
+/// A shuffle bucket from the worker at `url` (ADR 0064, 0068), as it
+/// arrives: its schema (from the first IPC message) and a stream of its
+/// batches, which fails without the end-of-stream marker. `token` is the
+/// worker token the reducing worker was called with.
+pub async fn open_bucket(
     url: String,
     token: &str,
     fragment: &Fragment,
     tag: Option<Arc<QueryTag>>,
-) -> Result<(SchemaRef, Vec<RecordBatch>)> {
+) -> Result<(SchemaRef, BoxStream<'static, Result<RecordBatch>>)> {
     let workers = Arc::new(
         Workers::new(Vec::new(), token.to_owned())
             .map_err(|e| worker_error(e.to_string(), false))?,
     );
-    let mut body = open(
+    let body = open(
         workers,
         url.clone(),
         Bytes::from(fragment.to_json().to_string()),
         tag,
     )
     .await?;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = body.next().await {
-        bytes.extend_from_slice(&chunk?);
-    }
-    if !bytes.ends_with(&END_OF_STREAM) {
-        return Err(worker_error(
-            format!("worker {url}: bucket ended without its end-of-stream marker"),
-            false,
-        ));
-    }
-    read_ipc(bytes)
+    with_schema(body)
+        .await
+        .map_err(|e| worker_error(format!("worker {url}: bucket: {e}"), false))
+}
+
+/// An Arrow IPC byte stream as its schema (read from the first message)
+/// and its batches, decoded as they arrive; the bytes read for the schema
+/// are decoded again. No schema, or no end-of-stream marker, is an error.
+pub async fn with_schema(
+    mut body: BoxStream<'static, Result<Bytes>>,
+) -> Result<(SchemaRef, BoxStream<'static, Result<RecordBatch>>)> {
+    let mut probe = StreamDecoder::new();
+    let mut head = Vec::new();
+    let schema = loop {
+        let Some(chunk) = body.next().await else {
+            return Err(DataFusionError::Execution("ended before its schema".into()));
+        };
+        let chunk = chunk?;
+        head.push(Ok(chunk.clone()));
+        let mut buf = Buffer::from(chunk);
+        while !buf.is_empty() && probe.schema().is_none() {
+            probe.decode(&mut buf)?;
+        }
+        if let Some(schema) = probe.schema() {
+            break schema;
+        }
+    };
+    let bytes = stream::iter(head).chain(body).boxed();
+    Ok((schema.clone(), decode(bytes, schema)))
 }
 
 /// A whole Arrow IPC stream: its schema and batches.
@@ -1577,6 +1596,24 @@ pub fn split_body(body: &[u8]) -> (&[u8], &[u8]) {
 
 /// Arrow IPC's end-of-stream marker: continuation, then a zero length.
 const END_OF_STREAM: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
+
+/// `batch` with `schema`'s names and metadata, columns cast to its types.
+pub fn conform(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
+    batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(c, f)| {
+            if c.data_type() == f.data_type() {
+                Ok(c.clone())
+            } else {
+                datafusion::arrow::compute::cast(c, f.data_type())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(|cols| RecordBatch::try_new(schema.clone(), cols))
+        .map_err(DataFusionError::from)
+}
 
 /// Arrow IPC bytes -> batches with `schema` (the coordinator's field names
 /// and metadata). A stream that ends without its end-of-stream marker (a
@@ -1609,20 +1646,7 @@ pub fn decode(
             if let Some(batch) = st.ready.pop_front() {
                 // The coordinator's names and types: partial states come
                 // back as the worker's SQL typed them (ADR 0061).
-                let batch = batch
-                    .columns()
-                    .iter()
-                    .zip(st.schema.fields())
-                    .map(|(c, f)| {
-                        if c.data_type() == f.data_type() {
-                            Ok(c.clone())
-                        } else {
-                            datafusion::arrow::compute::cast(c, f.data_type())
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .and_then(|cols| RecordBatch::try_new(st.schema.clone(), cols))
-                    .map_err(DataFusionError::from);
+                let batch = conform(&batch, &st.schema);
                 return Some((batch, st));
             }
             if st.done {
@@ -1751,6 +1775,52 @@ mod tests {
         let w = Workers::new(vec!["http://w1/".into()], "secret".into()).unwrap();
         assert_eq!(w.urls(), ["http://w1"]);
         assert!(!format!("{w:?}").contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn bucket_streams_yield_their_schema_first() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::ipc::writer::StreamWriter;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let ipc = |batches: &[RecordBatch]| {
+            let mut w = StreamWriter::try_new(Vec::new(), &schema).unwrap();
+            for b in batches {
+                w.write(b).unwrap();
+            }
+            w.into_inner().unwrap()
+        };
+        // Seven-byte chunks: the schema message spans several.
+        let chunks = |bytes: Vec<u8>| {
+            stream::iter(
+                bytes
+                    .chunks(7)
+                    .map(|c| Ok(Bytes::copy_from_slice(c)))
+                    .collect::<Vec<_>>(),
+            )
+            .boxed()
+        };
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let (got, batches) = with_schema(chunks(ipc(&[batch.clone(), batch.clone()])))
+            .await
+            .unwrap();
+        assert_eq!(got, schema);
+        let batches: Vec<_> = batches.map(|b| b.unwrap()).collect().await;
+        assert_eq!(batches, [batch.clone(), batch.clone()]);
+        // An empty bucket: a schema and no batches.
+        let (_, none) = with_schema(chunks(ipc(&[]))).await.unwrap();
+        assert_eq!(none.count().await, 0);
+        // Truncated after its schema: the stream fails, never just ends.
+        let mut cut = ipc(std::slice::from_ref(&batch));
+        cut.truncate(cut.len() - 8);
+        let (_, broken) = with_schema(chunks(cut)).await.unwrap();
+        let results: Vec<_> = broken.collect().await;
+        assert!(results.last().unwrap().is_err());
+        assert!(with_schema(chunks(Vec::new())).await.is_err());
     }
 
     #[test]

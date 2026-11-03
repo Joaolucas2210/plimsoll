@@ -9,17 +9,19 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use plimsoll_connectors::remote::{Bucket, Fragment, Reduce, fetch_bucket};
+use plimsoll_connectors::remote::{Bucket, Fragment, Reduce, open_bucket};
 use plimsoll_connectors::{Connector, ConnectorError, IcebergConnector};
 use plimsoll_control::catalog::CatalogError;
 use plimsoll_core::datafusion::arrow::ipc::writer::StreamWriter;
 use plimsoll_core::datafusion::arrow::json::ArrayWriter;
 use plimsoll_core::datafusion::arrow::record_batch::RecordBatch;
+use plimsoll_core::datafusion::catalog::streaming::StreamingTable;
 use plimsoll_core::datafusion::common::ScalarValue;
 use plimsoll_core::datafusion::error::DataFusionError;
 use plimsoll_core::datafusion::execution::{SendableRecordBatchStream, SpillFile, SpillWriter};
 use plimsoll_core::datafusion::object_store::Error as ObjectStoreError;
 use plimsoll_core::datafusion::parquet::errors::ParquetError;
+use plimsoll_core::datafusion::physical_plan::streaming::PartitionStream;
 use plimsoll_core::engine::{AccessDenied, Engine, QueryResult, QueryTag, TableRead};
 use plimsoll_core::plan_trace::{self, PlanEvent};
 
@@ -283,23 +285,18 @@ fn project(
 }
 
 /// Bucket `r.partition` of every one of `maps` (numbered from `offset`
-/// among the shuffle's maps, hashed by `keys`), fetched concurrently, as
-/// one schema and its batches (ADR 0064, 0065).
-async fn fetch_side(
+/// among the shuffle's maps, hashed by `keys`), opened concurrently, as a
+/// table with one partition per map that streams as the reduce reads it
+/// (ADR 0064, 0065, 0068).
+async fn open_side(
     r: &Reduce,
     maps: &[(String, Fragment)],
     offset: usize,
     keys: impl Fn(&Fragment) -> Result<Vec<usize>, EngineError>,
     token: &str,
     tag: &Option<Arc<QueryTag>>,
-) -> Result<
-    (
-        plimsoll_core::datafusion::arrow::datatypes::SchemaRef,
-        Vec<RecordBatch>,
-    ),
-    EngineError,
-> {
-    let fetches = maps
+) -> Result<Arc<StreamingTable>, EngineError> {
+    let opens = maps
         .iter()
         .enumerate()
         .map(|(i, (url, f))| {
@@ -312,16 +309,78 @@ async fn fetch_side(
                 keys: keys(&f)?,
             });
             let (url, tag) = (url.clone(), tag.clone());
-            Ok(async move { fetch_bucket(url, token, &f, tag).await })
+            Ok(async move { open_bucket(url, token, &f, tag).await })
         })
         .collect::<Result<Vec<_>, EngineError>>()?;
-    let fetched = futures::future::try_join_all(fetches)
+    let opened = futures::future::try_join_all(opens)
         .await
         .map_err(|e| classify(&e))?;
-    let Some(schema) = fetched.first().map(|(s, _)| s.clone()) else {
+    let Some(schema) = opened.first().map(|(s, _)| s.clone()) else {
         return Err(EngineError::InvalidQuery("a reduce side needs maps".into()));
     };
-    Ok((schema, fetched.into_iter().flat_map(|(_, b)| b).collect()))
+    // Every map's batches in the first map's schema (same version, same
+    // types; `decode` casts the rest).
+    let partitions = opened
+        .into_iter()
+        .map(|(_, batches)| {
+            let target = schema.clone();
+            let batches = batches
+                .map(move |b| b.and_then(|b| plimsoll_connectors::remote::conform(&b, &target)))
+                .boxed();
+            Arc::new(Bucketed {
+                schema: schema.clone(),
+                batches: std::sync::Mutex::new(Some(batches)),
+            }) as Arc<dyn PartitionStream>
+        })
+        .collect();
+    StreamingTable::try_new(schema, partitions)
+        .map(Arc::new)
+        .map_err(|e| classify(&e))
+}
+
+/// A fetched bucket as a partition of a [`StreamingTable`]: its batches
+/// can be read once.
+struct Bucketed {
+    schema: plimsoll_core::datafusion::arrow::datatypes::SchemaRef,
+    batches: std::sync::Mutex<
+        Option<
+            futures::stream::BoxStream<
+                'static,
+                plimsoll_core::datafusion::error::Result<RecordBatch>,
+            >,
+        >,
+    >,
+}
+
+impl std::fmt::Debug for Bucketed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Bucketed")
+    }
+}
+
+impl PartitionStream for Bucketed {
+    fn schema(&self) -> &plimsoll_core::datafusion::arrow::datatypes::SchemaRef {
+        &self.schema
+    }
+
+    fn execute(
+        &self,
+        _ctx: Arc<plimsoll_core::datafusion::execution::TaskContext>,
+    ) -> SendableRecordBatchStream {
+        use plimsoll_core::datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        let batches = self
+            .batches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_else(|| {
+                futures::stream::iter([Err(DataFusionError::Internal(
+                    "a shuffle bucket is read once".into(),
+                ))])
+                .boxed()
+            });
+        Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), batches))
+    }
 }
 
 /// Shuffle maps kept on this worker until every bucket is fetched, or
@@ -612,9 +671,7 @@ impl QueryEngine for CoreEngine {
         tag: Option<Arc<QueryTag>>,
     ) -> Result<SendableRecordBatchStream, EngineError> {
         use plimsoll_core::datafusion::common::{Column, JoinType};
-        use plimsoll_core::datafusion::datasource::MemTable;
         use plimsoll_core::datafusion::functions_aggregate::expr_fn::{max, min, sum};
-        use plimsoll_core::datafusion::physical_plan::stream::RecordBatchStreamAdapter;
         use plimsoll_core::datafusion::prelude::{Expr, SessionContext};
         let fail = |e: DataFusionError| classify(&e);
         // Join keys by position in each map's columns; group keys lead an
@@ -635,11 +692,11 @@ impl QueryEngine for CoreEngine {
         let groups =
             |f: &Fragment| Ok((0..f.aggregate.as_ref().map_or(0, |a| a.group_by.len())).collect());
         let (left, right) = match &r.join {
-            None => (fetch_side(&r, &r.maps, 0, groups, token, &tag).await?, None),
+            None => (open_side(&r, &r.maps, 0, groups, token, &tag).await?, None),
             Some(j) => {
                 let (l, r) = futures::future::try_join(
-                    fetch_side(&r, &r.maps, 0, positions(&j.left_keys), token, &tag),
-                    fetch_side(
+                    open_side(&r, &r.maps, 0, positions(&j.left_keys), token, &tag),
+                    open_side(
                         &r,
                         &j.right,
                         r.maps.len(),
@@ -652,24 +709,10 @@ impl QueryEngine for CoreEngine {
                 (l, Some(r))
             }
         };
-        // Held until the reduced stream ends.
-        let bytes = [Some(&left), right.as_ref()]
-            .into_iter()
-            .flatten()
-            .flat_map(|(_, b)| b)
-            .map(RecordBatch::get_array_memory_size)
-            .sum();
-        let memory = self
-            .0
-            .pool()
-            .reserve("shuffle-reduce", ConsumerKind::Output, bytes)
-            .map_err(|e| EngineError::MemoryLimitExceeded(e.to_string()))?;
+        // The merge or join reads the buckets as they arrive; its own
+        // operators account (and, for aggregation, spill) their state.
         let ctx = SessionContext::new_with_state(self.0.context().state());
-        let read = |(schema, batches)| {
-            MemTable::try_new(schema, vec![batches])
-                .and_then(|t| ctx.read_table(Arc::new(t)))
-                .map_err(fail)
-        };
+        let read = |t: Arc<StreamingTable>| ctx.read_table(t).map_err(fail);
         let left = read(left)?;
         let df = match (&r.join, right) {
             (Some(j), Some(right)) => {
@@ -723,15 +766,7 @@ impl QueryEngine for CoreEngine {
                 left.aggregate(groups, merges).map_err(fail)?
             }
         };
-        let stream = df.execute_stream().await.map_err(fail)?;
-        let schema = stream.schema();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream.map(move |b| {
-                let _held = &memory;
-                b
-            }),
-        )))
+        df.execute_stream().await.map_err(fail)
     }
 
     async fn execute(

@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Streaming shuffle reducers: buckets are opened as streams and read by the merge or join as a streaming table, no buffering outside operators (ADR 0068)
 - [x] Shuffle buckets spill to disk: maps account every batch before keeping it and spill buckets the pool refuses to the spill directory (ADR 0067)
 - [x] Broadcast joins on workers: small build sides (now sized by manifest row counts) are collected once and sent with each probe fragment; inner/right/right semi/anti only; shuffles never replace ordered nodes (ADR 0066)
 - [x] Join shuffle between workers: partitioned equi-joins of two remote scans hash both sides into buckets and join on workers (ADR 0065)
@@ -100,9 +101,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Streaming reducers**: shuffle reducers (ADR 0064/0065) buffer the
-buckets they fetch; feed them to the merge or join as streams, spilling
-there too, and count shuffle files in spill metrics.
+**Shuffle spill visibility**: count shuffle spill files in
+`spilled_bytes` and the temp-directory limit (ADR 0067/0068), and expose
+per-query shuffle bytes in the `fragment` log and trace.
 
 ## Later
 
