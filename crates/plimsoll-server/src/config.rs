@@ -32,6 +32,9 @@ pub struct Config {
     pub auth: Auth,
     /// Trace export; `None` = traces are only propagated (ADR 0031).
     pub otlp: Option<OtlpConfig>,
+    /// How often metrics are pushed to the OTLP endpoint (ADR 0100); `None`
+    /// with no endpoint or `OTEL_METRICS_EXPORTER=none`.
+    pub otlp_metrics_interval: Option<Duration>,
     /// How often catalog listings are refreshed; zero = boot only (ADR 0033).
     pub catalog_refresh: Duration,
     /// Between scheduled maintenance passes (ADR 0086); zero: none.
@@ -206,6 +209,7 @@ impl Config {
             groups,
         };
         let auth = Auth::from_lookup(&lookup, &|g| admission.has_group(g))?;
+        let otlp = otlp(&lookup)?;
         Ok(Self {
             bind,
             memory_limit_bytes,
@@ -213,7 +217,17 @@ impl Config {
             query_timeout: Duration::from_millis(timeout_ms),
             drain_delay: Duration::from_millis(drain_ms),
             auth,
-            otlp: otlp(&lookup)?,
+            otlp_metrics_interval: match (&otlp, lookup("OTEL_METRICS_EXPORTER").as_deref()) {
+                (None, _) => None,
+                (Some(_), Some(e)) if e.trim() == "none" => None,
+                // The OpenTelemetry SDKs' variable and default (60 s).
+                (Some(_), _) => Some(Duration::from_millis(positive(
+                    &lookup,
+                    "OTEL_METRIC_EXPORT_INTERVAL",
+                    60_000,
+                )?)),
+            },
+            otlp,
             catalog_refresh: Duration::from_millis(refresh_ms),
             maintenance_interval: Duration::from_millis(maintenance_ms),
             group_memory,
@@ -476,6 +490,21 @@ mod tests {
         .unwrap_err();
         assert_eq!(e.var, "OTEL_EXPORTER_OTLP_HEADERS");
         assert!(!e.to_string().contains("s3cr3t"), "{e}");
+    }
+
+    #[test]
+    fn metrics_are_pushed_every_minute_unless_disabled() {
+        let endpoint = ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318");
+        assert_eq!(cfg(&[]).unwrap().otlp_metrics_interval, None);
+        let c = cfg(&[endpoint]).unwrap();
+        assert_eq!(c.otlp_metrics_interval, Some(Duration::from_secs(60)));
+        let c = cfg(&[endpoint, ("OTEL_METRIC_EXPORT_INTERVAL", "5000")]).unwrap();
+        assert_eq!(c.otlp_metrics_interval, Some(Duration::from_secs(5)));
+        let c = cfg(&[endpoint, ("OTEL_METRICS_EXPORTER", "none")]).unwrap();
+        assert_eq!(c.otlp_metrics_interval, None);
+        assert!(c.otlp.is_some());
+        let e = cfg(&[endpoint, ("OTEL_METRIC_EXPORT_INTERVAL", "0")]).unwrap_err();
+        assert_eq!(e.var, "OTEL_METRIC_EXPORT_INTERVAL");
     }
 
     #[test]

@@ -125,7 +125,9 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_DRAIN_DELAY_MS` | `5000` | After SIGTERM: `/readyz` is 503 but queries are still served for this long, then the listener closes (ctrl-c skips it) (ADR 0026) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP/HTTP collector base URL (e.g. `http://collector:4318`); spans go to `/v1/traces` as JSON. Unset = trace context is still propagated, nothing exported (ADR 0031) |
 | `OTEL_EXPORTER_OTLP_HEADERS` | unset | `x-api-key=...,x-tenant=...` sent with every export (secret, env only, never logged) |
-| `OTEL_SERVICE_NAME` | `plimsoll` | `service.name` of exported spans |
+| `OTEL_SERVICE_NAME` | `plimsoll` | `service.name` of exported spans and metrics |
+| `OTEL_METRIC_EXPORT_INTERVAL` | `60000` | With an OTLP endpoint: every this many ms, the `/metrics` series are pushed to `/v1/metrics` as JSON (gauges, cumulative sums, histograms), and once more on shutdown (ADR 0100) |
+| `OTEL_METRICS_EXPORTER` | `otlp` | `none` keeps trace export and turns metric export off |
 | `PLIMSOLL_RESULT_CACHE_BYTES` | `0` (off) | Result cache for repeated queries over Iceberg snapshots, reserved in the memory pool, at most half the ceiling; keyed by SQL + every table's snapshot id, so a new commit is a miss (ADR 0038) |
 | `PLIMSOLL_SLOW_QUERY_MS` | unset (off) | Queries at least this long also log a `slow_query` warn line: timings, `reads`, and each planning event (catalog loads; Iceberg files/manifests/deletes/cache hits). Never SQL text (ADR 0057) |
 | `PLIMSOLL_WORKER_TOKEN` | unset | Shared secret (≥ 16 chars, env only) between coordinator and workers; on a worker it enables `POST /v1/fragment` (ADR 0058) |
@@ -232,7 +234,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 ## Decision records
 
 Index with status, date and the one-line decision of every ADR:
-[docs/adr/README.md](docs/adr/README.md) (0001–0099; template in
+[docs/adr/README.md](docs/adr/README.md) (0001–0100; template in
 [docs/adr/0000-template.md](docs/adr/0000-template.md)).
 
 Roadmap: [ROADMAP.md](ROADMAP.md).

@@ -198,6 +198,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map(plimsoll_server::auth::token_digest),
     });
 
+    // ADR 0100: the `/metrics` series, pushed to the OTLP endpoint.
+    let metrics_stop = Arc::new(tokio::sync::Notify::new());
+    let metrics_export = match (cfg.otlp.clone(), cfg.otlp_metrics_interval) {
+        (Some(otlp), Some(every)) => {
+            let st = state.clone();
+            Some(plimsoll_server::metrics::spawn_export(
+                otlp,
+                every,
+                move || st.exposition(),
+                metrics_stop.clone(),
+            )?)
+        }
+        _ => None,
+    };
+
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     // Loaded before listening: a bad certificate fails the boot (ADR 0099).
     let tls = cfg
@@ -258,6 +273,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .is_err()
         {
             log::emit(Level::Warn, "trace_flush_timeout", json!({}));
+        }
+    }
+    // The last metrics, under the same deadline.
+    if let Some(export) = metrics_export {
+        metrics_stop.notify_one();
+        if tokio::time::timeout(std::time::Duration::from_secs(5), export)
+            .await
+            .is_err()
+        {
+            log::emit(Level::Warn, "metrics_flush_timeout", json!({}));
         }
     }
     log::emit(Level::Info, "stopped", json!({}));

@@ -117,16 +117,26 @@ async fn healthz(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
 }
 
 async fn metrics_handler(State(st): State<Arc<AppState>>) -> Response {
-    let (running, queued) = st.admission.load();
-    let body = metrics::render(
-        (st.pool_stats)(),
-        running,
-        queued,
-        st.admission.registry().totals(),
-        &st.errors.snapshot(),
-        &st.latency,
-    );
-    ([(header::CONTENT_TYPE, metrics::CONTENT_TYPE)], body).into_response()
+    (
+        [(header::CONTENT_TYPE, metrics::CONTENT_TYPE)],
+        st.exposition(),
+    )
+        .into_response()
+}
+
+impl AppState {
+    /// The `/metrics` text, also what OTLP metric export pushes (ADR 0100).
+    pub fn exposition(&self) -> String {
+        let (running, queued) = self.admission.load();
+        metrics::render(
+            (self.pool_stats)(),
+            running,
+            queued,
+            self.admission.registry().totals(),
+            &self.errors.snapshot(),
+            &self.latency,
+        )
+    }
 }
 
 /// SIGTERM handling (ADR 0026): stop advertising readiness, keep serving for

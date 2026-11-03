@@ -3,16 +3,26 @@
 //! ponytail: no metrics crate. Every value is read at scrape time from its
 //! owner (admission, registry, pool), so there is no duplicated state to keep
 //! in sync. Latency histograms are fixed-bucket atomics (ADR 0019). Upgrade
-//! path: `prometheus-client` or OTLP export (see ROADMAP).
+//! path: `prometheus-client`.
+//!
+//! The same exposition is pushed over OTLP/HTTP JSON (ADR 0100): parsed back
+//! into gauges, cumulative sums and histograms, so both outputs always carry
+//! the same series.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use plimsoll_control::governance::QueryTotals;
 use plimsoll_core::result_cache::CacheStats;
+use serde_json::{Value, json};
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
+
+use crate::log::{self, Level};
+use crate::trace::{self, OtlpConfig};
 
 /// Memory pool figures from the compute plane's CeilingPool.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -226,7 +236,228 @@ pub fn render(
     out
 }
 
+/// Pushes `scrape()` (the `/metrics` text) to `<endpoint>/v1/metrics` every
+/// `every`, and once more when `stop` is notified, then returns.
+pub fn spawn_export(
+    cfg: OtlpConfig,
+    every: Duration,
+    scrape: impl Fn() -> String + Send + 'static,
+    stop: Arc<Notify>,
+) -> Result<JoinHandle<()>, reqwest::Error> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let url = format!("{}/v1/metrics", cfg.endpoint.trim_end_matches('/'));
+    // Counters and histograms count from process start.
+    let start = trace::nanos(SystemTime::now());
+    Ok(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The first tick is immediate: nothing has happened yet.
+        tick.tick().await;
+        loop {
+            let last = tokio::select! {
+                _ = tick.tick() => false,
+                () = stop.notified() => true,
+            };
+            let metrics = to_otlp(&scrape(), &start, &trace::nanos(SystemTime::now()));
+            let body = json!({"resourceMetrics": [{
+                "resource": {"attributes": [trace::attr("service.name", json!(cfg.service_name))]},
+                "scopeMetrics": [{"scope": {"name": "plimsoll-server"}, "metrics": metrics}],
+            }]});
+            if let Some(error) = trace::post(&client, &cfg, &url, &body).await {
+                log::emit(
+                    Level::Warn,
+                    "metrics_export_failed",
+                    json!({ "error": error }),
+                );
+            }
+            if last {
+                break;
+            }
+        }
+    }))
+}
+
+/// A sample's or series' labels.
+type Labels = Vec<(String, String)>;
+
+/// A histogram's label set: `(le, cumulative count)`, sum and count.
+#[derive(Default)]
+struct Series {
+    labels: Labels,
+    buckets: Vec<(String, u64)>,
+    sum: f64,
+    count: u64,
+}
+
+/// One metric of the exposition text, as it is parsed.
+struct Parsed<'a> {
+    name: &'a str,
+    kind: &'a str,
+    help: &'a str,
+    points: Vec<Value>,
+    series: Vec<Series>,
+}
+
+/// The exposition text written by [`render`] as OTLP JSON metrics: gauges,
+/// monotonic cumulative sums for counters, and explicit-bucket histograms.
+fn to_otlp(text: &str, start: &str, now: &str) -> Vec<Value> {
+    let mut help = "";
+    let mut out: Vec<Parsed> = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("# HELP ") {
+            help = rest.split_once(' ').map_or("", |(_, h)| h);
+        } else if let Some(rest) = line.strip_prefix("# TYPE ") {
+            if let Some((name, kind)) = rest.split_once(' ') {
+                out.push(Parsed {
+                    name,
+                    kind,
+                    help,
+                    points: Vec::new(),
+                    series: Vec::new(),
+                });
+            }
+        } else if let (Some(m), Some((name, labels, value))) = (out.last_mut(), sample(line)) {
+            if m.kind != "histogram" {
+                let mut p = json!({ "attributes": attributes(&labels), "timeUnixNano": now });
+                if m.kind == "counter" {
+                    p["startTimeUnixNano"] = json!(start);
+                }
+                match value.parse::<u64>() {
+                    // OTLP JSON encodes 64-bit ints as strings.
+                    Ok(n) => p["asInt"] = json!(n.to_string()),
+                    Err(_) => p["asDouble"] = json!(value.parse::<f64>().unwrap_or(f64::NAN)),
+                }
+                m.points.push(p);
+                continue;
+            }
+            let (mut labels, le): (Vec<_>, Vec<_>) =
+                labels.into_iter().partition(|(k, _)| k != "le");
+            labels.sort();
+            let i = match m.series.iter().position(|s| s.labels == labels) {
+                Some(i) => i,
+                None => {
+                    m.series.push(Series {
+                        labels,
+                        ..Default::default()
+                    });
+                    m.series.len() - 1
+                }
+            };
+            let s = &mut m.series[i];
+            match name.strip_prefix(m.name) {
+                Some("_bucket") => {
+                    if let Some((_, le)) = le.into_iter().next() {
+                        s.buckets.push((le, value.parse().unwrap_or(0)));
+                    }
+                }
+                Some("_sum") => s.sum = value.parse().unwrap_or(0.0),
+                Some("_count") => s.count = value.parse().unwrap_or(0),
+                _ => {}
+            }
+        }
+    }
+    out.into_iter()
+        // No groups or no errors yet: nothing to send.
+        .filter(|m| !(m.points.is_empty() && m.series.is_empty()))
+        .map(|m| {
+            let mut metric = json!({ "name": m.name, "description": m.help });
+            match m.kind {
+                "counter" => {
+                    // 2: AGGREGATION_TEMPORALITY_CUMULATIVE.
+                    metric["sum"] = json!({
+                        "aggregationTemporality": 2,
+                        "isMonotonic": true,
+                        "dataPoints": m.points,
+                    });
+                }
+                "histogram" => {
+                    let points: Vec<Value> = m
+                        .series
+                        .iter()
+                        .map(|s| {
+                            let bounds: Vec<f64> = s
+                                .buckets
+                                .iter()
+                                .filter_map(|(le, _)| le.parse().ok())
+                                .filter(|b: &f64| b.is_finite())
+                                .collect();
+                            // Prometheus buckets are cumulative, OTLP's are not.
+                            let mut previous = 0;
+                            let counts: Vec<String> = s
+                                .buckets
+                                .iter()
+                                .map(|(_, c)| {
+                                    let n = c.saturating_sub(previous);
+                                    previous = *c;
+                                    n.to_string()
+                                })
+                                .collect();
+                            json!({
+                                "attributes": attributes(&s.labels),
+                                "startTimeUnixNano": start,
+                                "timeUnixNano": now,
+                                "count": s.count.to_string(),
+                                "sum": s.sum,
+                                "bucketCounts": counts,
+                                "explicitBounds": bounds,
+                            })
+                        })
+                        .collect();
+                    metric["histogram"] =
+                        json!({ "aggregationTemporality": 2, "dataPoints": points });
+                }
+                _ => metric["gauge"] = json!({ "dataPoints": m.points }),
+            }
+            metric
+        })
+        .collect()
+}
+
+fn attributes(labels: &[(String, String)]) -> Vec<Value> {
+    labels
+        .iter()
+        .map(|(k, v)| trace::attr(k, json!(v)))
+        .collect()
+}
+
+/// `name{k="v",…} value` as its name, labels and value.
+fn sample(line: &str) -> Option<(&str, Labels, &str)> {
+    if line.starts_with('#') || line.trim().is_empty() {
+        return None;
+    }
+    let (head, value) = line.rsplit_once(' ')?;
+    let Some((name, rest)) = head.split_once('{') else {
+        return Some((head, Vec::new(), value));
+    };
+    let mut labels = Vec::new();
+    let mut chars = rest.strip_suffix('}')?.chars();
+    loop {
+        let key: String = chars.by_ref().take_while(|c| *c != '=').collect();
+        if key.is_empty() {
+            break;
+        }
+        if chars.next() != Some('"') {
+            return None;
+        }
+        let mut value = String::new();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => value.extend(chars.next()),
+                '"' => break,
+                c => value.push(c),
+            }
+        }
+        labels.push((key, value));
+        // The `,` between labels.
+        chars.next();
+    }
+    Some((name, labels, value))
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -285,5 +516,86 @@ mod tests {
         ] {
             assert!(text.lines().any(|l| l == line), "missing {line}\n{text}");
         }
+    }
+
+    #[test]
+    fn exposition_becomes_otlp_metrics() {
+        let latency = Latency::default();
+        latency.total.observe(Duration::from_millis(3));
+        latency.total.observe(Duration::from_millis(30));
+        let pool = PoolStats {
+            used_bytes: 10,
+            groups: vec![("batch".into(), 40, 7)],
+            ..Default::default()
+        };
+        let totals = QueryTotals {
+            finished: 4,
+            failed: 1,
+            cancelled: 0,
+        };
+        let text = render(pool, 2, 1, totals, &BTreeMap::new(), &latency);
+        let metrics = to_otlp(&text, "1", "2");
+        let get = |name: &str| {
+            metrics
+                .iter()
+                .find(|m| m["name"] == name)
+                .unwrap_or_else(|| panic!("no {name}"))
+                .clone()
+        };
+        assert!(
+            metrics
+                .iter()
+                .all(|m| m["name"] != "plimsoll_query_errors_total")
+        );
+        let used = get("plimsoll_pool_used_bytes");
+        assert_eq!(used["gauge"]["dataPoints"][0]["asInt"], "10");
+        assert_eq!(used["description"], "Bytes reserved in the memory pool.");
+        let group = get("plimsoll_pool_group_used_bytes");
+        let point = &group["gauge"]["dataPoints"][0];
+        assert_eq!(point["attributes"][0]["key"], "group");
+        assert_eq!(point["attributes"][0]["value"]["stringValue"], "batch");
+        assert_eq!(point["asInt"], "7");
+        let total = get("plimsoll_queries_total");
+        assert_eq!(total["sum"]["isMonotonic"], true);
+        assert_eq!(total["sum"]["dataPoints"][0]["startTimeUnixNano"], "1");
+        assert_eq!(total["sum"]["dataPoints"][1]["asInt"], "1");
+        let h = get("plimsoll_query_duration_seconds");
+        let points = h["histogram"]["dataPoints"].as_array().unwrap();
+        assert_eq!(points.len(), 5);
+        let p = points
+            .iter()
+            .find(|p| p["attributes"][0]["value"]["stringValue"] == "total")
+            .unwrap();
+        assert_eq!(p["count"], "2");
+        assert_eq!(p["explicitBounds"].as_array().unwrap().len(), BUCKETS.len());
+        // 3 ms in le=0.005, 30 ms in le=0.05: per bucket, not cumulative.
+        let counts: Vec<&str> = p["bucketCounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            counts,
+            [
+                "0", "1", "0", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"
+            ]
+        );
+        assert!((p["sum"].as_f64().unwrap() - 0.033).abs() < 1e-9);
+    }
+
+    #[test]
+    fn labels_with_escapes_are_parsed() {
+        let (name, labels, value) = sample(r#"m{a="x\"y",b="z"} 3"#).unwrap();
+        assert_eq!(name, "m");
+        assert_eq!(
+            labels,
+            vec![
+                ("a".to_owned(), "x\"y".to_owned()),
+                ("b".to_owned(), "z".to_owned())
+            ]
+        );
+        assert_eq!(value, "3");
+        assert!(sample("# HELP m x").is_none());
     }
 }

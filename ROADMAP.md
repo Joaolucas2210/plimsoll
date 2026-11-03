@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] OTLP metrics: the `/metrics` series pushed to `<endpoint>/v1/metrics` as JSON every `OTEL_METRIC_EXPORT_INTERVAL`, flushed on shutdown (ADR 0100)
 - [x] In-process TLS (rotating certificates, private CA for workers) and a broadcast build-side limit with a local-join fallback; column-less broadcast results fixed (ADR 0099)
 - [x] Joins with filters on workers: the residual filter shipped as SQL over `f0…` columns mapped to each side, checked by equivalence after simplification; shuffled, broadcast and gathered joins (ADR 0098)
 - [x] Left, full, semi and anti broadcast joins on workers: workers join with numbered build rows and report the matches; the coordinator adds the build-only rows (`EXISTS`, `NOT EXISTS`, `IN`, left and full joins; `NOT IN` stays local) (ADR 0097)
@@ -169,5 +170,5 @@ aggregation keys, so shuffled and broadcast joins take them too.
 - Spilling hash-join build sides (DataFusion upstream, ADR 0068).
 
 **Security and operations**
-- OTLP metrics; shuffle-map operator spans; per-kind fragment
+- Shuffle-map operator spans; per-kind fragment
   counters; per-query spill attribution (ADR 0069/0071).

@@ -190,18 +190,7 @@ async fn export(
             "resource": {"attributes": [attr("service.name", json!(cfg.service_name))]},
             "scopeSpans": [{"scope": {"name": "plimsoll-server"}, "spans": spans}],
         }]});
-        let mut req = client
-            .post(&url)
-            .header("content-type", "application/json")
-            .body(body.to_string());
-        for (k, v) in &cfg.headers {
-            req = req.header(k, v);
-        }
-        let failure = match req.send().await {
-            Ok(r) if r.status().is_success() => None,
-            Ok(r) => Some(format!("HTTP {}", r.status())),
-            Err(e) => Some(e.to_string()),
-        };
+        let failure = post(&client, &cfg, &url, &body).await;
         let lost = dropped.swap(0, Ordering::Relaxed);
         if failure.is_some() || lost > 0 {
             log::emit(
@@ -213,13 +202,34 @@ async fn export(
     }
 }
 
+/// POSTs an OTLP JSON body with the configured headers; the failure, if any.
+pub(crate) async fn post(
+    client: &reqwest::Client,
+    cfg: &OtlpConfig,
+    url: &str,
+    body: &Value,
+) -> Option<String> {
+    let mut req = client
+        .post(url)
+        .header("content-type", "application/json")
+        .body(body.to_string());
+    for (k, v) in &cfg.headers {
+        req = req.header(k, v);
+    }
+    match req.send().await {
+        Ok(r) if r.status().is_success() => None,
+        Ok(r) => Some(format!("HTTP {}", r.status())),
+        Err(e) => Some(e.to_string()),
+    }
+}
+
 fn body_len(body: &Value) -> usize {
     body["resourceSpans"][0]["scopeSpans"][0]["spans"]
         .as_array()
         .map_or(0, Vec::len)
 }
 
-fn attr(key: &str, value: Value) -> Value {
+pub(crate) fn attr(key: &str, value: Value) -> Value {
     let value = match value {
         Value::String(s) => json!({ "stringValue": s }),
         // OTLP JSON encodes 64-bit ints as strings.
@@ -230,7 +240,7 @@ fn attr(key: &str, value: Value) -> Value {
     json!({ "key": key, "value": value })
 }
 
-fn nanos(t: SystemTime) -> String {
+pub(crate) fn nanos(t: SystemTime) -> String {
     t.duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos())
         .to_string()
