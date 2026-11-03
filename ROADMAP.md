@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Snapshot expiration: `POST /v1/maintenance/expire-snapshots` drops old snapshots (branch and tag heads and the last N kept) through the catalog, then deletes files only they reached (ADR 0079)
 - [x] Compaction: `POST /v1/maintenance/compact` rewrites small files and files carrying deletes into a `replace` snapshot; manifests rewritten with explicit sequence numbers; read by Spark and pyiceberg, time travel intact (ADR 0078)
 - [x] `DELETE FROM … WHERE` as position delete files, skipping rows already deleted; subquery predicates refused (DataFusion would drop them); read by Spark and pyiceberg (ADR 0077)
 - [x] Partitioned appends (identity, bucket, truncate, year/month/day/hour) and per-file column statistics, pruned by Plimsoll, Spark and pyiceberg (ADR 0076)
@@ -111,11 +112,10 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Table maintenance: expire snapshots and remove orphan files** — drop
-snapshots older than a retention (keeping the last N and every branch and
-tag head), then delete the data, delete and metadata files no remaining
-snapshot references, and files no commit ever made reachable (failed
-writes, ADR 0075 debt), so storage stops growing with history.
+**Table maintenance: remove orphan files** — list the table location and
+delete files older than a safety window that no snapshot, manifest or
+metadata file references (failed writes, interrupted expirations; ADR
+0075/0079 debt).
 
 ## Missing
 

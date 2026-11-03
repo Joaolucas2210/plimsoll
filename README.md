@@ -194,6 +194,12 @@ Needs read and write grants on the table, holds an admission slot, and
 answers `{"partitions", "files_rewritten", "files_written", "rows"}`
 (ADR 0078).
 
+`POST /v1/maintenance/expire-snapshots` with `{"table": "bronze.events",
+"older_than_ms": 1730000000000, "retain_last": 1}` (defaults: 5 days ago,
+1) drops snapshots committed before the cutoff, keeping every branch and
+tag head and the last `retain_last` of each branch, then deletes the
+files only they reached (ADR 0079).
+
 ### Probes
 
 - `/livez` — process alive (never checks dependencies).
@@ -225,8 +231,8 @@ Roadmap: [ROADMAP.md](ROADMAP.md).
   formats. Open formats (Parquet, Iceberg) and open catalogs only.
 - No in-process TLS yet; deploy the query API behind a TLS-terminating
   proxy. Authentication is bearer tokens (ADR 0021).
-- Writes are `INSERT INTO`, `DELETE FROM` and compaction (ADR
-  0075–0078): no `UPDATE`, `MERGE`, DDL, snapshot expiry or orphan file
+- Writes are `INSERT INTO`, `DELETE FROM`, compaction and snapshot
+  expiration (ADR 0075–0079): no `UPDATE`, `MERGE`, DDL or orphan file
   removal yet. See
   [ROADMAP.md](ROADMAP.md).
 

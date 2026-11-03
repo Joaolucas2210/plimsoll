@@ -55,6 +55,7 @@ mod field_ids;
 mod files;
 pub mod meta;
 
+pub mod expire;
 mod prune;
 pub mod write;
 use deletes::{DeleteFile, EqualityDelete};
@@ -216,6 +217,24 @@ impl IcebergConnector {
     /// accumulated deletes and small appends.
     pub async fn compact(&self, state: &dyn Session) -> Result<Compaction, ConnectorError> {
         Ok(self.table.compact(state).await?)
+    }
+
+    /// Expires old snapshots through the catalog and deletes the files
+    /// only they reached (ADR 0079).
+    pub async fn expire_snapshots(
+        &self,
+        state: &dyn Session,
+        opts: expire::ExpireOptions,
+    ) -> Result<expire::Expiration, ConnectorError> {
+        let sink = self.table.writable("expire snapshots of")?;
+        self.table.register_scoped(state);
+        Ok(expire::expire(
+            sink.committer.as_ref(),
+            opts,
+            state.runtime_env(),
+            self.table.scoped.as_ref(),
+        )
+        .await?)
     }
 
     /// Accept `INSERT INTO`, committing through `committer` (ADR 0075).

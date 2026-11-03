@@ -168,6 +168,17 @@ pub trait QueryEngine: Send + Sync {
         Err(EngineError::Unsupported("compaction".into()))
     }
 
+    /// Expires `table`'s old snapshots on behalf of `viewer`, who needs a
+    /// write grant on it (ADR 0079). Default: not supported.
+    async fn expire_snapshots(
+        &self,
+        _table: &str,
+        _viewer: Viewer,
+        _opts: plimsoll_connectors::iceberg::expire::ExpireOptions,
+    ) -> Result<plimsoll_connectors::iceberg::expire::Expiration, EngineError> {
+        Err(EngineError::Unsupported("snapshot expiration".into()))
+    }
+
     /// Drops this worker's maps of `shuffle` and of its retries (ADR
     /// 0073); an empty stream. Default: not a worker.
     async fn release(&self, _shuffle: &str) -> Result<Running, EngineError> {
@@ -250,6 +261,26 @@ fn each_row(
 }
 
 pub struct CoreEngine(pub Arc<Engine>);
+
+/// Table maintenance reads and rewrites or deletes a table's data: the
+/// caller needs both its read and its write grant (ADR 0078, 0079).
+fn maintainer(
+    ctx: &plimsoll_core::datafusion::prelude::SessionContext,
+    table: &str,
+    viewer: &Viewer,
+) -> Result<(), EngineError> {
+    use plimsoll_core::datafusion::common::TableReference;
+    use plimsoll_core::engine::TableAccess;
+    let options = ctx.state().config_options().clone();
+    let resolved = TableReference::from(table).resolve(
+        &options.catalog.default_catalog,
+        &options.catalog.default_schema,
+    );
+    viewer
+        .check(&resolved)
+        .and_then(|()| viewer.check_write(&resolved))
+        .map_err(|e| classify(&e))
+}
 
 /// A worker task's output, and the plan producing it when there is one,
 /// for its operator spans (ADR 0071).
@@ -831,20 +862,24 @@ impl QueryEngine for CoreEngine {
         table: &str,
         viewer: Viewer,
     ) -> Result<plimsoll_connectors::Compaction, EngineError> {
-        use plimsoll_core::datafusion::common::TableReference;
-        use plimsoll_core::engine::TableAccess;
         let ctx = self.0.context();
-        let options = ctx.state().config_options().clone();
-        let resolved = TableReference::from(table).resolve(
-            &options.catalog.default_catalog,
-            &options.catalog.default_schema,
-        );
         // Rewriting reads and writes every row of the table: both grants.
-        viewer
-            .check(&resolved)
-            .and_then(|()| viewer.check_write(&resolved))
-            .map_err(|e| classify(&e))?;
+        maintainer(ctx, table, &viewer)?;
         crate::lakehouse::compact(ctx, table)
+            .await
+            .map_err(|e| classify(&e))
+    }
+
+    async fn expire_snapshots(
+        &self,
+        table: &str,
+        viewer: Viewer,
+        opts: plimsoll_connectors::iceberg::expire::ExpireOptions,
+    ) -> Result<plimsoll_connectors::iceberg::expire::Expiration, EngineError> {
+        let ctx = self.0.context();
+        // Expiring deletes history, data included: both grants.
+        maintainer(ctx, table, &viewer)?;
+        crate::lakehouse::expire_snapshots(ctx, table, opts)
             .await
             .map_err(|e| classify(&e))
     }

@@ -84,6 +84,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/queries/{id}", delete(cancel_query))
         .route("/v1/fragment", post(fragment))
         .route("/v1/maintenance/compact", post(compact))
+        .route("/v1/maintenance/expire-snapshots", post(expire_snapshots))
         .with_state(state)
 }
 
@@ -622,11 +623,36 @@ impl Drop for FragmentReport {
 }
 
 #[derive(Debug, Deserialize)]
-struct CompactRequest {
+struct MaintenanceRequest {
     /// `schema.table`.
     table: String,
     /// Only when authentication is disabled, as for `/v1/sql`.
     user: Option<String>,
+    /// Expiration: snapshots committed before this instant (ms since the
+    /// epoch) may go; default 5 days ago.
+    older_than_ms: Option<i64>,
+    /// Expiration: the most recent ancestors of every branch kept
+    /// regardless of age; default 1.
+    retain_last: Option<usize>,
+}
+
+/// Table maintenance an endpoint runs.
+#[derive(Debug, Clone, Copy)]
+enum Maintenance {
+    Compact,
+    ExpireSnapshots,
+}
+
+/// `POST /v1/maintenance/expire-snapshots` (ADR 0079): drops snapshots
+/// older than `older_than_ms` (keeping every branch and tag head and the
+/// last `retain_last` of each branch) and deletes the files only they
+/// reached. As [`compact`] otherwise.
+async fn expire_snapshots(
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Json<MaintenanceRequest>, JsonRejection>,
+) -> Response {
+    maintain(state, headers, body, Maintenance::ExpireSnapshots).await
 }
 
 /// `POST /v1/maintenance/compact` (ADR 0078): rewrites a catalog-served
@@ -635,9 +661,18 @@ struct CompactRequest {
 /// admission slot in the caller's default group and the query timeout.
 /// Logs one `compaction` line.
 async fn compact(
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Json<MaintenanceRequest>, JsonRejection>,
+) -> Response {
+    maintain(state, headers, body, Maintenance::Compact).await
+}
+
+async fn maintain(
     State(shared): State<Arc<AppState>>,
     headers: HeaderMap,
-    body: Result<Json<CompactRequest>, JsonRejection>,
+    body: Result<Json<MaintenanceRequest>, JsonRejection>,
+    action: Maintenance,
 ) -> Response {
     let st = shared.as_ref();
     let authorization = headers
@@ -690,31 +725,72 @@ async fn compact(
         }
     };
     let viewer = st.auth.viewer(&user);
-    let outcome =
-        match tokio::time::timeout_at(deadline, st.engine.compact(&req.table, viewer)).await {
-            Ok(Ok(report)) => Ok(report),
-            Ok(Err(e)) => Err(GovernedError::Failed(e)),
-            Err(_) => Err(GovernedError::TimedOut(st.query_timeout)),
-        };
+    let (event, outcome) = match action {
+        Maintenance::Compact => (
+            "compaction",
+            tokio::time::timeout_at(deadline, st.engine.compact(&req.table, viewer))
+                .await
+                .map(|r| {
+                    r.map(|r| {
+                        json!({
+                            "partitions": r.partitions,
+                            "files_rewritten": r.files_rewritten,
+                            "files_written": r.files_written,
+                            "rows": r.rows,
+                        })
+                    })
+                }),
+        ),
+        Maintenance::ExpireSnapshots => {
+            use plimsoll_connectors::iceberg::expire::{
+                DEFAULT_MAX_AGE_MS, DEFAULT_RETAIN_LAST, ExpireOptions,
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as i64);
+            let opts = ExpireOptions {
+                older_than_ms: req.older_than_ms.unwrap_or(now - DEFAULT_MAX_AGE_MS),
+                retain_last: req.retain_last.unwrap_or(DEFAULT_RETAIN_LAST).max(1),
+            };
+            (
+                "snapshot_expiration",
+                tokio::time::timeout_at(
+                    deadline,
+                    st.engine.expire_snapshots(&req.table, viewer, opts),
+                )
+                .await
+                .map(|r| {
+                    r.map(|r| {
+                        json!({
+                            "snapshots_expired": r.snapshots_expired,
+                            "manifest_lists_deleted": r.manifest_lists_deleted,
+                            "manifests_deleted": r.manifests_deleted,
+                            "data_files_deleted": r.data_files_deleted,
+                            "delete_files_deleted": r.delete_files_deleted,
+                        })
+                    })
+                }),
+            )
+        }
+    };
+    let outcome = match outcome {
+        Ok(Ok(report)) => Ok(report),
+        Ok(Err(e)) => Err(GovernedError::Failed(e)),
+        Err(_) => Err(GovernedError::TimedOut(st.query_timeout)),
+    };
     let ms = (started.elapsed().as_micros() as f64) / 1e3;
     match outcome {
-        Ok(r) => {
-            let fields = json!({
-                "table": req.table,
-                "user": user,
-                "partitions": r.partitions,
-                "files_rewritten": r.files_rewritten,
-                "files_written": r.files_written,
-                "rows": r.rows,
-                "total_ms": ms,
-            });
-            crate::log::emit(Level::Info, "compaction", fields.clone());
+        Ok(mut fields) => {
+            fields["table"] = json!(req.table);
+            fields["user"] = json!(user);
+            fields["total_ms"] = json!(ms);
+            crate::log::emit(Level::Info, event, fields.clone());
             (StatusCode::OK, Json(fields)).into_response()
         }
         Err(e) => {
             crate::log::emit(
                 Level::Warn,
-                "compaction",
+                event,
                 json!({"table": req.table, "user": user, "error": e.to_string(), "total_ms": ms}),
             );
             ApiError::of(&e).respond(st, &e, None)

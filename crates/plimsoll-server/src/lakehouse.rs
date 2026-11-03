@@ -215,10 +215,9 @@ pub async fn register(
     Ok(r.namespaces)
 }
 
-/// Compacts `table` (`schema.name`, a catalog-served Iceberg table) in
-/// place (ADR 0078): rewrites its small files and files carrying deletes,
-/// and commits the replacement through the catalog.
-pub async fn compact(ctx: &SessionContext, table: &str) -> Result<plimsoll_connectors::Compaction> {
+/// The connector of `table` (`schema.name`), a catalog-served Iceberg
+/// table, loaded fresh, for maintenance.
+async fn maintained(ctx: &SessionContext, table: &str) -> Result<IcebergConnector> {
     let plan = |m: String| DataFusionError::Plan(m);
     let (schema, name) = table
         .rsplit_once('.')
@@ -231,16 +230,37 @@ pub async fn compact(ctx: &SessionContext, table: &str) -> Result<plimsoll_conne
         .ok_or_else(|| plan(format!("no schema {schema}")))?;
     let Some(catalog) = provider.as_ref().downcast_ref::<CatalogSchema>() else {
         return Err(plan(format!(
-            "{table}: only tables served by a REST catalog can be compacted"
+            "{table}: only tables served by a REST catalog can be maintained"
         )));
     };
     let Some(loaded) = catalog.load(name).await? else {
         return Err(plan(format!("no table {table}")));
     };
     let metadata = loaded.1.metadata.clone();
-    catalog
-        .connector(name, loaded, &metadata)?
-        .compact(&state)
+    catalog.connector(name, loaded, &metadata)
+}
+
+/// Compacts `table` in place (ADR 0078): rewrites its small files and
+/// files carrying deletes, and commits the replacement through the
+/// catalog.
+pub async fn compact(ctx: &SessionContext, table: &str) -> Result<plimsoll_connectors::Compaction> {
+    maintained(ctx, table)
+        .await?
+        .compact(&ctx.state())
+        .await
+        .map_err(DataFusionError::from)
+}
+
+/// Expires `table`'s old snapshots and deletes the files only they
+/// reached (ADR 0079).
+pub async fn expire_snapshots(
+    ctx: &SessionContext,
+    table: &str,
+    opts: iceberg::expire::ExpireOptions,
+) -> Result<iceberg::expire::Expiration> {
+    maintained(ctx, table)
+        .await?
+        .expire_snapshots(&ctx.state(), opts)
         .await
         .map_err(DataFusionError::from)
 }
@@ -589,6 +609,51 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(last["summary"]["operation"], "replace");
+        // Snapshot expiration (ADR 0079): a tag on the first snapshot keeps
+        // it (and its files) alive; everything else but the head goes, and
+        // the files only those snapshots reached are deleted.
+        let ident = TableIdent::new(Namespace::new(&["bronze"]), &parted);
+        let meta = catalog.load_table(&ident).await.unwrap().metadata;
+        let first = meta["snapshots"][0]["snapshot-id"].as_i64().unwrap();
+        catalog
+            .update_table(
+                &ident,
+                vec![],
+                vec![serde_json::json!({"action": "set-snapshot-ref", "ref-name": "keep", "type": "tag", "snapshot-id": first})],
+            )
+            .await
+            .unwrap();
+        let tagged = text(&format!(
+            "SELECT id FROM bronze.\"{parted}@keep\" ORDER BY id"
+        ))
+        .await;
+        let opts = iceberg::expire::ExpireOptions {
+            older_than_ms: i64::MAX,
+            retain_last: 1,
+        };
+        let report = expire_snapshots(engine.context(), &p, opts).await.unwrap();
+        let total = meta["snapshots"].as_array().unwrap().len();
+        assert_eq!(report.snapshots_expired, total - 2, "{report:?}");
+        assert!(
+            report.data_files_deleted > 0 && report.manifest_lists_deleted > 0,
+            "{report:?}"
+        );
+        let ids = text(&format!("SELECT id FROM {p} ORDER BY id")).await;
+        let ids: Vec<&str> = ids
+            .lines()
+            .skip(3)
+            .filter(|l| l.starts_with("| "))
+            .collect();
+        assert_eq!(ids, ["| 1  |", "| 3  |", "| 11 |"]);
+        // The tagged snapshot still reads, from files that were kept.
+        let still = text(&format!(
+            "SELECT id FROM bronze.\"{parted}@keep\" ORDER BY id"
+        ))
+        .await;
+        assert_eq!(still, tagged);
+        // Nothing left to expire.
+        let again = expire_snapshots(engine.context(), &p, opts).await.unwrap();
+        assert_eq!(again.snapshots_expired, 0);
         for t in [name, parted] {
             let _ = http
                 .delete(format!("{base}/{t}?purgeRequested=true"))
