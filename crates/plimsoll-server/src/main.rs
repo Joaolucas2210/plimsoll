@@ -129,6 +129,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "catalog_registered",
             json!({ "namespaces": schemas }),
         );
+        // Policy-driven maintenance (ADR 0086), queued like any query.
+        if !cfg.maintenance_interval.is_zero() {
+            tokio::spawn(plimsoll_server::schedule::every(
+                engine.context().clone(),
+                catalog.clone(),
+                admission.clone(),
+                cfg.maintenance_interval,
+            ));
+        }
         if !cfg.catalog_refresh.is_zero() {
             tokio::spawn(refresh_catalog(
                 engine.clone(),

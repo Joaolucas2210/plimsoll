@@ -142,6 +142,7 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_CATALOG_SCOPE` | `PRINCIPAL_ROLE:ALL` | OAuth2 scope |
 | `PLIMSOLL_CATALOG_VENDED_CREDENTIALS` | `false` | `true` asks the catalog for per-table storage credentials (Polaris credential vending) |
 | `PLIMSOLL_CATALOG_REFRESH_MS` | `60000` | How often `SHOW TABLES` / `information_schema` re-list the catalog (new tables and namespaces); `0` = boot only. Queries always resolve tables live (ADR 0033) |
+| `PLIMSOLL_MAINTENANCE_INTERVAL_MS` | `0` (off) | Between scheduled maintenance passes: tables with `plimsoll.maintenance.enabled = 'true'` are compacted, have snapshots expired (Iceberg's `history.expire.*` properties) and, with `plimsoll.maintenance.remove-orphans`, orphan files removed; queued under admission as `plimsoll-maintenance`; run it on one coordinator (ADR 0086) |
 
 ### SQL API
 
@@ -227,7 +228,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 ## Decision records
 
 Index with status, date and the one-line decision of every ADR:
-[docs/adr/README.md](docs/adr/README.md) (0001–0085; template in
+[docs/adr/README.md](docs/adr/README.md) (0001–0086; template in
 [docs/adr/0000-template.md](docs/adr/0000-template.md)).
 
 Roadmap: [ROADMAP.md](ROADMAP.md).

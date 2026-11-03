@@ -9,6 +9,7 @@ pub mod engine;
 pub mod lakehouse;
 pub mod log;
 pub mod metrics;
+pub mod schedule;
 pub mod system;
 pub mod tables;
 pub mod trace;

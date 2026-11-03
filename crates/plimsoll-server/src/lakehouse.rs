@@ -902,6 +902,37 @@ mod tests {
             .await,
             tagged
         );
+        // Scheduled maintenance (ADR 0086): the table opts in through its
+        // properties; one pass compacts two small appends and expires all
+        // but the head and the tag.
+        Box::pin(async {
+            text(&format!(
+                "ALTER TABLE {p} SET TBLPROPERTIES ('plimsoll.maintenance.enabled' = 'true', \
+                 'history.expire.max-snapshot-age-ms' = '0')"
+            ))
+            .await;
+            for _ in 0..2 {
+                text(&format!("INSERT INTO {p} VALUES (50, 'eu')")).await;
+            }
+            assert!(crate::schedule::pass(engine.context(), catalog.as_ref(), None).await >= 1);
+            let meta = catalog
+                .load_table(&TableIdent::new(Namespace::new(&["bronze"]), &parted))
+                .await
+                .unwrap()
+                .metadata;
+            assert_eq!(
+                meta["snapshots"].as_array().unwrap().len(),
+                2,
+                "head and tag"
+            );
+            assert_eq!(
+                meta["snapshots"].as_array().unwrap().last().unwrap()["summary"]["operation"],
+                "replace"
+            );
+            let fifty = text(&format!("SELECT count(*) AS n FROM {p} WHERE id = 50")).await;
+            assert!(fifty.contains("| 2 |"), "{fifty}");
+        })
+        .await;
         for t in [name, parted] {
             let _ = http
                 .delete(format!("{base}/{t}?purgeRequested=true"))

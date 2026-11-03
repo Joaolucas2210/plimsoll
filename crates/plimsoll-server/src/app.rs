@@ -642,10 +642,10 @@ struct MaintenanceRequest {
 
 /// Orphan removal never touches files younger than this: a write in
 /// flight has files no commit references yet (ADR 0080).
-const ORPHAN_MIN_AGE_MS: i64 = 3_600_000;
+pub const ORPHAN_MIN_AGE_MS: i64 = 3_600_000;
 
 /// Its default window, as Iceberg's `deleteOrphanFiles`.
-const ORPHAN_DEFAULT_AGE_MS: i64 = 3 * 24 * 3_600_000;
+pub const ORPHAN_DEFAULT_AGE_MS: i64 = 3 * 24 * 3_600_000;
 
 /// `POST /v1/maintenance/remove-orphans` (ADR 0080): deletes files under
 /// the table location that nothing references, last modified before

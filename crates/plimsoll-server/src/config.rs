@@ -34,6 +34,8 @@ pub struct Config {
     pub otlp: Option<OtlpConfig>,
     /// How often catalog listings are refreshed; zero = boot only (ADR 0033).
     pub catalog_refresh: Duration,
+    /// Between scheduled maintenance passes (ADR 0086); zero: none.
+    pub maintenance_interval: Duration,
     /// Percent of the memory ceiling each capped group may hold (ADR 0036).
     pub group_memory: HashMap<String, u8>,
     /// Result cache size, reserved in the pool; zero = off (ADR 0038).
@@ -85,6 +87,13 @@ impl Config {
             &lookup,
             "PLIMSOLL_CATALOG_REFRESH_MS",
             Some(60_000),
+            "expected a non-negative integer",
+        )?;
+
+        let maintenance_ms: u64 = parse(
+            &lookup,
+            "PLIMSOLL_MAINTENANCE_INTERVAL_MS",
+            Some(0),
             "expected a non-negative integer",
         )?;
 
@@ -169,6 +178,7 @@ impl Config {
             auth,
             otlp: otlp(&lookup)?,
             catalog_refresh: Duration::from_millis(refresh_ms),
+            maintenance_interval: Duration::from_millis(maintenance_ms),
             group_memory,
             result_cache_bytes,
             slow_query: (slow_ms > 0).then(|| Duration::from_millis(slow_ms)),
