@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Compaction: `POST /v1/maintenance/compact` rewrites small files and files carrying deletes into a `replace` snapshot; manifests rewritten with explicit sequence numbers; read by Spark and pyiceberg, time travel intact (ADR 0078)
 - [x] `DELETE FROM … WHERE` as position delete files, skipping rows already deleted; subquery predicates refused (DataFusion would drop them); read by Spark and pyiceberg (ADR 0077)
 - [x] Partitioned appends (identity, bucket, truncate, year/month/day/hour) and per-file column statistics, pruned by Plimsoll, Spark and pyiceberg (ADR 0076)
 - [x] `INSERT INTO` Iceberg tables (append): v2, unpartitioned, through the REST catalog commit; write grants per schema; read by Spark and pyiceberg (ADR 0075)
@@ -110,11 +111,11 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Table maintenance: compaction** — rewrite a partition's small files and
-the data files that carry position deletes into fresh files, committed as
-a `replace` snapshot, so readers stop paying for accumulated deletes and
-small appends (ADR 0076/0077 debt); then expire snapshots and remove
-orphan files.
+**Table maintenance: expire snapshots and remove orphan files** — drop
+snapshots older than a retention (keeping the last N and every branch and
+tag head), then delete the data, delete and metadata files no remaining
+snapshot references, and files no commit ever made reachable (failed
+writes, ADR 0075 debt), so storage stops growing with history.
 
 ## Missing
 

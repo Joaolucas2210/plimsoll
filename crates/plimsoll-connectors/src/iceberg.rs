@@ -211,6 +211,13 @@ impl IcebergConnector {
         self.table.snapshot_id
     }
 
+    /// Rewrites small files and files carrying deletes into fresh ones,
+    /// partition by partition (ADR 0078). Readers then stop paying for
+    /// accumulated deletes and small appends.
+    pub async fn compact(&self, state: &dyn Session) -> Result<Compaction, ConnectorError> {
+        Ok(self.table.compact(state).await?)
+    }
+
     /// Accept `INSERT INTO`, committing through `committer` (ADR 0075).
     pub fn with_committer(mut self, committer: Arc<dyn write::Committer>) -> Self {
         let mut table = (*self.table).clone();
@@ -238,6 +245,22 @@ impl Connector for IcebergConnector {
         self.table.clone()
     }
 }
+
+/// What a compaction did (ADR 0078).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Compaction {
+    /// Partitions with files rewritten.
+    pub partitions: usize,
+    pub files_rewritten: usize,
+    pub files_written: usize,
+    /// Live rows carried over.
+    pub rows: u64,
+}
+
+/// Data files below this are "small" and compacted with their partition's
+/// other small files: 75% of the target size new files are written at,
+/// as Iceberg's `min-file-size-bytes` default.
+const SMALL_FILE_BYTES: u64 = 96 << 20;
 
 #[derive(Debug, Clone)]
 struct IcebergTable {
@@ -268,6 +291,8 @@ struct IcebergTable {
     /// The `metadata.json` this table was read from (ADR 0058: what a
     /// worker re-opens).
     metadata_path: String,
+    /// Plan files with no live rows too (compaction, ADR 0078).
+    keep_empty: bool,
     /// Where `INSERT INTO` commits (ADR 0075); `None`: not writable.
     committer: Option<Arc<dyn write::Committer>>,
     /// How appended rows are laid out, or why this table cannot take an
@@ -479,6 +504,7 @@ impl IcebergTable {
             identity,
             metadata_path: path.to_owned(),
             committer: None,
+            keep_empty: false,
             layout: write::Layout::of(meta),
             schema_id: meta["current-schema-id"].as_i64().unwrap_or(0),
             only_files: None,
@@ -730,7 +756,11 @@ impl IcebergTable {
                 file.selection = Some(deletes::selection(&deleted, rows)?);
             }
             // Fully deleted files need not be opened at all.
-            files.retain(|f| f.selection.as_ref().is_none_or(|s| s.row_count() > 0));
+            // Files whose every row is deleted are skipped, except for
+            // compaction, which must retire them (ADR 0078).
+            if !self.keep_empty {
+                files.retain(|f| f.selection.as_ref().is_none_or(|s| s.row_count() > 0));
+            }
         }
 
         // Phase 3: equality deletes that apply to at least one kept file.
@@ -1302,6 +1332,55 @@ impl IcebergTable {
 }
 
 impl IcebergTable {
+    /// See [`IcebergConnector::compact`]. A partition is rewritten when it
+    /// has a file carrying deletes (position, deletion vector or
+    /// equality), or two small files; its other files stay.
+    async fn compact(&self, state: &dyn Session) -> Result<Compaction> {
+        let sink = self.writable("compact")?;
+        self.register_scoped(state);
+        let mut planner = self.clone();
+        planner.keep_empty = true;
+        let (files, _, _) = planner.data_files(state, &Pruner::default()).await?;
+        let mut groups: BTreeMap<String, (bool, Vec<String>)> = BTreeMap::new();
+        for file in files {
+            let deletes = file.selection.is_some() || !file.eq.is_empty();
+            let small = file.size.is_none_or(|s| s < SMALL_FILE_BYTES);
+            if !(deletes || small) {
+                continue;
+            }
+            let key = format!(
+                "{}:{:?}",
+                file.spec,
+                prune::partition_values(file.partition.as_ref())
+            );
+            let group = groups.entry(key).or_default();
+            group.0 |= deletes;
+            group.1.push(file.path);
+        }
+        let mut report = Compaction::default();
+        let mut chosen = HashSet::new();
+        for (deletes, paths) in groups.into_values() {
+            if deletes || paths.len() >= 2 {
+                report.partitions += 1;
+                chosen.extend(paths);
+            }
+        }
+        if chosen.is_empty() {
+            return Ok(report);
+        }
+        report.files_rewritten = chosen.len();
+        // The chosen files' live rows: the regular scan, deletes applied.
+        let mut only = self.clone();
+        only.only_files = Some(Arc::new(chosen.clone()));
+        let plan = only.scan(state, None, &[], None).await?;
+        let task = state.task_ctx();
+        let rows = datafusion::physical_plan::execute_stream(plan, task.clone())?;
+        let (rows, written) = sink.replace(rows, &chosen, &task).await?;
+        report.rows = rows;
+        report.files_written = written;
+        Ok(report)
+    }
+
     /// The sink a write commits through, or why this table takes none
     /// (ADR 0075).
     fn writable(&self, verb: &str) -> Result<write::IcebergSink> {
@@ -1332,6 +1411,7 @@ impl IcebergTable {
             committer: committer.clone(),
             schema_id: self.schema_id,
             layout,
+            base: self.snapshot_id,
         })
     }
 

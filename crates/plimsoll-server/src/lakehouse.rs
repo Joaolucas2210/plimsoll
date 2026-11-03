@@ -215,6 +215,36 @@ pub async fn register(
     Ok(r.namespaces)
 }
 
+/// Compacts `table` (`schema.name`, a catalog-served Iceberg table) in
+/// place (ADR 0078): rewrites its small files and files carrying deletes,
+/// and commits the replacement through the catalog.
+pub async fn compact(ctx: &SessionContext, table: &str) -> Result<plimsoll_connectors::Compaction> {
+    let plan = |m: String| DataFusionError::Plan(m);
+    let (schema, name) = table
+        .rsplit_once('.')
+        .ok_or_else(|| plan(format!("expected `schema.table`, got {table:?}")))?;
+    let state = ctx.state();
+    let default = &state.config_options().catalog.default_catalog;
+    let provider = ctx
+        .catalog(default)
+        .and_then(|c| c.schema(schema))
+        .ok_or_else(|| plan(format!("no schema {schema}")))?;
+    let Some(catalog) = provider.as_ref().downcast_ref::<CatalogSchema>() else {
+        return Err(plan(format!(
+            "{table}: only tables served by a REST catalog can be compacted"
+        )));
+    };
+    let Some(loaded) = catalog.load(name).await? else {
+        return Err(plan(format!("no table {table}")));
+    };
+    let metadata = loaded.1.metadata.clone();
+    catalog
+        .connector(name, loaded, &metadata)?
+        .compact(&state)
+        .await
+        .map_err(DataFusionError::from)
+}
+
 /// What a [`refresh`] saw and changed.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Refreshed {
@@ -518,6 +548,47 @@ mod tests {
             .map(|s| s["summary"]["operation"].as_str().unwrap())
             .collect();
         assert_eq!(ops, ["append", "append", "delete", "append"]);
+        // Compaction (ADR 0078): the partition with deletes, and the one
+        // with small files, rewritten; the rows unchanged; the position
+        // deletes gone with the files they referenced.
+        let files = async |sql: String| text(&sql).await;
+        let before = files(format!("SELECT content, count(*) AS n FROM bronze.\"{parted}$files\" GROUP BY content ORDER BY content")).await;
+        assert!(
+            before.contains("| 1       |"),
+            "position deletes before: {before}"
+        );
+        let report = compact(engine.context(), &p).await.unwrap();
+        assert!(report.files_rewritten > report.files_written, "{report:?}");
+        assert_eq!(report.rows, 3);
+        let ids = text(&format!("SELECT id FROM {p} ORDER BY id")).await;
+        let ids: Vec<&str> = ids
+            .lines()
+            .skip(3)
+            .filter(|l| l.starts_with("| "))
+            .collect();
+        assert_eq!(ids, ["| 1  |", "| 3  |", "| 11 |"]);
+        let after = files(format!("SELECT content, count(*) AS n FROM bronze.\"{parted}$files\" GROUP BY content ORDER BY content")).await;
+        assert!(
+            !after.contains("| 1       |"),
+            "no position deletes after: {after}"
+        );
+        // Nothing left to do.
+        assert_eq!(
+            compact(engine.context(), &p).await.unwrap().files_rewritten,
+            0
+        );
+        let last = catalog
+            .load_table(&TableIdent::new(Namespace::new(&["bronze"]), &parted))
+            .await
+            .unwrap()
+            .metadata;
+        let last = last["snapshots"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(last["summary"]["operation"], "replace");
         for t in [name, parted] {
             let _ = http
                 .delete(format!("{base}/{t}?purgeRequested=true"))

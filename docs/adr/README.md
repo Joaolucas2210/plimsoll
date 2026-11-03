@@ -85,6 +85,7 @@ are allowed in place.
 | [0075](0075-insert-into-iceberg.md) | `INSERT INTO` Iceberg tables (append) | Accepted | 2026-11-03 | DML is planned but only `INSERT INTO` (append) is accepted, gated by `check_write` (deny by default; `PLIMSOLL_AUTH_WRITE_GRANTS`); the Iceberg sink writes Parquet with field ids, a v2 manifest and a manifest list carrying the parent's manifests (deflate Avro), and commits through REST `updateTable` with retry on conflict; v2, unpartitioned, flat, REST-catalog tables only | 0024, 0025, 0008, 0040, 0004 |
 | [0076](0076-partitioned-appends-and-file-statistics.md) | Partitioned appends and file statistics | Accepted | 2026-11-03 | Rows are routed by the default spec with the pruner's own transforms (identity, bucket, truncate, year/month/day/hour) into per-partition files under a pool reservation (refusal or 512 open partitions finish files); every file records value/null counts and lower/upper bounds (strings truncated to 16 chars); manifests carry partition tuples and the list carries partition summaries; the Avro header is written by Plimsoll to keep Iceberg's `logicalType: map` | 0075, 0050, 0051, 0052, 0053, 0010 |
 | [0077](0077-delete-from-iceberg.md) | `DELETE FROM` Iceberg tables (position deletes) | Accepted | 2026-11-03 | `DELETE FROM` is allowed under the write grant; inputs with subqueries or joins are refused (DataFusion would drop their predicates); pruned data files are read whole in file order, matching positions (minus earlier deletes) are written as one position delete file per data file in a delete manifest, committed as a `delete` snapshot that retries only over concurrent appends | 0075, 0076, 0014, 0017, 0024, 0045 |
+| [0078](0078-compaction.md) | Compaction: rewrite small files and files carrying deletes | Accepted | 2026-11-03 | `POST /v1/maintenance/compact` (read + write grants, admission): per partition, files with deletes or ≥2 small files are read through the regular scan (deletes applied, fully-deleted files included) and rewritten by the partitioned writer; a `replace` snapshot marks them and their file-scoped position deletes DELETED in rewritten manifests (original Avro schema kept, sequence numbers explicit); retries only over appends; deletes now check concurrency against the planned snapshot | 0075, 0076, 0077, 0014, 0023 |
 
 ## Reading order
 
@@ -93,7 +94,7 @@ are allowed in place.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
 - Federation: 0005 → 0006.
 - Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074.
-- Writes: 0024 → 0075 → 0076 → 0077.
+- Writes: 0024 → 0075 → 0076 → 0077 → 0078.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046.
 

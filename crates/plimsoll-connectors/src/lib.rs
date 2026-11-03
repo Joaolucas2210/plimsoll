@@ -14,7 +14,7 @@ mod portable;
 pub mod postgres;
 pub mod remote;
 
-pub use iceberg::{AsOf, IcebergConnector};
+pub use iceberg::{AsOf, Compaction, IcebergConnector};
 pub use parquet::ParquetConnector;
 pub use postgres::{PG_URL_ENV, PostgresConnector};
 

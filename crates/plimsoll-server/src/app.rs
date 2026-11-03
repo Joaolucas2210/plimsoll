@@ -83,6 +83,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/sql", post(sql))
         .route("/v1/queries/{id}", delete(cancel_query))
         .route("/v1/fragment", post(fragment))
+        .route("/v1/maintenance/compact", post(compact))
         .with_state(state)
 }
 
@@ -616,6 +617,107 @@ impl Drop for FragmentReport {
                 ));
             }
             tracer.record(spans);
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CompactRequest {
+    /// `schema.table`.
+    table: String,
+    /// Only when authentication is disabled, as for `/v1/sql`.
+    user: Option<String>,
+}
+
+/// `POST /v1/maintenance/compact` (ADR 0078): rewrites a catalog-served
+/// Iceberg table's small files and files carrying deletes. Authenticated
+/// like `/v1/sql`; needs read and write grants on the table; holds an
+/// admission slot in the caller's default group and the query timeout.
+/// Logs one `compaction` line.
+async fn compact(
+    State(shared): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Json<CompactRequest>, JsonRejection>,
+) -> Response {
+    let st = shared.as_ref();
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let principal = match st.auth.principal(authorization) {
+        Ok(p) => p,
+        Err(e) => {
+            return ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", false)
+                .respond(st, e, None);
+        }
+    };
+    let req = match body {
+        Ok(Json(r)) => r,
+        Err(e) => {
+            return ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", false).respond(
+                st,
+                e.body_text(),
+                None,
+            );
+        }
+    };
+    let user = match (principal, req.user) {
+        (Some(p), _) => p.to_owned(),
+        (None, Some(u)) if !u.trim().is_empty() => u,
+        (None, _) => {
+            return ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", false).respond(
+                st,
+                "`user` is required when authentication is disabled",
+                None,
+            );
+        }
+    };
+    let group = st
+        .auth
+        .groups_for(&user)
+        .and_then(|g| g.first().map(|g| (*g).to_owned()))
+        .unwrap_or_else(|| DEFAULT_GROUP.to_owned());
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + st.query_timeout;
+    let _slot = match tokio::time::timeout_at(deadline, st.admission.acquire(&user, &group)).await {
+        Ok(Ok(slot)) => slot,
+        Ok(Err(e)) => {
+            let e = GovernedError::<EngineError>::Rejected(e);
+            return ApiError::of(&e).respond(st, &e, None);
+        }
+        Err(_) => {
+            let e = GovernedError::<EngineError>::TimedOut(st.query_timeout);
+            return ApiError::of(&e).respond(st, &e, None);
+        }
+    };
+    let viewer = st.auth.viewer(&user);
+    let outcome =
+        match tokio::time::timeout_at(deadline, st.engine.compact(&req.table, viewer)).await {
+            Ok(Ok(report)) => Ok(report),
+            Ok(Err(e)) => Err(GovernedError::Failed(e)),
+            Err(_) => Err(GovernedError::TimedOut(st.query_timeout)),
+        };
+    let ms = (started.elapsed().as_micros() as f64) / 1e3;
+    match outcome {
+        Ok(r) => {
+            let fields = json!({
+                "table": req.table,
+                "user": user,
+                "partitions": r.partitions,
+                "files_rewritten": r.files_rewritten,
+                "files_written": r.files_written,
+                "rows": r.rows,
+                "total_ms": ms,
+            });
+            crate::log::emit(Level::Info, "compaction", fields.clone());
+            (StatusCode::OK, Json(fields)).into_response()
+        }
+        Err(e) => {
+            crate::log::emit(
+                Level::Warn,
+                "compaction",
+                json!({"table": req.table, "user": user, "error": e.to_string(), "total_ms": ms}),
+            );
+            ApiError::of(&e).respond(st, &e, None)
         }
     }
 }

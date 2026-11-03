@@ -184,6 +184,16 @@ memory and admission slot. Owners cancel their own queries,
 `409 query_not_running` once it has finished. Ids are in every response,
 log line and `system.runtime.queries`.
 
+### Compaction
+
+`POST /v1/maintenance/compact` with `{"table": "bronze.events"}` rewrites
+a catalog-served Iceberg table's small files and files carrying deletes
+into fresh ones, partition by partition, as one `replace` snapshot; the
+rows do not change and time travel to earlier snapshots still works.
+Needs read and write grants on the table, holds an admission slot, and
+answers `{"partitions", "files_rewritten", "files_written", "rows"}`
+(ADR 0078).
+
 ### Probes
 
 - `/livez` — process alive (never checks dependencies).
@@ -215,8 +225,9 @@ Roadmap: [ROADMAP.md](ROADMAP.md).
   formats. Open formats (Parquet, Iceberg) and open catalogs only.
 - No in-process TLS yet; deploy the query API behind a TLS-terminating
   proxy. Authentication is bearer tokens (ADR 0021).
-- Writes are `INSERT INTO` and `DELETE FROM` (ADR 0075–0077): no
-  `UPDATE`, `MERGE`, DDL or table maintenance yet. See
+- Writes are `INSERT INTO`, `DELETE FROM` and compaction (ADR
+  0075–0078): no `UPDATE`, `MERGE`, DDL, snapshot expiry or orphan file
+  removal yet. See
   [ROADMAP.md](ROADMAP.md).
 
 ## License

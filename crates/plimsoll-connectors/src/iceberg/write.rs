@@ -214,6 +214,9 @@ pub(super) struct IcebergSink {
     /// change fails the commit rather than mislabel them.
     pub(super) schema_id: i64,
     pub(super) layout: Layout,
+    /// The snapshot rows were read from when planning: deletes and
+    /// rewrites commit only if nothing but appends happened since.
+    pub(super) base: Option<i64>,
 }
 
 impl fmt::Debug for IcebergSink {
@@ -268,13 +271,16 @@ pub(super) enum Change {
     Append,
     /// Position delete files (ADR 0077).
     Delete,
+    /// Data files replacing others with the same live rows (compaction,
+    /// ADR 0078).
+    Replace,
 }
 
 impl Change {
     /// Manifest and data file `content`: 0 data, 1 position deletes.
     fn content(self) -> i32 {
         match self {
-            Self::Append => 0,
+            Self::Append | Self::Replace => 0,
             Self::Delete => 1,
         }
     }
@@ -403,9 +409,26 @@ impl DataSink for IcebergSink {
 
     async fn write_all(
         &self,
-        mut data: SendableRecordBatchStream,
+        data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> Result<u64> {
+        let written = self.write_rows(data, context).await?;
+        let rows = written.iter().map(|w| w.rows).sum();
+        if !written.is_empty() {
+            self.commit(&written, Change::Append, None, &context.runtime_env())
+                .await?;
+        }
+        Ok(rows)
+    }
+}
+
+impl IcebergSink {
+    /// Writes `data` as data files, routed by partition (ADR 0076).
+    async fn write_rows(
+        &self,
+        mut data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+    ) -> Result<Vec<Written>> {
         let env = context.runtime_env();
         let run = unique();
         let mut written = Vec::new();
@@ -464,12 +487,28 @@ impl DataSink for IcebergSink {
             written.push(self.finish(file, key, run, written.len(), &env).await?);
         }
         memory.resize(0);
-        let rows = written.iter().map(|w| w.rows).sum();
-        if written.is_empty() {
-            return Ok(0);
-        }
-        self.commit(&written, Change::Append, &env).await?;
-        Ok(rows)
+        Ok(written)
+    }
+
+    /// Compaction (ADR 0078): writes the live rows of `data` (read from
+    /// the files in `removed`) as new files, and commits them replacing
+    /// those files and the position deletes that referenced them. The
+    /// rows written, and the files added.
+    pub(super) async fn replace(
+        &self,
+        data: SendableRecordBatchStream,
+        removed: &std::collections::HashSet<String>,
+        context: &Arc<TaskContext>,
+    ) -> Result<(u64, usize)> {
+        let written = self.write_rows(data, context).await?;
+        self.commit(
+            &written,
+            Change::Replace,
+            Some(removed),
+            &context.runtime_env(),
+        )
+        .await?;
+        Ok((written.iter().map(|w| w.rows).sum(), written.len()))
     }
 }
 
@@ -562,6 +601,7 @@ impl IcebergSink {
         &self,
         files: &[Written],
         change: Change,
+        removed: Option<&std::collections::HashSet<String>>,
         env: &datafusion::execution::runtime_env::RuntimeEnv,
     ) -> Result<()> {
         let failed = |m: String| DataFusionError::Execution(format!("{}: {m}", self.name));
@@ -569,7 +609,6 @@ impl IcebergSink {
         let snapshot_id = (unique() >> 1) as i64;
         let meta = self.committer.current().await.map_err(failed)?;
         let manifest_path = format!("{}/metadata/{snapshot_id:x}-m0.avro", self.location);
-        let original_parent = main_snapshot(&meta);
         let manifest = manifest(
             &meta,
             &self.layout,
@@ -598,17 +637,17 @@ impl IcebergSink {
                 ));
             }
             let parent = main_snapshot(&meta);
-            // Position deletes name files of the snapshot they were planned
-            // on: only appends may slip in between (their rows are newer
-            // than the deletes and untouched by them).
-            if change == Change::Delete && parent != original_parent {
-                if let Some(op) = operations_since(&meta, parent, original_parent)
+            // Deletes and rewrites name files of the snapshot they were
+            // planned on: only appends may slip in between (their rows are
+            // newer and untouched).
+            if change != Change::Append && parent != self.base {
+                if let Some(op) = operations_since(&meta, parent, self.base)
                     .into_iter()
                     .find(|op| op != "append")
                 {
                     return Err(failed(format!(
-                        "a concurrent `{op}` changed the table's data during the DELETE; \
-                         nothing was committed, run it again"
+                        "a concurrent `{op}` changed the table's data meanwhile; nothing was \
+                         committed, run it again"
                     )));
                 }
             }
@@ -632,6 +671,45 @@ impl IcebergSink {
                     )
                 }
             };
+            // A rewrite marks the replaced files (and position deletes that
+            // only referenced them) DELETED in rewritten copies of the
+            // manifests that list them.
+            let mut rewritten = HashMap::new();
+            let mut gone = Gone::default();
+            if let (Some(removed), Some(list)) = (removed, parent_list.as_deref()) {
+                let reader = apache_avro::Reader::new(list).map_err(|e| failed(e.to_string()))?;
+                for (n, entry) in reader.enumerate() {
+                    let entry = entry.map_err(|e| failed(e.to_string()))?;
+                    let (Some(Avro::String(path)), Some(seq)) = (
+                        field(&entry, "manifest_path").map(strip),
+                        field(&entry, "sequence_number").map(strip).and_then(long),
+                    ) else {
+                        return Err(failed("manifest list entry without path".into()));
+                    };
+                    let bytes = read_env(path, env, self.scoped.as_ref())
+                        .await
+                        .map_err(DataFusionError::from)?;
+                    let Some((copy, counts)) = rewrite_manifest(&bytes, removed, seq, snapshot_id)
+                        .map_err(|e| failed(format!("rewriting {path}: {e}")))?
+                    else {
+                        continue;
+                    };
+                    let new_path = format!(
+                        "{}/metadata/{snapshot_id:x}-r{attempt}-{n}.avro",
+                        self.location
+                    );
+                    let length = copy.len() as i64;
+                    self.put_bytes(&new_path, copy, env).await?;
+                    gone.add(&counts);
+                    rewritten.insert(path.clone(), (new_path, length, counts));
+                }
+                if gone.data_paths.len() != removed.len() {
+                    return Err(failed(
+                        "some files to rewrite are no longer in the table; nothing was committed"
+                            .into(),
+                    ));
+                }
+            }
             let new_entry = ManifestFile {
                 path: manifest_path.clone(),
                 length: manifest_length,
@@ -649,6 +727,7 @@ impl IcebergSink {
                 snapshot_id,
                 parent,
                 sequence,
+                &rewritten,
             )
             .map_err(|e| failed(format!("manifest list: {e}")))?;
             let list_path = format!(
@@ -671,6 +750,16 @@ impl IcebergSink {
                     "added-position-delete-files": files.len().to_string(),
                     "added-position-deletes": added_rows.to_string(),
                     "added-files-size": size,
+                }),
+                Change::Replace => json!({
+                    "operation": "replace",
+                    "added-data-files": files.len().to_string(),
+                    "added-records": added_rows.to_string(),
+                    "added-files-size": size,
+                    "deleted-data-files": gone.data_paths.len().to_string(),
+                    "deleted-records": gone.data_rows.to_string(),
+                    "removed-delete-files": gone.delete_files.to_string(),
+                    "removed-position-deletes": gone.delete_rows.to_string(),
                 }),
             };
             summary["engine-name"] = json!("plimsoll");
@@ -923,7 +1012,7 @@ impl IcebergSink {
         }
         let deleted = written.iter().map(|w| w.rows).sum();
         if !written.is_empty() {
-            self.commit(&written, Change::Delete, &env).await?;
+            self.commit(&written, Change::Delete, None, &env).await?;
         }
         Ok(deleted)
     }
@@ -1216,7 +1305,7 @@ fn manifest(
             (
                 "content",
                 match change {
-                    Change::Append => "data",
+                    Change::Append | Change::Replace => "data",
                     Change::Delete => "deletes",
                 }
                 .to_owned(),
@@ -1338,6 +1427,7 @@ fn manifest_list(
     snapshot_id: i64,
     parent_id: Option<i64>,
     sequence: i64,
+    rewritten: &HashMap<String, (String, i64, Counts)>,
 ) -> std::result::Result<Vec<u8>, String> {
     let schema = avro_schema(MANIFEST_FILE)?;
     let mut writer = avro_writer(
@@ -1388,12 +1478,232 @@ fn manifest_list(
         let reader = apache_avro::Reader::new(bytes).map_err(|e| e.to_string())?;
         for entry in reader {
             let entry = entry.map_err(|e| e.to_string())?;
+            let mut entry = conform(&entry, &schema);
+            let old = match field(&entry, "manifest_path") {
+                Some(Avro::String(p)) => p.clone(),
+                _ => String::new(),
+            };
+            // A rewritten manifest: its new copy, added now, with what it
+            // keeps and what it marks deleted.
+            if let Some((path, length, c)) = rewritten.get(&old) {
+                for (name, value) in [
+                    ("manifest_path", Avro::String(path.clone())),
+                    ("manifest_length", Avro::Long(*length)),
+                    ("sequence_number", Avro::Long(sequence)),
+                    (
+                        "min_sequence_number",
+                        Avro::Long(c.min_sequence.unwrap_or(sequence)),
+                    ),
+                    ("added_snapshot_id", Avro::Long(snapshot_id)),
+                    ("added_files_count", Avro::Int(0)),
+                    ("existing_files_count", Avro::Int(c.existing_files as i32)),
+                    ("deleted_files_count", Avro::Int(c.deleted_files as i32)),
+                    ("added_rows_count", Avro::Long(0)),
+                    ("existing_rows_count", Avro::Long(c.existing_rows)),
+                    ("deleted_rows_count", Avro::Long(c.deleted_rows)),
+                ] {
+                    set(&mut entry, name, value);
+                }
+            }
             writer
-                .append_value(conform(&entry, &schema))
+                .append_value(entry)
                 .map_err(|e| format!("carrying over a parent manifest: {e}"))?;
         }
     }
     writer.into_inner().map_err(|e| e.to_string())
+}
+
+/// What rewriting one manifest kept and marked deleted.
+#[derive(Debug, Clone, Default)]
+struct Counts {
+    existing_files: i64,
+    existing_rows: i64,
+    deleted_files: i64,
+    deleted_rows: i64,
+    min_sequence: Option<i64>,
+    /// Data files marked deleted, by path.
+    data_paths: Vec<String>,
+    /// Position delete files marked deleted, and their rows.
+    delete_files: i64,
+    delete_rows: i64,
+}
+
+/// Totals across rewritten manifests, for the snapshot summary.
+#[derive(Debug, Default)]
+struct Gone {
+    data_paths: std::collections::HashSet<String>,
+    data_rows: i64,
+    delete_files: i64,
+    delete_rows: i64,
+}
+
+impl Gone {
+    fn add(&mut self, c: &Counts) {
+        self.data_paths.extend(c.data_paths.iter().cloned());
+        self.data_rows += c.deleted_rows - c.delete_rows;
+        self.delete_files += c.delete_files;
+        self.delete_rows += c.delete_rows;
+    }
+}
+
+fn long(v: &Avro) -> Option<i64> {
+    match v {
+        Avro::Long(n) => Some(*n),
+        Avro::Int(n) => Some(i64::from(*n)),
+        _ => None,
+    }
+}
+
+/// Sets a record's field, keeping its union wrapping if any.
+fn set(record: &mut Avro, name: &str, value: Avro) {
+    let Avro::Record(fields) = record else { return };
+    if let Some((_, v)) = fields.iter_mut().find(|(n, _)| n == name) {
+        *v = match v {
+            Avro::Union(i, _) => Avro::Union(*i, Box::new(value)),
+            _ => value,
+        };
+    }
+}
+
+/// The header of an Avro container: its schema text and its metadata
+/// (`avro.*` keys excluded).
+fn read_header(bytes: &[u8]) -> Option<(String, Vec<(String, String)>)> {
+    fn long(bytes: &[u8], at: &mut usize) -> Option<i64> {
+        let (mut z, mut shift) = (0u64, 0);
+        loop {
+            let b = *bytes.get(*at)?;
+            *at += 1;
+            z |= u64::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                return Some(((z >> 1) as i64) ^ -((z & 1) as i64));
+            }
+            shift += 7;
+            if shift > 63 {
+                return None;
+            }
+        }
+    }
+    fn text(bytes: &[u8], at: &mut usize) -> Option<String> {
+        let n = usize::try_from(long(bytes, at)?).ok()?;
+        let s = std::str::from_utf8(bytes.get(*at..*at + n)?)
+            .ok()?
+            .to_owned();
+        *at += n;
+        Some(s)
+    }
+    let mut at = 4;
+    if bytes.get(..4)? != b"Obj\x01" {
+        return None;
+    }
+    let (mut schema, mut metadata) = (None, Vec::new());
+    loop {
+        let mut n = long(bytes, &mut at)?;
+        if n == 0 {
+            break;
+        }
+        if n < 0 {
+            // A negative count is followed by the block's byte size.
+            long(bytes, &mut at)?;
+            n = -n;
+        }
+        for _ in 0..n {
+            let (k, v) = (text(bytes, &mut at)?, text(bytes, &mut at)?);
+            match k.as_str() {
+                "avro.schema" => schema = Some(v),
+                k if k.starts_with("avro.") => {}
+                _ => metadata.push((k, v)),
+            }
+        }
+    }
+    Some((schema?, metadata))
+}
+
+/// A copy of manifest `bytes` in which the data files in `removed`, and
+/// the position delete files that reference one of them, are DELETED by
+/// `snapshot_id`; every other live entry becomes EXISTING with its
+/// sequence numbers made explicit (`inherited`: the manifest's own), and
+/// entries deleted earlier are dropped. `None` when nothing matches.
+fn rewrite_manifest(
+    bytes: &[u8],
+    removed: &std::collections::HashSet<String>,
+    inherited: i64,
+    snapshot_id: i64,
+) -> std::result::Result<Option<(Vec<u8>, Counts)>, String> {
+    let (schema_text, metadata) = read_header(bytes).ok_or("not an Avro container")?;
+    let schema = avro_schema(&schema_text)?;
+    let reader = apache_avro::Reader::new(bytes).map_err(|e| e.to_string())?;
+    let mut entries = Vec::new();
+    let mut counts = Counts::default();
+    for entry in reader {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if field(&entry, "status").map(strip).and_then(long) == Some(2) {
+            continue;
+        }
+        let file = field(&entry, "data_file")
+            .map(strip)
+            .ok_or("entry without data_file")?;
+        let content = field(file, "content")
+            .map(strip)
+            .and_then(long)
+            .unwrap_or(0);
+        let text = |name: &str| match field(file, name).map(strip) {
+            Some(Avro::String(s)) => Some(s.clone()),
+            _ => None,
+        };
+        let rows = field(file, "record_count")
+            .map(strip)
+            .and_then(long)
+            .unwrap_or(0);
+        let gone = match content {
+            0 => text("file_path").is_some_and(|p| removed.contains(&p)),
+            1 => text("referenced_data_file").is_some_and(|p| removed.contains(&p)),
+            _ => false,
+        };
+        let seq = field(&entry, "sequence_number")
+            .map(strip)
+            .and_then(long)
+            .unwrap_or(inherited);
+        let file_seq = field(&entry, "file_sequence_number")
+            .map(strip)
+            .and_then(long)
+            .unwrap_or(seq);
+        let mut entry = entry.clone();
+        if gone {
+            counts.deleted_files += 1;
+            counts.deleted_rows += rows;
+            if content == 0 {
+                counts.data_paths.extend(text("file_path"));
+            } else {
+                counts.delete_files += 1;
+                counts.delete_rows += rows;
+            }
+            set(&mut entry, "status", Avro::Int(2));
+            set(&mut entry, "snapshot_id", Avro::Long(snapshot_id));
+        } else {
+            counts.existing_files += 1;
+            counts.existing_rows += rows;
+            counts.min_sequence = Some(counts.min_sequence.map_or(seq, |m| m.min(seq)));
+            set(&mut entry, "status", Avro::Int(0));
+        }
+        set(&mut entry, "sequence_number", Avro::Long(seq));
+        set(&mut entry, "file_sequence_number", Avro::Long(file_seq));
+        entries.push(conform(&entry, &schema));
+    }
+    if counts.deleted_files == 0 {
+        return Ok(None);
+    }
+    let metadata: Vec<(&str, String)> = metadata
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.clone()))
+        .collect();
+    let mut writer = avro_writer(&schema, &schema_text, &metadata)?;
+    for entry in entries {
+        writer.append_value(entry).map_err(|e| e.to_string())?;
+    }
+    Ok(Some((
+        writer.into_inner().map_err(|e| e.to_string())?,
+        counts,
+    )))
 }
 
 /// `v` rebuilt for `schema`: unions re-chosen, records matched by field
@@ -1591,7 +1901,7 @@ mod tests {
             partitions: summaries(&layout, &files),
         };
         assert_eq!(new.partitions[0].1, Some(19_723i32.to_le_bytes().to_vec()));
-        let first = manifest_list(&new, None, 6, None, 1).unwrap();
+        let first = manifest_list(&new, None, 6, None, 1, &HashMap::new()).unwrap();
         let second = manifest_list(
             &ManifestFile {
                 path: "m2".into(),
@@ -1603,6 +1913,7 @@ mod tests {
             8,
             Some(7),
             3,
+            &HashMap::new(),
         )
         .unwrap();
         let entries: Vec<Avro> = apache_avro::Reader::new(&second[..])
@@ -1619,6 +1930,74 @@ mod tests {
         );
         let carried = strip(field(&entries[1], "partitions").unwrap());
         assert!(matches!(carried, Avro::Array(p) if p.len() == 1));
+    }
+
+    #[test]
+    fn rewritten_manifests_mark_replaced_files_and_their_deletes() {
+        let meta = table(2, json!([]), flat());
+        let layout = Layout::of(&meta).unwrap();
+        let file = |path: &str, rows: u64, referenced: Option<&str>| Written {
+            path: path.into(),
+            rows,
+            bytes: 10,
+            partition: vec![],
+            stats: vec![],
+            referenced: referenced.map(str::to_owned),
+        };
+        // A data manifest with two files, sequence numbers inherited.
+        let data = manifest(
+            &meta,
+            &layout,
+            &[file("a", 3, None), file("b", 4, None)],
+            7,
+            0,
+            Change::Append,
+        )
+        .unwrap();
+        // Its header is read back as written, Iceberg metadata included.
+        let (schema, metadata) = read_header(&data).unwrap();
+        assert!(schema.contains(r#""logicalType":"map""#));
+        assert!(metadata.contains(&("content".to_owned(), "data".to_owned())));
+        let removed = std::collections::HashSet::from(["a".to_owned()]);
+        let (copy, counts) = rewrite_manifest(&data, &removed, 5, 9).unwrap().unwrap();
+        assert_eq!((counts.deleted_files, counts.existing_files), (1, 1));
+        assert_eq!((counts.deleted_rows, counts.existing_rows), (3, 4));
+        assert_eq!(counts.data_paths, ["a"]);
+        assert_eq!(counts.min_sequence, Some(5));
+        let entries: Vec<Avro> = apache_avro::Reader::new(&copy[..])
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect();
+        let status = |e: &Avro| field(e, "status").map(strip).and_then(long);
+        let seq = |e: &Avro| field(e, "sequence_number").map(strip).and_then(long);
+        // DELETED by the rewrite; EXISTING keeps its (now explicit) seq.
+        assert_eq!((status(&entries[0]), seq(&entries[0])), (Some(2), Some(5)));
+        assert_eq!((status(&entries[1]), seq(&entries[1])), (Some(0), Some(5)));
+        assert_eq!(
+            field(&entries[0], "snapshot_id").map(strip),
+            Some(&Avro::Long(9))
+        );
+        // Rewritten again: the earlier DELETED entry is dropped.
+        let removed_b = std::collections::HashSet::from(["b".to_owned()]);
+        let (again, counts) = rewrite_manifest(&copy, &removed_b, 6, 10).unwrap().unwrap();
+        assert_eq!((counts.deleted_files, counts.existing_files), (1, 0));
+        assert_eq!(apache_avro::Reader::new(&again[..]).unwrap().count(), 1);
+        // A delete manifest: the delete file referencing a replaced file
+        // goes; one referencing another file stays. Nothing matches: None.
+        let deletes = manifest(
+            &meta,
+            &layout,
+            &[file("d1", 1, Some("a")), file("d2", 1, Some("z"))],
+            7,
+            0,
+            Change::Delete,
+        )
+        .unwrap();
+        let (_, counts) = rewrite_manifest(&deletes, &removed, 5, 9).unwrap().unwrap();
+        assert_eq!((counts.delete_files, counts.existing_files), (1, 1));
+        assert!(counts.data_paths.is_empty());
+        let none = std::collections::HashSet::from(["q".to_owned()]);
+        assert!(rewrite_manifest(&deletes, &none, 5, 9).unwrap().is_none());
     }
 
     #[test]
@@ -1730,6 +2109,7 @@ mod tests {
             committer: Arc::new(Never),
             schema_id: 0,
             layout,
+            base: None,
         };
         let groups = sink.split(&batch).unwrap();
         // ("a", bucket(1)) twice, then ("b", ...), then (NULL, ...).

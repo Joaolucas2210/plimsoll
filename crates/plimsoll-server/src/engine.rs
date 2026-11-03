@@ -158,6 +158,16 @@ pub trait QueryEngine: Send + Sync {
         Err(EngineError::Unsupported("scan fragments".into()))
     }
 
+    /// Compacts `table` on behalf of `viewer`, who needs a write grant on
+    /// it (ADR 0078). Default: not supported.
+    async fn compact(
+        &self,
+        _table: &str,
+        _viewer: Viewer,
+    ) -> Result<plimsoll_connectors::Compaction, EngineError> {
+        Err(EngineError::Unsupported("compaction".into()))
+    }
+
     /// Drops this worker's maps of `shuffle` and of its retries (ADR
     /// 0073); an empty stream. Default: not a worker.
     async fn release(&self, _shuffle: &str) -> Result<Running, EngineError> {
@@ -816,6 +826,29 @@ impl QueryEngine for CoreEngine {
         }
     }
 
+    async fn compact(
+        &self,
+        table: &str,
+        viewer: Viewer,
+    ) -> Result<plimsoll_connectors::Compaction, EngineError> {
+        use plimsoll_core::datafusion::common::TableReference;
+        use plimsoll_core::engine::TableAccess;
+        let ctx = self.0.context();
+        let options = ctx.state().config_options().clone();
+        let resolved = TableReference::from(table).resolve(
+            &options.catalog.default_catalog,
+            &options.catalog.default_schema,
+        );
+        // Rewriting reads and writes every row of the table: both grants.
+        viewer
+            .check(&resolved)
+            .and_then(|()| viewer.check_write(&resolved))
+            .map_err(|e| classify(&e))?;
+        crate::lakehouse::compact(ctx, table)
+            .await
+            .map_err(|e| classify(&e))
+    }
+
     async fn release(&self, shuffle: &str) -> Result<Running, EngineError> {
         use plimsoll_core::datafusion::arrow::datatypes::Schema;
         use plimsoll_core::datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -1356,6 +1389,34 @@ mod tests {
         assert!(!maps.contains_key(&("exp-old".into(), 0)));
         assert!(maps.contains_key(&("exp-live".into(), 0)));
         assert!(!RELEASED.lock().unwrap().contains_key("exp-gone"));
+    }
+
+    /// Compaction rewrites every row it reads (ADR 0078): read and write
+    /// grants, both checked before the catalog is asked anything.
+    #[tokio::test]
+    async fn compaction_needs_read_and_write_grants() {
+        let pool = Arc::new(CeilingPool::new(1 << 20, 1 << 17).unwrap());
+        let e = CoreEngine(Arc::new(Engine::new(pool, None).unwrap()));
+        let reader = Viewer {
+            schemas: Some(["bronze".to_owned()].into()),
+            ..Viewer::default()
+        };
+        let writer_elsewhere = Viewer {
+            schemas: Some(["*".to_owned()].into()),
+            writable: Some(["gold".to_owned()].into()),
+            ..Viewer::default()
+        };
+        for viewer in [reader, writer_elsewhere] {
+            let err = e.compact("bronze.t", viewer).await.unwrap_err();
+            assert!(err.to_string().contains("access denied"), "{err}");
+        }
+        // Granted: on to the catalog, which has no such schema here.
+        let writer = Viewer {
+            writable: Some(["bronze".to_owned()].into()),
+            ..Viewer::default()
+        };
+        let err = e.compact("bronze.t", writer).await.unwrap_err();
+        assert!(!err.to_string().contains("access denied"), "{err}");
     }
 
     #[tokio::test]
