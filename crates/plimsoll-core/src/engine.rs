@@ -46,6 +46,8 @@ pub struct QueryResult {
     pub execution: Duration,
     /// Every scan of the optimized plan (ADR 0046).
     pub reads: Vec<TableRead>,
+    /// The executed plan's nodes, for execution spans (ADR 0071).
+    pub operators: Vec<crate::plan_trace::OperatorSpan>,
 }
 
 /// One scan of a query, for the audit trail (ADR 0046): the table as
@@ -266,6 +268,7 @@ impl Engine {
         }
         let planning = query.planning;
         let reads = std::mem::take(&mut query.reads);
+        let operators = query.operators();
         drop(query);
         Ok(QueryResult {
             batches,
@@ -273,6 +276,7 @@ impl Engine {
             planning,
             execution: started.elapsed() - planning,
             reads,
+            operators,
         })
     }
 
@@ -479,6 +483,14 @@ pub struct QueryStream {
     spilled_total: Arc<AtomicU64>,
 }
 
+impl QueryStream {
+    /// The plan's nodes with their metrics so far: complete once the
+    /// stream has ended (ADR 0071).
+    pub fn operators(&self) -> Vec<crate::plan_trace::OperatorSpan> {
+        crate::plan_trace::operators(&self.physical, crate::plan_trace::TRACED_OPERATORS)
+    }
+}
+
 impl Drop for QueryStream {
     fn drop(&mut self) {
         self.spilled_total
@@ -494,6 +506,30 @@ mod tests {
     fn engine(limit: usize) -> Engine {
         let pool = Arc::new(CeilingPool::new(limit, limit / 8).unwrap());
         Engine::new(pool, None).unwrap()
+    }
+
+    #[tokio::test]
+    async fn executed_operators_carry_their_metrics() {
+        let e = engine(64 << 20);
+        let out = e
+            .sql("SELECT v % 3 AS k, count(*) FROM (VALUES (1), (2), (3), (4)) t(v) GROUP BY k")
+            .await
+            .unwrap();
+        let ops = &out.operators;
+        assert!(ops.len() >= 2, "{ops:?}");
+        // Parents come first; only the root has none.
+        assert_eq!(ops[0].parent, None);
+        assert!(
+            ops.iter()
+                .enumerate()
+                .skip(1)
+                .all(|(i, o)| o.parent.is_some_and(|p| p < i))
+        );
+        // The aggregation ran: rows out, real start and end.
+        let agg = ops.iter().find(|o| o.name == "AggregateExec").unwrap();
+        assert!(agg.output_rows.is_some_and(|n| n > 0), "{agg:?}");
+        assert!(agg.start.is_some() && agg.end >= agg.start, "{agg:?}");
+        assert!(agg.detail.contains("AggregateExec"), "{agg:?}");
     }
 
     #[tokio::test]

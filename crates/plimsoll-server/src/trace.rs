@@ -236,6 +236,54 @@ fn nanos(t: SystemTime) -> String {
         .to_string()
 }
 
+/// One span per executed plan node (ADR 0071), nested as the plan under
+/// `parent`. Nodes carry their own first start and last end when
+/// DataFusion recorded them; otherwise they span `start`..`end`.
+pub fn operator_spans(
+    trace_id: &str,
+    parent: &str,
+    operators: &[plimsoll_core::plan_trace::OperatorSpan],
+    start: SystemTime,
+    end: SystemTime,
+) -> Vec<Value> {
+    let ids: Vec<String> = operators.iter().map(|_| random_hex::<8>()).collect();
+    operators
+        .iter()
+        .zip(&ids)
+        .map(|(op, id)| {
+            let parent = op
+                .parent
+                .and_then(|p| ids.get(p))
+                .map_or(parent, String::as_str);
+            let begin = op.start.unwrap_or(start);
+            let finish = op.end.unwrap_or(end).max(begin);
+            let mut attributes = vec![attr("plimsoll.operator", json!(op.detail))];
+            for (key, v) in [
+                ("plimsoll.output_rows", op.output_rows.map(|v| json!(v))),
+                (
+                    "plimsoll.compute_ms",
+                    op.compute.map(|d| json!(d.as_millis())),
+                ),
+                ("plimsoll.spilled_bytes", op.spilled_bytes.map(|v| json!(v))),
+            ] {
+                if let Some(v) = v {
+                    attributes.push(attr(key, v));
+                }
+            }
+            json!({
+                "traceId": trace_id,
+                "spanId": id,
+                "parentSpanId": parent,
+                "name": op.name,
+                "kind": 1,
+                "startTimeUnixNano": nanos(begin),
+                "endTimeUnixNano": nanos(finish),
+                "attributes": attributes,
+            })
+        })
+        .collect()
+}
+
 /// One SERVER span for work done on behalf of another node (a worker's
 /// fragment, ADR 0059): the caller's trace continues here.
 pub fn server_span(
@@ -327,12 +375,15 @@ pub fn spans(
     ];
     let ran: Duration = phases.iter().filter_map(|(_, d)| *d).sum();
     let mut at = end.checked_sub(ran).unwrap_or(started).max(started);
-    let mut planning = None;
+    let (mut planning, mut execution) = (None, None);
     for (name, d) in phases {
         let Some(d) = d else { continue };
         let id = random_hex::<8>();
         if name == "planning" {
             planning = Some(id.clone());
+        }
+        if name == "execution" {
+            execution = Some((id.clone(), at, at + d));
         }
         out.push(json!({
             "traceId": ctx.trace_id,
@@ -365,6 +416,19 @@ pub fn spans(
             "endTimeUnixNano": nanos(e.start + e.duration),
             "attributes": attributes,
         }));
+    }
+    // What execution did (ADR 0071): one span per plan node, nested as
+    // the plan, under the execution span. Nodes carry their own first
+    // start and last end when DataFusion recorded them; otherwise they
+    // span the execution phase.
+    if let Some((exec_id, exec_start, exec_end)) = execution {
+        out.extend(operator_spans(
+            &ctx.trace_id,
+            &exec_id,
+            &q.operators,
+            exec_start,
+            exec_end,
+        ));
     }
     out
 }
@@ -457,6 +521,42 @@ mod tests {
         // A caller error is not a server error.
         let s = spans(&ctx, t0, &q, 403, Some(("forbidden", "no")));
         assert_eq!(s[0]["status"]["code"], 0);
+        // Executed operators nest as the plan under execution (ADR 0071):
+        // real instants when recorded, the execution phase otherwise.
+        let op = |name: &str, parent, start: Option<u64>| plimsoll_core::plan_trace::OperatorSpan {
+            name: name.into(),
+            detail: format!("{name}: detail"),
+            parent,
+            start: start.map(|ms| t0 + Duration::from_millis(ms)),
+            end: start.map(|ms| t0 + Duration::from_millis(ms + 1)),
+            output_rows: Some(3),
+            compute: Some(Duration::from_millis(1)),
+            spilled_bytes: None,
+        };
+        let q = QueryLog {
+            operators: vec![
+                op("ProjectionExec", None, None),
+                op("AggregateExec", Some(0), Some(8)),
+            ],
+            ..q
+        };
+        let s = spans(&ctx, t0, &q, 200, None);
+        let execution = s.iter().find(|s| s["name"] == "execution").unwrap();
+        let projection = s.iter().find(|s| s["name"] == "ProjectionExec").unwrap();
+        let aggregate = s.iter().find(|s| s["name"] == "AggregateExec").unwrap();
+        assert_eq!(projection["parentSpanId"], execution["spanId"]);
+        assert_eq!(aggregate["parentSpanId"], projection["spanId"]);
+        assert_eq!(
+            projection["startTimeUnixNano"],
+            execution["startTimeUnixNano"]
+        );
+        assert_eq!(projection["endTimeUnixNano"], execution["endTimeUnixNano"]);
+        assert_eq!(aggregate["startTimeUnixNano"], "1008000000");
+        let attrs = aggregate["attributes"].to_string();
+        assert!(
+            attrs.contains("plimsoll.output_rows") && attrs.contains("AggregateExec: detail"),
+            "{attrs}"
+        );
     }
 
     #[tokio::test]

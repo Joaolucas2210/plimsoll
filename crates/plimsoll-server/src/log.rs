@@ -70,6 +70,8 @@ pub struct QueryLog {
     pub traceparent: Option<String>,
     /// Planning events for the trace (ADR 0056); not logged.
     pub plan_events: Vec<plimsoll_core::plan_trace::PlanEvent>,
+    /// Executed plan nodes for the trace (ADR 0071); not logged.
+    pub operators: Vec<plimsoll_core::plan_trace::OperatorSpan>,
     pub queue: Option<Duration>,
     pub planning: Option<Duration>,
     pub execution: Option<Duration>,

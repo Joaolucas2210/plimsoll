@@ -23,7 +23,7 @@ use plimsoll_core::datafusion::object_store::Error as ObjectStoreError;
 use plimsoll_core::datafusion::parquet::errors::ParquetError;
 use plimsoll_core::datafusion::physical_plan::streaming::PartitionStream;
 use plimsoll_core::engine::{AccessDenied, Engine, QueryResult, QueryTag, TableRead};
-use plimsoll_core::plan_trace::{self, PlanEvent};
+use plimsoll_core::plan_trace::{self, OperatorSpan, PlanEvent};
 
 use crate::auth::Viewer;
 use plimsoll_core::memory::{ConsumerKind, Reservation};
@@ -41,6 +41,8 @@ pub struct QueryOutput {
     pub reads: Vec<TableRead>,
     /// Catalog loads and connector planning, for the trace (ADR 0056).
     pub plan_events: Vec<PlanEvent>,
+    /// Executed plan nodes, for execution spans (ADR 0071).
+    pub operators: Vec<OperatorSpan>,
 }
 
 /// Where a successful query spent its time (the admission queue is timed by
@@ -62,6 +64,7 @@ impl QueryOutput {
             phases: Phases::default(),
             reads: Vec::new(),
             plan_events: Vec::new(),
+            operators: Vec::new(),
         }
     }
 }
@@ -123,6 +126,8 @@ pub struct Streamed {
     pub reads: Vec<TableRead>,
     /// Catalog loads and connector planning, for the trace (ADR 0056).
     pub plan_events: Vec<PlanEvent>,
+    /// Executed plan nodes, for execution spans (ADR 0071).
+    pub operators: Vec<OperatorSpan>,
 }
 
 /// The receiver is gone (client disconnected). The caller cancels the query
@@ -148,7 +153,7 @@ pub trait QueryEngine: Send + Sync {
         &self,
         _fragment: Fragment,
         _build: Option<Build>,
-    ) -> Result<SendableRecordBatchStream, EngineError> {
+    ) -> Result<Running, EngineError> {
         Err(EngineError::Unsupported("scan fragments".into()))
     }
 
@@ -160,7 +165,7 @@ pub trait QueryEngine: Send + Sync {
         _reduce: Reduce,
         _token: &str,
         _tag: Option<Arc<QueryTag>>,
-    ) -> Result<SendableRecordBatchStream, EngineError> {
+    ) -> Result<Running, EngineError> {
         Err(EngineError::Unsupported("shuffle reduces".into()))
     }
 
@@ -198,6 +203,7 @@ pub trait QueryEngine: Send + Sync {
             phases: out.phases,
             reads: out.reads,
             plan_events: out.plan_events,
+            operators: out.operators,
         })
     }
 }
@@ -227,6 +233,31 @@ fn each_row(
 }
 
 pub struct CoreEngine(pub Arc<Engine>);
+
+/// A worker task's output, and the plan producing it when there is one,
+/// for its operator spans (ADR 0071).
+pub struct Running {
+    pub stream: SendableRecordBatchStream,
+    pub plan: Option<Arc<dyn plimsoll_core::datafusion::physical_plan::ExecutionPlan>>,
+}
+
+impl From<SendableRecordBatchStream> for Running {
+    fn from(stream: SendableRecordBatchStream) -> Self {
+        Self { stream, plan: None }
+    }
+}
+
+/// Plans and runs `df`, keeping the plan for its metrics.
+async fn run(df: plimsoll_core::datafusion::prelude::DataFrame) -> Result<Running, EngineError> {
+    let task = Arc::new(df.task_ctx());
+    let plan = df.create_physical_plan().await.map_err(|e| classify(&e))?;
+    let stream = plimsoll_core::datafusion::physical_plan::execute_stream(plan.clone(), task)
+        .map_err(|e| classify(&e))?;
+    Ok(Running {
+        stream,
+        plan: Some(plan),
+    })
+}
 
 /// A broadcast join's build side: schema and batches.
 pub type Build = (
@@ -601,11 +632,7 @@ impl CoreEngine {
 
 #[async_trait]
 impl QueryEngine for CoreEngine {
-    async fn fragment(
-        &self,
-        f: Fragment,
-        build: Option<Build>,
-    ) -> Result<SendableRecordBatchStream, EngineError> {
+    async fn fragment(&self, f: Fragment, build: Option<Build>) -> Result<Running, EngineError> {
         let fail = |e: DataFusionError| classify(&e);
         let state = self.0.context().state();
         let connector = IcebergConnector::fragment(
@@ -677,8 +704,8 @@ impl QueryEngine for CoreEngine {
             df = broadcast_join(&ctx, b, schema, batches, df)?;
         }
         match f.bucket {
-            Some(bucket) => self.map_bucket(df, bucket).await,
-            None => df.execute_stream().await.map_err(fail),
+            Some(bucket) => self.map_bucket(df, bucket).await.map(Running::from),
+            None => run(df).await,
         }
     }
 
@@ -687,7 +714,7 @@ impl QueryEngine for CoreEngine {
         r: Reduce,
         token: &str,
         tag: Option<Arc<QueryTag>>,
-    ) -> Result<SendableRecordBatchStream, EngineError> {
+    ) -> Result<Running, EngineError> {
         use plimsoll_core::datafusion::common::{Column, JoinType};
         use plimsoll_core::datafusion::functions_aggregate::expr_fn::{max, min, sum};
         use plimsoll_core::datafusion::prelude::{Expr, SessionContext};
@@ -784,7 +811,7 @@ impl QueryEngine for CoreEngine {
                 left.aggregate(groups, merges).map_err(fail)?
             }
         };
-        df.execute_stream().await.map_err(fail)
+        run(df).await
     }
 
     async fn execute(
@@ -800,6 +827,7 @@ impl QueryEngine for CoreEngine {
             planning,
             execution,
             reads,
+            operators,
         } = {
             let (result, events) =
                 plan_trace::collect(self.0.sql_with(sql, params, Arc::new(viewer))).await;
@@ -849,6 +877,7 @@ impl QueryEngine for CoreEngine {
             },
             reads,
             plan_events,
+            operators,
         })
     }
 
@@ -942,6 +971,7 @@ impl QueryEngine for CoreEngine {
             rows,
             reads: std::mem::take(&mut query.reads),
             plan_events,
+            operators: query.operators(),
             phases: Phases {
                 planning,
                 // Includes time spent waiting for the reader.

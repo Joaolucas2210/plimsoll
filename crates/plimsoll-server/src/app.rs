@@ -453,6 +453,7 @@ async fn fragment(
         bytes: 0,
         error: None,
         _slot: slot,
+        plan: None,
     };
     let run = match task {
         Task::Scan(f) => st.engine.fragment(f, build).await,
@@ -470,7 +471,10 @@ async fn fragment(
         }
     };
     let stream = match run {
-        Ok(s) => s,
+        Ok(r) => {
+            report.plan = r.plan;
+            r.stream
+        }
         Err(e) => {
             let e = GovernedError::Failed(e);
             report.error = Some(e.to_string());
@@ -551,6 +555,8 @@ struct FragmentReport {
     error: Option<String>,
     /// `None` for shuffle bucket requests (ADR 0064).
     _slot: Option<plimsoll_control::governance::AdmissionSlot>,
+    /// What ran, for operator spans under this one (ADR 0071).
+    plan: Option<Arc<dyn plimsoll_core::datafusion::physical_plan::ExecutionPlan>>,
 }
 
 impl Drop for FragmentReport {
@@ -577,7 +583,7 @@ impl Drop for FragmentReport {
             }),
         );
         if let (Some(tracer), true) = (&self.st.tracer, self.ctx.sampled) {
-            tracer.record(vec![trace::server_span(
+            let mut spans = vec![trace::server_span(
                 &self.ctx,
                 "fragment",
                 self.wall,
@@ -590,7 +596,22 @@ impl Drop for FragmentReport {
                     ("plimsoll.rows", json!(self.rows)),
                 ],
                 self.error.as_deref(),
-            )]);
+            )];
+            // The worker's own operators (ADR 0071). The stream was
+            // dropped before this report, so the metrics are final.
+            if let Some(plan) = &self.plan {
+                spans.extend(trace::operator_spans(
+                    &self.ctx.trace_id,
+                    &self.ctx.span_id,
+                    &plimsoll_core::plan_trace::operators(
+                        plan,
+                        plimsoll_core::plan_trace::TRACED_OPERATORS,
+                    ),
+                    self.wall,
+                    self.wall + elapsed,
+                ));
+            }
+            tracer.record(spans);
         }
     }
 }
@@ -629,6 +650,7 @@ async fn sql(
             if let Some(s) = outcome.streamed {
                 log.reads = s.reads;
                 log.plan_events = s.plan_events;
+                log.operators = s.operators;
                 log.planning = Some(s.phases.planning);
                 log.execution = Some(s.phases.execution);
                 log.serialization = Some(s.phases.serialization);
@@ -1092,6 +1114,7 @@ async fn run_sql(
         Ok(out) => {
             log.reads = out.reads.clone();
             log.plan_events = out.plan_events.clone();
+            log.operators = out.operators.clone();
             log.planning = Some(out.phases.planning);
             log.execution = Some(out.phases.execution);
             log.serialization = Some(out.phases.serialization);

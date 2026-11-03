@@ -78,6 +78,7 @@ are allowed in place.
 | [0068](0068-streaming-shuffle-reducers.md) | Streaming shuffle reducers | Accepted | 2026-11-03 | Reducers open every bucket concurrently and return once its IPC schema arrives; each reduce side is a `StreamingTable` of one read-once partition per map (batches conformed to the first map's schema), so the merge or join consumes buckets as they arrive and owns the memory; the end-of-stream marker is still required | 0064, 0065, 0067, 0060 |
 | [0069](0069-shuffle-spill-visibility.md) | Shuffle spill and traffic visibility | Accepted | 2026-11-03 | Spilled shuffle buckets are added to `spilled_bytes` and logged as `shuffle_spill`; every worker request is classified (`scan`, `partial_aggregate`, `broadcast_probe`, `shuffle_map`, `aggregate_reduce`, `join_reduce`) in the `fragment` log and span; the spill writer's temp-directory limit is verified to bound shuffle files (correcting 0067/0068) | 0067, 0068, 0059, 0019 |
 | [0070](0070-worker-discovery-by-dns.md) | Worker discovery by DNS | Accepted | 2026-11-03 | `PLIMSOLL_WORKERS` accepts `dns+http(s)://name:port`; each health round re-resolves names into workers (new ones join unhealthy and are checked at once, vanished ones leave, a failed lookup keeps the last members), so pools scale without coordinator restarts | 0058, 0059, 0004 |
+| [0071](0071-operator-spans.md) | Execution spans per operator | Accepted | 2026-11-03 | After execution, the plan tree's DataFusion metrics (first start, last end, rows, compute, spill) become one span per operator nested as the plan under `execution`; workers return their plan with the stream and emit operator spans under their `fragment` span, so one trace spans coordinator and workers; no new dependency | 0031, 0056, 0059, 0004 |
 
 ## Reading order
 
@@ -85,7 +86,7 @@ are allowed in place.
 - Shape of the system: 0001, 0002, 0004.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
 - Federation: 0005 → 0006.
-- Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070.
+- Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046.
 
