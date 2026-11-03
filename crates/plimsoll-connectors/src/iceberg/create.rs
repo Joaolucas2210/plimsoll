@@ -18,12 +18,15 @@ pub fn create_request(
     properties: &[(String, String)],
 ) -> Result<Value, ConnectorError> {
     let unsupported = |m: String| ConnectorError::Unsupported(m);
+    // Top-level columns 1…n, then nested fields after them, as Iceberg
+    // assigns ids.
+    let mut next = schema.fields().len() as i64;
     let fields = schema
         .fields()
         .iter()
         .enumerate()
         .map(|(i, f)| {
-            let ty = iceberg_type(f.data_type()).ok_or_else(|| {
+            let ty = field_type(f.data_type(), &mut next).ok_or_else(|| {
                 unsupported(format!(
                     "column {}: type {} for Iceberg",
                     f.name(),
@@ -79,7 +82,51 @@ pub(super) fn partition_name(transform: &str, column: &str) -> String {
     }
 }
 
-/// ponytail: primitives only; nested types when the writer takes them.
+/// An Arrow type as an Iceberg type: a primitive's name, or a `struct`,
+/// `list` or `map` object (ADR 0087) whose fields, element, key and value
+/// take ids after `next`, which is left at the last id used.
+pub(super) fn field_type(t: &DataType, next: &mut i64) -> Option<Value> {
+    let mut id = || {
+        *next += 1;
+        *next
+    };
+    Some(match t {
+        DataType::Struct(fields) => {
+            // A struct's own fields first, then what they contain.
+            let ids: Vec<i64> = fields.iter().map(|_| id()).collect();
+            let fields = fields
+                .iter()
+                .zip(ids)
+                .map(|(f, id)| {
+                    Some(
+                        json!({"id": id, "name": f.name(), "required": !f.is_nullable(),
+                                "type": field_type(f.data_type(), next)?}),
+                    )
+                })
+                .collect::<Option<Vec<_>>>()?;
+            json!({"type": "struct", "fields": fields})
+        }
+        DataType::List(e) | DataType::LargeList(e) => {
+            let element_id = id();
+            json!({"type": "list", "element-id": element_id,
+                   "element-required": !e.is_nullable(),
+                   "element": field_type(e.data_type(), next)?})
+        }
+        DataType::Map(entries, _) => {
+            let DataType::Struct(kv) = entries.data_type() else {
+                return None;
+            };
+            let (key_id, value_id) = (id(), id());
+            json!({"type": "map", "key-id": key_id, "value-id": value_id,
+                   "key": field_type(kv.first()?.data_type(), next)?,
+                   "value": field_type(kv.get(1)?.data_type(), next)?,
+                   "value-required": !kv.get(1)?.is_nullable()})
+        }
+        t => Value::String(iceberg_type(t)?),
+    })
+}
+
+/// A primitive's Iceberg name. nested types when the writer takes them.
 pub(super) fn iceberg_type(t: &DataType) -> Option<String> {
     Some(match t {
         DataType::Boolean => "boolean".into(),
@@ -120,6 +167,44 @@ mod tests {
             ("day".into(), "ts".into()),
         ];
         let r = create_request("t", &schema, &partition, &[("k".into(), "v".into())]).unwrap();
+        // Nested: top-level ids first, then a struct's fields, a list's
+        // element, a map's key and value.
+        let nested = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "s",
+                DataType::Struct(
+                    vec![
+                        Field::new("a", DataType::Int32, true),
+                        Field::new("tags", DataType::new_list(DataType::Utf8, true), true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+            Field::new_map(
+                "m",
+                "entries",
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, true),
+                false,
+                true,
+            ),
+        ]);
+        let n = create_request("n", &nested, &[], &[]).unwrap();
+        assert_eq!(
+            n["schema"]["fields"][1]["type"],
+            json!({"type": "struct", "fields": [
+                {"id": 4, "name": "a", "required": false, "type": "int"},
+                {"id": 5, "name": "tags", "required": false, "type":
+                    {"type": "list", "element-id": 6, "element-required": false, "element": "string"}},
+            ]})
+        );
+        assert_eq!(
+            n["schema"]["fields"][2]["type"],
+            json!({"type": "map", "key-id": 7, "value-id": 8, "key": "string", "value": "long",
+                   "value-required": false})
+        );
         assert_eq!(
             r["schema"]["fields"][0],
             json!({"id": 1, "name": "id", "required": true, "type": "long"})
@@ -137,11 +222,7 @@ mod tests {
         assert!(create_request("t", &schema, &bad_column, &[]).is_err());
         let v3 = [("format-version".into(), "3".into())];
         assert!(create_request("t", &schema, &[], &v3).is_err());
-        let nested = Schema::new(vec![Field::new(
-            "l",
-            DataType::new_list(DataType::Int32, true),
-            true,
-        )]);
-        assert!(create_request("t", &nested, &[], &[]).is_err());
+        let unsupported = Schema::new(vec![Field::new("u", DataType::UInt64, true)]);
+        assert!(create_request("t", &unsupported, &[], &[]).is_err());
     }
 }

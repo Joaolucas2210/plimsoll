@@ -195,12 +195,14 @@ impl PhysicalExprAdapter for ById {
             let file_field = self.physical.field(i);
             let read: Arc<dyn PhysicalExpr> = Arc::new(Column::new(file_field.name(), i));
             Ok(Transformed::yes(
-                if file_field.data_type().equals_datatype(field.data_type()) {
+                if file_field.data_type() == field.data_type() {
                     read
                 } else {
-                    // Type promotion (int -> long, float -> double), or a
+                    // Type promotion (int -> long, float -> double), a
                     // struct that gained fields since the file was written
-                    // (filled with NULLs): DataFusion's struct-aware cast.
+                    // (filled with NULLs), or nested fields carrying their
+                    // field ids as metadata (ADR 0087), which the table's
+                    // types do not: DataFusion's struct-aware cast.
                     Arc::new(CastExpr::new_with_target_field(
                         read,
                         Arc::new(field.clone()),

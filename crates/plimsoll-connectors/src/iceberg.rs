@@ -1672,7 +1672,7 @@ impl IcebergTable {
         };
         Ok(write::IcebergSink {
             name: self.name.clone(),
-            schema: Arc::new(field_ids::with_field_ids(&self.schema, &self.names)),
+            schema: layout.arrow(),
             location: location.trim_end_matches('/').to_owned(),
             scoped: self.scoped.clone(),
             committer: committer.clone(),
@@ -1789,28 +1789,51 @@ fn renamed_columns(path: &str, schemas: &[&Json]) -> Result<bool, ConnectorError
 }
 
 fn arrow_schema(path: &str, schema: &Json) -> Result<Schema, ConnectorError> {
+    arrow_schema_as(path, schema, false)
+}
+
+/// [`arrow_schema`] with every field, nested ones included, carrying its
+/// Iceberg field id as Parquet field-id metadata: the schema files are
+/// written with (ADR 0075, nested: ADR 0087).
+pub(super) fn arrow_write_schema(path: &str, schema: &Json) -> Result<Schema, ConnectorError> {
+    arrow_schema_as(path, schema, true)
+}
+
+fn arrow_schema_as(path: &str, schema: &Json, ids: bool) -> Result<Schema, ConnectorError> {
     let fields = schema["fields"]
         .as_array()
         .ok_or_else(|| invalid(path, "schema without fields"))?;
     fields
         .iter()
-        .map(|f| arrow_field(path, f))
+        .map(|f| arrow_field(path, f, ids))
         .collect::<Result<Vec<_>, _>>()
         .map(Schema::new)
 }
 
+/// `field` labelled with field id `id` when `ids`.
+fn with_id(field: Field, id: &Json, ids: bool) -> Field {
+    match (ids, id.as_i64()) {
+        (true, Some(id)) => field.with_metadata(HashMap::from([(
+            datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_owned(),
+            id.to_string(),
+        )])),
+        _ => field,
+    }
+}
+
 /// A struct field (`{"id", "name", "required", "type"}`) as an Arrow field.
-fn arrow_field(path: &str, f: &Json) -> Result<Field, ConnectorError> {
+fn arrow_field(path: &str, f: &Json, ids: bool) -> Result<Field, ConnectorError> {
     let name = f["name"].as_str().unwrap_or_default();
     let required = f["required"].as_bool().unwrap_or(false);
-    Ok(Field::new(name, iceberg_type(path, &f["type"])?, !required))
+    let field = Field::new(name, iceberg_type(path, &f["type"], ids)?, !required);
+    Ok(with_id(field, &f["id"], ids))
 }
 
 /// An Iceberg type: a primitive name, or a `struct` / `list` / `map` object
 /// (ADR 0041). Child names follow the Parquet layout Iceberg writers use
 /// (`element`, `key_value` / `key` / `value`); the scan compares nested
 /// types ignoring names, so they only matter for display.
-fn iceberg_type(path: &str, ty: &Json) -> Result<DataType, ConnectorError> {
+fn iceberg_type(path: &str, ty: &Json, ids: bool) -> Result<DataType, ConnectorError> {
     if let Some(primitive) = ty.as_str() {
         return arrow_type(path, primitive);
     }
@@ -1822,24 +1845,34 @@ fn iceberg_type(path: &str, ty: &Json) -> Result<DataType, ConnectorError> {
             Ok(DataType::Struct(
                 fields
                     .iter()
-                    .map(|f| arrow_field(path, f))
+                    .map(|f| arrow_field(path, f, ids))
                     .collect::<Result<Vec<_>, _>>()?
                     .into(),
             ))
         }
         Some("list") => {
             let nullable = !ty["element-required"].as_bool().unwrap_or(false);
-            let element = iceberg_type(path, &ty["element"])?;
-            Ok(DataType::List(Arc::new(Field::new(
-                "element", element, nullable,
+            let element = iceberg_type(path, &ty["element"], ids)?;
+            Ok(DataType::List(Arc::new(with_id(
+                Field::new("element", element, nullable),
+                &ty["element-id"],
+                ids,
             ))))
         }
         Some("map") => {
-            let key = Field::new("key", iceberg_type(path, &ty["key"])?, false);
-            let value = Field::new(
-                "value",
-                iceberg_type(path, &ty["value"])?,
-                !ty["value-required"].as_bool().unwrap_or(false),
+            let key = with_id(
+                Field::new("key", iceberg_type(path, &ty["key"], ids)?, false),
+                &ty["key-id"],
+                ids,
+            );
+            let value = with_id(
+                Field::new(
+                    "value",
+                    iceberg_type(path, &ty["value"], ids)?,
+                    !ty["value-required"].as_bool().unwrap_or(false),
+                ),
+                &ty["value-id"],
+                ids,
             );
             Ok(DataType::Map(
                 Arc::new(Field::new(

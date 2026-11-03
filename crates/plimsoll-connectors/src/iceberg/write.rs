@@ -86,9 +86,12 @@ pub(super) struct Layout {
     /// `partition-specs[].fields` of the default spec, verbatim.
     spec_fields: Json,
     /// Per table column (current schema order): field id, and its type
-    /// when bounds can be recorded for it.
+    /// when bounds can be recorded for it. A nested column's id is -1: no
+    /// statistics are recorded for it (ADR 0087).
     columns: Vec<(i64, Option<Prim>)>,
     parts: Vec<Part>,
+    /// The current schema as files are written: field ids at every level.
+    arrow: SchemaRef,
 }
 
 /// One partition field of the default spec.
@@ -109,6 +112,10 @@ impl Layout {
         self.spec_id
     }
 
+    pub(super) fn arrow(&self) -> SchemaRef {
+        self.arrow.clone()
+    }
+
     /// Why `meta` cannot take an append, as an `Err`.
     pub(super) fn of(meta: &Json) -> std::result::Result<Self, String> {
         Self::of_spec(meta, meta["default-spec-id"].as_i64().unwrap_or(0))
@@ -126,16 +133,13 @@ impl Layout {
         }
         let schema = current_schema(meta).ok_or("the current schema is missing")?;
         let fields: Vec<&Json> = schema["fields"].as_array().into_iter().flatten().collect();
-        if fields.iter().any(|f| !f["type"].is_string()) {
-            return Err("INSERT into tables with nested columns is not supported yet".into());
-        }
+        let arrow =
+            Arc::new(super::arrow_write_schema("table", schema).map_err(|e| e.to_string())?);
         let columns: Vec<(i64, Option<Prim>)> = fields
             .iter()
-            .map(|f| {
-                (
-                    f["id"].as_i64().unwrap_or(-1),
-                    f["type"].as_str().and_then(Prim::from_iceberg),
-                )
+            .map(|f| match f["type"].as_str() {
+                Some(ty) => (f["id"].as_i64().unwrap_or(-1), Prim::from_iceberg(ty)),
+                None => (-1, None),
             })
             .collect();
         let spec_fields = meta["partition-specs"]
@@ -195,6 +199,7 @@ impl Layout {
             spec_fields,
             columns,
             parts,
+            arrow,
         })
     }
 }
@@ -468,9 +473,20 @@ impl IcebergSink {
         let memory = MemoryConsumer::new(format!("IcebergAppend[{}]", self.name))
             .register(context.memory_pool());
         while let Some(batch) = data.next().await {
-            // Same columns, relabelled with the table's field ids; a NULL
-            // in a required column fails here.
-            let batch = RecordBatch::try_new(self.schema.clone(), batch?.columns().to_vec())?;
+            // Same columns, relabelled with the table's field ids (nested
+            // types carry them in their child fields, hence the cast); a
+            // NULL in a required column fails here.
+            let batch = batch?;
+            let columns = batch
+                .columns()
+                .iter()
+                .zip(self.schema.fields())
+                .map(|(c, f)| match c.data_type() == f.data_type() {
+                    true => Ok(c.clone()),
+                    false => datafusion::arrow::compute::cast(c, f.data_type()),
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let batch = RecordBatch::try_new(self.schema.clone(), columns)?;
             if batch.num_rows() == 0 {
                 continue;
             }
@@ -1458,6 +1474,10 @@ fn manifest(
         let mut lower = Vec::new();
         let mut upper = Vec::new();
         for (id, prim, s) in &f.stats {
+            // A nested column: counts belong to its leaf ids, not its own.
+            if *id < 0 {
+                continue;
+            }
             values.push((*id, Avro::Long(s.values as i64)));
             nulls.push((*id, Avro::Long(s.nulls as i64)));
             let Some(prim) = prim else { continue };
@@ -2190,11 +2210,20 @@ mod tests {
                 .contains("v2")
         );
         assert!(Layout::of(&table(3, json!([]), flat())).is_err());
-        let nested = json!([{"id": 1, "name": "s", "required": false, "type": {"type": "struct", "fields": []}}]);
-        assert!(
-            Layout::of(&table(2, json!([]), nested))
-                .unwrap_err()
-                .contains("nested")
+        // Nested columns (ADR 0087): no statistics, ids on every field.
+        let nested = json!([{"id": 1, "name": "s", "required": false, "type": {"type": "struct",
+            "fields": [{"id": 2, "name": "a", "required": false, "type": "int"}]}}]);
+        let layout = Layout::of(&table(2, json!([]), nested)).unwrap();
+        assert_eq!(layout.columns, [(-1, None)]);
+        let DataType::Struct(children) = layout.arrow.field(0).data_type() else {
+            panic!()
+        };
+        assert_eq!(
+            children[0]
+                .metadata()
+                .get("PARQUET:field_id")
+                .map(String::as_str),
+            Some("2")
         );
     }
 

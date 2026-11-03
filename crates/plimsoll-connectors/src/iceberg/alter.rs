@@ -6,7 +6,7 @@ use datafusion::error::{DataFusionError, Result};
 use plimsoll_core::ddl::Alteration;
 use serde_json::{Map, Value, json};
 
-use super::create::{iceberg_type, partition_name};
+use super::create::{field_type, iceberg_type, partition_name};
 use crate::ConnectorError;
 
 /// The requirements and updates applying `changes`, in order, to the
@@ -88,16 +88,16 @@ pub fn alter_updates(
                     }
                     return plan(format!("column {} already exists", field.name()));
                 }
-                let Some(ty) = iceberg_type(field.data_type()) else {
+                last += 1;
+                let id = last;
+                let Some(ty) = field_type(field.data_type(), &mut last) else {
                     return plan(format!(
                         "column {}: type {} for Iceberg",
                         field.name(),
                         field.data_type()
                     ));
                 };
-                last += 1;
-                fields
-                    .push(json!({"id": last, "name": field.name(), "required": false, "type": ty}));
+                fields.push(json!({"id": id, "name": field.name(), "required": false, "type": ty}));
             }
             Alteration::DropColumn { name, if_exists } => {
                 let Some(i) = pos(&fields, name) else {

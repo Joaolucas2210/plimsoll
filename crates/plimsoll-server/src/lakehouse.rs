@@ -933,7 +933,39 @@ mod tests {
             assert!(fifty.contains("| 2 |"), "{fifty}");
         })
         .await;
-        for t in [name, parted] {
+        // Nested columns (ADR 0087): created, written, updated and merged
+        // through SQL; every nested field written with its field id, so
+        // the files read back by id.
+        let nested = format!("{name}_n");
+        Box::pin(async {
+            let n = format!("bronze.{nested}");
+            text(&format!(
+                "CREATE TABLE {n} (id BIGINT NOT NULL, s STRUCT<a INT, tags ARRAY<VARCHAR>>)"
+            ))
+            .await;
+            text(&format!(
+                "INSERT INTO {n} VALUES (1, named_struct('a', 1, 'tags', make_array('x', 'y'))), \
+                 (2, NULL)"
+            ))
+            .await;
+            text(&format!(
+                "UPDATE {n} SET s = named_struct('a', 2, 'tags', make_array('z')) WHERE id = 2"
+            ))
+            .await;
+            text(&format!(
+                "MERGE INTO {n} t USING (SELECT 1 AS id) s ON t.id = s.id \
+                 WHEN MATCHED THEN DELETE"
+            ))
+            .await;
+            let rows = text(&format!(
+                "SELECT id, s['a'] AS a, s['tags'] AS tags FROM {n}"
+            ))
+            .await;
+            assert!(rows.contains("| 2  | 2 | [z]  |"), "{rows}");
+            assert!(!rows.contains("| 1  |"), "{rows}");
+        })
+        .await;
+        for t in [name, parted, nested] {
             let _ = http
                 .delete(format!("{base}/{t}?purgeRequested=true"))
                 .send()

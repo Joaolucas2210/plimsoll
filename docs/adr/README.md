@@ -94,6 +94,7 @@ are allowed in place.
 | [0084](0084-alter-table.md) | `ALTER TABLE`: schema evolution and properties | Accepted | 2026-11-03 | Add (nullable, fresh ids), drop (not partition sources or identifier fields), rename (ids kept), `DROP NOT NULL`, Iceberg promotions and `SET TBLPROPERTIES`, committed as one new current schema with schema-id and last-column-id requirements, retried on conflict; write grant plus `check_columns` on touched columns; result cache pinned by schema id too | 0083, 0040, 0044, 0038 |
 | [0085](0085-partition-evolution.md) | Partition evolution | Accepted | 2026-11-03 | `ALTER TABLE … ADD | DROP PARTITION FIELD` (Spark syntax, own small parser) makes a new default spec or reuses an existing one, field ids reused, only writable specs; position deletes go in their data file's spec (one manifest per content and spec), so DELETE/UPDATE/MERGE work on evolved tables; compaction always rewrites old-spec files into the current spec | 0084, 0076, 0077, 0078, 0055 |
 | [0086](0086-scheduled-maintenance.md) | Scheduled maintenance by table policy | Accepted | 2026-11-03 | `PLIMSOLL_MAINTENANCE_INTERVAL_MS` runs non-overlapping passes over catalog tables; tables opt in with `plimsoll.maintenance.enabled` and get compaction, expiration (Iceberg's `history.expire.*`) and optional orphan removal, each table under an admission slot as `plimsoll-maintenance`; malformed policies skip the table with a warning | 0078, 0079, 0080, 0084, 0023 |
+| [0087](0087-nested-writes.md) | Writes to nested columns | Accepted | 2026-11-03 | Files are written with `PARQUET:field_id` on every field (struct fields, list element, map key/value ids) and batches relabelled by cast; nested columns get no statistics under their own id; the id adapter casts on any type difference; `CREATE TABLE` / `ADD COLUMN` take `STRUCT` and `ARRAY` with Iceberg's id order | 0041, 0040, 0075, 0083, 0084 |
 
 ## Reading order
 
@@ -102,7 +103,7 @@ are allowed in place.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
 - Federation: 0005 → 0006.
 - Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074.
-- Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084 → 0085 → 0086.
+- Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084 → 0085 → 0086 → 0087.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046.
 

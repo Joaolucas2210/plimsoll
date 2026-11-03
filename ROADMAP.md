@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Writes to nested columns: field ids at every level (struct fields, list elements, map keys and values), no statistics under a nested column's id; `CREATE TABLE` / `ADD COLUMN` with `STRUCT` and `ARRAY`; read by Spark and pyiceberg (ADR 0087)
 - [x] Scheduled maintenance: `PLIMSOLL_MAINTENANCE_INTERVAL_MS` passes over catalog tables that opt in through properties (`plimsoll.maintenance.*`, Iceberg's `history.expire.*`): compaction, expiration and optional orphan removal under admission (ADR 0086)
 - [x] Partition evolution: `ALTER TABLE … ADD | DROP PARTITION FIELD` (field ids and specs reused); position deletes written in their data file's spec, one manifest per content and spec; compaction moves old-spec files to the current spec (ADR 0085)
 - [x] `ALTER TABLE`: add, drop and rename columns, `DROP NOT NULL`, Iceberg type promotions and `SET TBLPROPERTIES`, one schema per statement with retry; renaming a denied column is denied; result cache keyed by schema too (ADR 0084)
@@ -119,15 +120,16 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Writes to nested columns** — `INSERT`, `UPDATE`, `DELETE` and `MERGE`
-on tables with struct, list and map columns (field ids for every nested
-field, nested statistics skipped), so every table Plimsoll reads it can
-also write.
+**Nested field evolution** — resolve nested fields by id in the scan,
+so tables whose nested fields another engine renamed, moved or re-added
+read (and write) instead of being refused; then nested `ALTER TABLE`
+(`ADD COLUMN s.b`, `RENAME COLUMN s.a TO b`) and leaf statistics for
+fields inside structs.
 
 ## Missing
 
 **Lakehouse writes** (the largest gap)
-- Appends to v3 and nested columns (above); decimal partition values; data
+- Appends to v3; decimal partition values; data
   files written on workers; vectorized partition transforms.
 - `MERGE` beyond the pool (spilled source); deletion vectors for v3
   tables.
