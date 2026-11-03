@@ -1,4 +1,4 @@
-//! Snapshot expiration (ADR 0079).
+//! Snapshot expiration (ADR 0079) and orphan file removal (ADR 0080).
 //!
 //! Old snapshots keep every file they ever referenced alive. Expiring
 //! drops them from the table's metadata through the catalog
@@ -115,6 +115,7 @@ async fn reach(
     ids: &HashSet<i64>,
     env: &RuntimeEnv,
     scoped: Option<&ScopedStore>,
+    deleted_too: bool,
 ) -> Result<Reach> {
     let mut out = Reach::default();
     for snap in meta["snapshots"].as_array().into_iter().flatten() {
@@ -140,8 +141,9 @@ async fn reach(
             }
             let bytes = read_env(&path, env, scoped).await?;
             for entry in avro(&bytes)? {
-                // DELETED entries name files their snapshot removed.
-                if field(&entry, "status").and_then(long) == Some(2) {
+                // DELETED entries name files their snapshot removed: not
+                // read by it, but still named (orphan removal keeps them).
+                if !deleted_too && field(&entry, "status").and_then(long) == Some(2) {
                     continue;
                 }
                 let Some(file) = field(&entry, "data_file") else {
@@ -230,8 +232,8 @@ pub(super) async fn expire(
             .filter(|id| !gone.contains(id))
             .collect();
         let (old, live) = (
-            reach(&meta, &gone, env, scoped).await?,
-            reach(&meta, &kept, env, scoped).await?,
+            reach(&meta, &gone, env, scoped, false).await?,
+            reach(&meta, &kept, env, scoped, false).await?,
         );
 
         let lists = only(&old.lists, &live.lists);
@@ -252,6 +254,95 @@ pub(super) async fn expire(
     Err(failed(
         "the table kept changing; nothing was expired".into(),
     ))
+}
+
+/// Which files orphan removal may delete (ADR 0080).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrphanOptions {
+    /// Only files last modified before this instant (ms since the epoch):
+    /// a write in flight has files no commit references yet.
+    pub older_than_ms: i64,
+    /// List them; delete nothing.
+    pub dry_run: bool,
+}
+
+/// What orphan removal found.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Orphans {
+    /// Files listed under the table location.
+    pub scanned: usize,
+    /// Orphans found (full paths, sorted).
+    pub orphans: Vec<String>,
+    pub deleted: usize,
+}
+
+/// Files under `location` that no snapshot, manifest, statistics file or
+/// metadata references, last modified before the cutoff; deleted unless
+/// `dry_run`. The catalog's `*.metadata.json` and `version-hint.text`,
+/// and hidden files, are never candidates.
+pub(super) async fn orphans(
+    meta: &Json,
+    location: &str,
+    opts: OrphanOptions,
+    env: &RuntimeEnv,
+    scoped: Option<&ScopedStore>,
+) -> Result<Orphans> {
+    use futures::TryStreamExt;
+    let all: HashSet<i64> = meta["snapshots"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s["snapshot-id"].as_i64())
+        .collect();
+    let reached = reach(meta, &all, env, scoped, true).await?;
+    let statistics = ["statistics", "partition-statistics"]
+        .into_iter()
+        .flat_map(|key| meta[key].as_array().into_iter().flatten())
+        .filter_map(|s| s["statistics-path"].as_str().map(str::to_owned));
+    // Compared as object paths: `file:/x`, `file:///x` and `s3://b/x`
+    // spellings of one file agree there.
+    let mut referenced = HashSet::new();
+    for path in reached
+        .lists
+        .into_iter()
+        .chain(reached.manifests)
+        .chain(reached.data)
+        .chain(reached.deletes)
+        .chain(statistics)
+    {
+        referenced.insert(ListingTableUrl::parse(&path)?.prefix().clone());
+    }
+    let root = ListingTableUrl::parse(format!("{}/", location.trim_end_matches('/')))?;
+    let store = env.object_store(store_url(&root, scoped))?;
+    let base = store_url(&root, scoped);
+    let listed: Vec<_> = store
+        .list(Some(root.prefix()))
+        .try_collect()
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let mut out = Orphans {
+        scanned: listed.len(),
+        ..Orphans::default()
+    };
+    for object in listed {
+        let name = object.location.filename().unwrap_or_default();
+        let catalogs = name.ends_with(".metadata.json") || name == "version-hint.text";
+        if catalogs
+            || name.starts_with('.')
+            || object.last_modified.timestamp_millis() >= opts.older_than_ms
+            || referenced.contains(&object.location)
+        {
+            continue;
+        }
+        out.orphans
+            .push(format!("{}{}", base.as_str(), object.location));
+    }
+    out.orphans.sort();
+    if !opts.dry_run {
+        remove(&out.orphans, env, scoped).await?;
+        out.deleted = out.orphans.len();
+    }
+    Ok(out)
 }
 
 /// Deletes one object; an already-missing one is fine.

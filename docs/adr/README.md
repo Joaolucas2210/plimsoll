@@ -87,6 +87,7 @@ are allowed in place.
 | [0077](0077-delete-from-iceberg.md) | `DELETE FROM` Iceberg tables (position deletes) | Accepted | 2026-11-03 | `DELETE FROM` is allowed under the write grant; inputs with subqueries or joins are refused (DataFusion would drop their predicates); pruned data files are read whole in file order, matching positions (minus earlier deletes) are written as one position delete file per data file in a delete manifest, committed as a `delete` snapshot that retries only over concurrent appends | 0075, 0076, 0014, 0017, 0024, 0045 |
 | [0078](0078-compaction.md) | Compaction: rewrite small files and files carrying deletes | Accepted | 2026-11-03 | `POST /v1/maintenance/compact` (read + write grants, admission): per partition, files with deletes or ≥2 small files are read through the regular scan (deletes applied, fully-deleted files included) and rewritten by the partitioned writer; a `replace` snapshot marks them and their file-scoped position deletes DELETED in rewritten manifests (original Avro schema kept, sequence numbers explicit); retries only over appends; deletes now check concurrency against the planned snapshot | 0075, 0076, 0077, 0014, 0023 |
 | [0079](0079-expire-snapshots.md) | Snapshot expiration | Accepted | 2026-11-03 | `POST /v1/maintenance/expire-snapshots` (read + write grants, admission; defaults 5 days, keep 1): keeps branch and tag heads, each branch's last N and recent ancestors and recent strays; commits `remove-snapshots` with retry, then deletes manifest lists, manifests, data and delete files only expired snapshots reached (DELETED entries skipped) | 0078, 0075, 0077, 0028, 0029 |
+| [0080](0080-remove-orphan-files.md) | Orphan file removal | Accepted | 2026-11-03 | `POST /v1/maintenance/remove-orphans` (grants, admission; dry run; window default 3 days, never under 1 hour) lists the table location and deletes files no snapshot reaches (DELETED entries and statistics files count as referenced), never the catalog's metadata files or hidden files | 0079, 0075, 0024 |
 
 ## Reading order
 
@@ -95,7 +96,7 @@ are allowed in place.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
 - Federation: 0005 → 0006.
 - Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074.
-- Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079.
+- Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046.
 

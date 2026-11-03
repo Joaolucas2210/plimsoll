@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Orphan file removal: `POST /v1/maintenance/remove-orphans` (dry run, ≥1 hour window) deletes unreferenced files under the table location (ADR 0080)
 - [x] Snapshot expiration: `POST /v1/maintenance/expire-snapshots` drops old snapshots (branch and tag heads and the last N kept) through the catalog, then deletes files only they reached (ADR 0079)
 - [x] Compaction: `POST /v1/maintenance/compact` rewrites small files and files carrying deletes into a `replace` snapshot; manifests rewritten with explicit sequence numbers; read by Spark and pyiceberg, time travel intact (ADR 0078)
 - [x] `DELETE FROM … WHERE` as position delete files, skipping rows already deleted; subquery predicates refused (DataFusion would drop them); read by Spark and pyiceberg (ADR 0077)
@@ -112,19 +113,20 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Table maintenance: remove orphan files** — list the table location and
-delete files older than a safety window that no snapshot, manifest or
-metadata file references (failed writes, interrupted expirations; ADR
-0075/0079 debt).
+**Write path: `UPDATE … SET … WHERE`** — the rows a `DELETE` would find
+(ADR 0077), rewritten with the new values and appended, as one
+`overwrite` snapshot (position deletes plus data files), so updates are
+atomic; then `MERGE INTO` on the same machinery.
 
 ## Missing
 
 **Lakehouse writes** (the largest gap)
 - Appends to v3 and nested columns; decimal partition values; data
   files written on workers; vectorized partition transforms.
-- `UPDATE`/`MERGE` (a delete plus an append in one `overwrite`
-  snapshot); deletion vectors for v3 tables; deletes across partition
-  spec evolution.
+- `UPDATE` (above) and `MERGE`; deletion vectors for v3 tables;
+  deletes across partition spec evolution.
+- Scheduled maintenance (compaction, expiration, orphans) by policy
+  instead of on demand.
 - DDL: `CREATE TABLE` / schema and partition evolution through the
   catalog.
 

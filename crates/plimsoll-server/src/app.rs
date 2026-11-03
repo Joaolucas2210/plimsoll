@@ -85,6 +85,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/fragment", post(fragment))
         .route("/v1/maintenance/compact", post(compact))
         .route("/v1/maintenance/expire-snapshots", post(expire_snapshots))
+        .route("/v1/maintenance/remove-orphans", post(remove_orphans))
         .with_state(state)
 }
 
@@ -634,6 +635,28 @@ struct MaintenanceRequest {
     /// Expiration: the most recent ancestors of every branch kept
     /// regardless of age; default 1.
     retain_last: Option<usize>,
+    /// Orphan removal: list, delete nothing.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Orphan removal never touches files younger than this: a write in
+/// flight has files no commit references yet (ADR 0080).
+const ORPHAN_MIN_AGE_MS: i64 = 3_600_000;
+
+/// Its default window, as Iceberg's `deleteOrphanFiles`.
+const ORPHAN_DEFAULT_AGE_MS: i64 = 3 * 24 * 3_600_000;
+
+/// `POST /v1/maintenance/remove-orphans` (ADR 0080): deletes files under
+/// the table location that nothing references, last modified before
+/// `older_than_ms` (default 3 days ago, at most 1 hour ago); `dry_run`
+/// only lists them. As [`compact`] otherwise.
+async fn remove_orphans(
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Json<MaintenanceRequest>, JsonRejection>,
+) -> Response {
+    maintain(state, headers, body, Maintenance::RemoveOrphans).await
 }
 
 /// Table maintenance an endpoint runs.
@@ -641,6 +664,7 @@ struct MaintenanceRequest {
 enum Maintenance {
     Compact,
     ExpireSnapshots,
+    RemoveOrphans,
 }
 
 /// `POST /v1/maintenance/expire-snapshots` (ADR 0079): drops snapshots
@@ -724,6 +748,21 @@ async fn maintain(
             return ApiError::of(&e).respond(st, &e, None);
         }
     };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    if matches!(action, Maintenance::RemoveOrphans)
+        && req
+            .older_than_ms
+            .is_some_and(|t| t > now - ORPHAN_MIN_AGE_MS)
+    {
+        return ApiError::new(StatusCode::BAD_REQUEST, "invalid_request", false).respond(
+            st,
+            "`older_than_ms` must be at least 1 hour ago: younger files may belong to a write \
+             in flight",
+            None,
+        );
+    }
     let viewer = st.auth.viewer(&user);
     let (event, outcome) = match action {
         Maintenance::Compact => (
@@ -745,9 +784,6 @@ async fn maintain(
             use plimsoll_connectors::iceberg::expire::{
                 DEFAULT_MAX_AGE_MS, DEFAULT_RETAIN_LAST, ExpireOptions,
             };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis() as i64);
             let opts = ExpireOptions {
                 older_than_ms: req.older_than_ms.unwrap_or(now - DEFAULT_MAX_AGE_MS),
                 retain_last: req.retain_last.unwrap_or(DEFAULT_RETAIN_LAST).max(1),
@@ -767,6 +803,33 @@ async fn maintain(
                             "manifests_deleted": r.manifests_deleted,
                             "data_files_deleted": r.data_files_deleted,
                             "delete_files_deleted": r.delete_files_deleted,
+                        })
+                    })
+                }),
+            )
+        }
+        Maintenance::RemoveOrphans => {
+            use plimsoll_connectors::iceberg::expire::OrphanOptions;
+            let opts = OrphanOptions {
+                older_than_ms: req.older_than_ms.unwrap_or(now - ORPHAN_DEFAULT_AGE_MS),
+                dry_run: req.dry_run,
+            };
+            (
+                "orphan_removal",
+                tokio::time::timeout_at(
+                    deadline,
+                    st.engine.remove_orphans(&req.table, viewer, opts),
+                )
+                .await
+                .map(|r| {
+                    r.map(|r| {
+                        json!({
+                            "scanned": r.scanned,
+                            "orphans": r.orphans.len(),
+                            "deleted": r.deleted,
+                            "dry_run": req.dry_run,
+                            // A sample, for a dry run's review.
+                            "sample": r.orphans.iter().take(100).collect::<Vec<_>>(),
                         })
                     })
                 }),

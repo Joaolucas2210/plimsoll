@@ -179,6 +179,18 @@ pub trait QueryEngine: Send + Sync {
         Err(EngineError::Unsupported("snapshot expiration".into()))
     }
 
+    /// Finds (and unless `dry_run`, deletes) `table`'s orphan files on
+    /// behalf of `viewer`, who needs a write grant on it (ADR 0080).
+    /// Default: not supported.
+    async fn remove_orphans(
+        &self,
+        _table: &str,
+        _viewer: Viewer,
+        _opts: plimsoll_connectors::iceberg::expire::OrphanOptions,
+    ) -> Result<plimsoll_connectors::iceberg::expire::Orphans, EngineError> {
+        Err(EngineError::Unsupported("orphan file removal".into()))
+    }
+
     /// Drops this worker's maps of `shuffle` and of its retries (ADR
     /// 0073); an empty stream. Default: not a worker.
     async fn release(&self, _shuffle: &str) -> Result<Running, EngineError> {
@@ -880,6 +892,19 @@ impl QueryEngine for CoreEngine {
         // Expiring deletes history, data included: both grants.
         maintainer(ctx, table, &viewer)?;
         crate::lakehouse::expire_snapshots(ctx, table, opts)
+            .await
+            .map_err(|e| classify(&e))
+    }
+
+    async fn remove_orphans(
+        &self,
+        table: &str,
+        viewer: Viewer,
+        opts: plimsoll_connectors::iceberg::expire::OrphanOptions,
+    ) -> Result<plimsoll_connectors::iceberg::expire::Orphans, EngineError> {
+        let ctx = self.0.context();
+        maintainer(ctx, table, &viewer)?;
+        crate::lakehouse::remove_orphans(ctx, table, opts)
             .await
             .map_err(|e| classify(&e))
     }

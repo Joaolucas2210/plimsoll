@@ -237,6 +237,30 @@ impl IcebergConnector {
         .await?)
     }
 
+    /// Finds (and unless `dry_run`, deletes) files under the table
+    /// location that nothing references (ADR 0080).
+    pub async fn remove_orphans(
+        &self,
+        state: &dyn Session,
+        opts: expire::OrphanOptions,
+    ) -> Result<expire::Orphans, ConnectorError> {
+        let sink = self.table.writable("remove orphan files of")?;
+        self.table.register_scoped(state);
+        let meta = sink
+            .committer
+            .current()
+            .await
+            .map_err(|m| ConnectorError::DataFusion(DataFusionError::Execution(m)))?;
+        Ok(expire::orphans(
+            &meta,
+            &sink.location,
+            opts,
+            state.runtime_env(),
+            self.table.scoped.as_ref(),
+        )
+        .await?)
+    }
+
     /// Accept `INSERT INTO`, committing through `committer` (ADR 0075).
     pub fn with_committer(mut self, committer: Arc<dyn write::Committer>) -> Self {
         let mut table = (*self.table).clone();

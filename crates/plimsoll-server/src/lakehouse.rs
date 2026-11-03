@@ -265,6 +265,20 @@ pub async fn expire_snapshots(
         .map_err(DataFusionError::from)
 }
 
+/// Finds (and unless `dry_run`, deletes) `table`'s orphan files (ADR
+/// 0080).
+pub async fn remove_orphans(
+    ctx: &SessionContext,
+    table: &str,
+    opts: iceberg::expire::OrphanOptions,
+) -> Result<iceberg::expire::Orphans> {
+    maintained(ctx, table)
+        .await?
+        .remove_orphans(&ctx.state(), opts)
+        .await
+        .map_err(DataFusionError::from)
+}
+
 /// What a [`refresh`] saw and changed.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Refreshed {
@@ -654,6 +668,60 @@ mod tests {
         // Nothing left to expire.
         let again = expire_snapshots(engine.context(), &p, opts).await.unwrap();
         assert_eq!(again.snapshots_expired, 0);
+        // Orphan removal (ADR 0080): a file nothing references, as a
+        // failed write leaves, is found by a dry run, then deleted; every
+        // referenced file stays. (No age window here: a fresh table, and
+        // the store cannot backdate files.)
+        let location = catalog.load_table(&ident).await.unwrap().metadata["location"]
+            .as_str()
+            .unwrap()
+            .trim_end_matches('/')
+            .to_owned();
+        use plimsoll_core::datafusion::object_store::ObjectStoreExt;
+        let orphan = format!("{location}/data/failed-write-00000.parquet");
+        let url = plimsoll_core::datafusion::datasource::listing::ListingTableUrl::parse(&orphan)
+            .unwrap();
+        engine
+            .context()
+            .runtime_env()
+            .object_store(url.object_store())
+            .unwrap()
+            .put(url.prefix(), b"not a commit".to_vec().into())
+            .await
+            .unwrap();
+        let window = |dry_run| iceberg::expire::OrphanOptions {
+            older_than_ms: i64::MAX,
+            dry_run,
+        };
+        let found = remove_orphans(engine.context(), &p, window(true))
+            .await
+            .unwrap();
+        assert_eq!(found.orphans.len(), 1, "{found:?}");
+        assert!(
+            found.orphans[0].ends_with("data/failed-write-00000.parquet"),
+            "{found:?}"
+        );
+        assert_eq!(found.deleted, 0);
+        let removed = remove_orphans(engine.context(), &p, window(false))
+            .await
+            .unwrap();
+        assert_eq!(removed.deleted, 1);
+        assert!(
+            remove_orphans(engine.context(), &p, window(false))
+                .await
+                .unwrap()
+                .orphans
+                .is_empty()
+        );
+        let ids = text(&format!("SELECT id FROM {p} ORDER BY id")).await;
+        assert!(ids.contains("| 11 |"), "{ids}");
+        assert_eq!(
+            text(&format!(
+                "SELECT id FROM bronze.\"{parted}@keep\" ORDER BY id"
+            ))
+            .await,
+            tagged
+        );
         for t in [name, parted] {
             let _ = http
                 .delete(format!("{base}/{t}?purgeRequested=true"))

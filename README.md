@@ -200,6 +200,13 @@ answers `{"partitions", "files_rewritten", "files_written", "rows"}`
 tag head and the last `retain_last` of each branch, then deletes the
 files only they reached (ADR 0079).
 
+`POST /v1/maintenance/remove-orphans` with `{"table": "bronze.events",
+"dry_run": true}` lists (or, without `dry_run`, deletes) files under the
+table location that no snapshot or metadata references and that were
+last modified before `older_than_ms` (default 3 days ago; anything later
+than 1 hour ago is refused, as a write in flight may still commit them)
+(ADR 0080).
+
 ### Probes
 
 - `/livez` — process alive (never checks dependencies).
@@ -231,9 +238,9 @@ Roadmap: [ROADMAP.md](ROADMAP.md).
   formats. Open formats (Parquet, Iceberg) and open catalogs only.
 - No in-process TLS yet; deploy the query API behind a TLS-terminating
   proxy. Authentication is bearer tokens (ADR 0021).
-- Writes are `INSERT INTO`, `DELETE FROM`, compaction and snapshot
-  expiration (ADR 0075–0079): no `UPDATE`, `MERGE`, DDL or orphan file
-  removal yet. See
+- Writes are `INSERT INTO`, `DELETE FROM` and table maintenance
+  (compaction, snapshot expiration, orphan removal; ADR 0075–0080): no
+  `UPDATE`, `MERGE` or DDL yet. See
   [ROADMAP.md](ROADMAP.md).
 
 ## License
