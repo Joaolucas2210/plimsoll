@@ -343,6 +343,11 @@ pub struct Broadcast {
     pub probe_keys: Vec<String>,
     /// Output columns kept, by position in build ++ probe.
     pub projection: Option<Vec<usize>>,
+    /// A join whose build-only rows the coordinator adds (left, full,
+    /// left semi and anti, ADR 0097): the worker joins (inner, or right
+    /// for full) and returns each output row's build row index as a last
+    /// `__b_row` column; for semi and anti joins, only the indices.
+    pub matched: bool,
 }
 
 /// Which bucket of which shuffle map a reducing worker asks for.
@@ -554,6 +559,7 @@ impl Fragment {
                 "build_keys": b.build_keys,
                 "probe_keys": b.probe_keys,
                 "projection": b.projection,
+                "matched": b.matched,
             })),
             "write": self.write.as_ref().map(WriteTo::to_json),
             "change": self.change.as_ref().map(|c| json!({"predicate": c.predicate, "update": c.update})),
@@ -640,6 +646,7 @@ impl Fragment {
                     build_keys: names(&b["build_keys"], "broadcast.build_keys")?,
                     probe_keys: names(&b["probe_keys"], "broadcast.probe_keys")?,
                     projection: projection(&b["projection"], "broadcast.projection")?,
+                    matched: b["matched"].as_bool().unwrap_or(false),
                 }),
             },
             bucket: match &v["bucket"] {
@@ -1172,6 +1179,235 @@ impl ExecutionPlan for RemoteBroadcastExec {
     }
 }
 
+/// A left, full, left semi or anti broadcast join (ADR 0097): one output
+/// partition. Every probe fragment runs at once on its worker against the
+/// build side, returning its joined rows (left, full) and which build rows
+/// matched; once all are done, the build rows the join type keeps on
+/// their own follow: the unmatched ones (left, full: with NULLs for the
+/// probe side; anti), or the matched ones (semi).
+#[derive(Debug)]
+pub struct RemoteGatheredJoinExec {
+    build: Arc<dyn ExecutionPlan>,
+    probe: Arc<RemoteScanExec>,
+    join_type: datafusion::common::JoinType,
+    schema: SchemaRef,
+    /// The probe side's schema, for the NULLs of build-only rows.
+    probe_schema: SchemaRef,
+    projection: Option<Vec<usize>>,
+    properties: Arc<PlanProperties>,
+}
+
+impl RemoteGatheredJoinExec {
+    fn new(
+        build: Arc<dyn ExecutionPlan>,
+        probe: Arc<RemoteScanExec>,
+        join_type: datafusion::common::JoinType,
+        schema: SchemaRef,
+        probe_schema: SchemaRef,
+        projection: Option<Vec<usize>>,
+    ) -> Self {
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Self {
+            build,
+            probe,
+            join_type,
+            schema,
+            probe_schema,
+            projection,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for RemoteGatheredJoinExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "RemoteBroadcastExec: {} join fragments={} gathered",
+            self.join_type,
+            self.probe.fragments.len()
+        )
+    }
+}
+
+impl ExecutionPlan for RemoteGatheredJoinExec {
+    fn name(&self) -> &str {
+        "RemoteGatheredJoinExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.build]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> Result<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let Some(build) = children.pop() else {
+            return Err(DataFusionError::Internal(
+                "broadcast join needs its build side".into(),
+            ));
+        };
+        Ok(Arc::new(Self::new(
+            build,
+            self.probe.clone(),
+            self.join_type,
+            self.schema.clone(),
+            self.probe_schema.clone(),
+            self.projection.clone(),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        ctx: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::UInt64Type;
+        use datafusion::common::JoinType;
+        use futures::TryStreamExt;
+        if partition != 0 {
+            return Err(DataFusionError::Internal(format!(
+                "a gathered broadcast join has one partition, not {partition}"
+            )));
+        }
+        let tag = ctx.session_config().get_extension::<QueryTag>();
+        let (build, probe, schema) = (self.build.clone(), self.probe.clone(), self.schema.clone());
+        let (join_type, probe_schema, projection) = (
+            self.join_type,
+            self.probe_schema.clone(),
+            self.projection.clone(),
+        );
+        let out = schema.clone();
+        let body = stream::once(async move {
+            let build_schema = build.schema();
+            let batches = datafusion::physical_plan::collect(build, ctx.clone()).await?;
+            let rows = datafusion::arrow::compute::concat_batches(&build_schema, &batches)?;
+            drop(batches);
+            let mut writer =
+                datafusion::arrow::ipc::writer::StreamWriter::try_new(Vec::new(), &build_schema)?;
+            writer.write(&rows)?;
+            writer.finish()?;
+            let bytes = Bytes::from(writer.into_inner()?);
+            let memory = datafusion::execution::memory_pool::MemoryConsumer::new("broadcast-build")
+                .register(ctx.memory_pool());
+            memory.try_grow(bytes.len() + rows.get_array_memory_size())?;
+            let marks = Arc::new(std::sync::Mutex::new(vec![false; rows.num_rows()]));
+            let joined_rows = matches!(join_type, JoinType::Left | JoinType::Full);
+            let fragments = (0..probe.fragments.len())
+                .map(|p| probe.fragment_stream(p, tag.clone(), Some(bytes.clone())));
+            let seen = marks.clone();
+            let schema = out.clone();
+            let joined = stream::select_all(fragments).try_filter_map(move |batch| {
+                let last = batch.num_columns().saturating_sub(1);
+                let indices = batch.column(last).as_primitive::<UInt64Type>().clone();
+                {
+                    let mut marks = seen.lock().unwrap_or_else(|e| e.into_inner());
+                    for i in indices.iter().flatten() {
+                        if let Some(m) = usize::try_from(i).ok().and_then(|i| marks.get_mut(i)) {
+                            *m = true;
+                        }
+                    }
+                }
+                let kept = joined_rows
+                    .then(|| RecordBatch::try_new(schema.clone(), batch.columns()[..last].to_vec()))
+                    .transpose()
+                    .map_err(DataFusionError::from);
+                futures::future::ready(kept)
+            });
+            let tail = stream::once(async move {
+                let _memory = memory;
+                let marks = marks.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                build_only(
+                    &rows,
+                    &marks,
+                    join_type,
+                    &probe_schema,
+                    projection.as_deref(),
+                    &out,
+                )
+            });
+            Ok::<_, DataFusionError>(joined.chain(tail))
+        })
+        .try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema.clone(),
+            body,
+        )))
+    }
+}
+
+/// The rows a gathered join adds from its build side alone (ADR 0097):
+/// matched rows for a semi join; unmatched ones otherwise, with NULLs for
+/// the probe side's columns in a left or full join.
+fn build_only(
+    rows: &RecordBatch,
+    marks: &[bool],
+    join_type: datafusion::common::JoinType,
+    probe: &SchemaRef,
+    projection: Option<&[usize]>,
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    use datafusion::arrow::array::{UInt32Array, new_null_array};
+    use datafusion::common::JoinType;
+    let keep = join_type == JoinType::LeftSemi;
+    let picked: Vec<u32> = (0..marks.len())
+        .filter(|i| marks[*i] == keep)
+        .map(|i| i as u32)
+        .collect();
+    let indices = UInt32Array::from(picked);
+    let mut columns = rows
+        .columns()
+        .iter()
+        .map(|c| datafusion::arrow::compute::take(c.as_ref(), &indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if matches!(join_type, JoinType::Left | JoinType::Full) {
+        columns.extend(
+            probe
+                .fields()
+                .iter()
+                .map(|f| new_null_array(f.data_type(), indices.len())),
+        );
+    }
+    let columns = match projection {
+        Some(p) => p
+            .iter()
+            .map(|&i| columns.get(i).cloned())
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| DataFusionError::Internal("join projection out of range".into()))?,
+        None => columns,
+    };
+    let columns = columns
+        .iter()
+        .zip(schema.fields())
+        .map(|(c, f)| datafusion::arrow::compute::cast(c, f.data_type()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(RecordBatch::try_new_with_options(
+        schema.clone(),
+        columns,
+        &datafusion::arrow::array::RecordBatchOptions::new().with_row_count(Some(indices.len())),
+    )?)
+}
+
 /// A unique enough shuffle id: workers key their maps by it.
 fn shuffle_id() -> String {
     use std::hash::{BuildHasher, Hasher};
@@ -1668,13 +1904,22 @@ fn broadcast_join(
     let Some(join) = node.as_ref().downcast_ref::<HashJoinExec>() else {
         return Ok(None);
     };
+    // Left, full, left semi and anti joins need every fragment's matches
+    // to know a build row's fate: the coordinator gathers them (ADR 0097).
+    // NOT IN's null-aware anti join is not one of them.
+    let gathered = matches!(
+        join.join_type(),
+        JoinType::Left | JoinType::Full | JoinType::LeftSemi | JoinType::LeftAnti
+    );
     if *join.partition_mode() != PartitionMode::CollectLeft
         || join.filter().is_some()
         || join.null_equality() != NullEquality::NullEqualsNothing
-        || !matches!(
-            join.join_type(),
-            JoinType::Inner | JoinType::Right | JoinType::RightSemi | JoinType::RightAnti
-        )
+        || join.null_aware
+        || !(gathered
+            || matches!(
+                join.join_type(),
+                JoinType::Inner | JoinType::Right | JoinType::RightSemi | JoinType::RightAnti
+            ))
     {
         return Ok(None);
     }
@@ -1712,10 +1957,34 @@ fn broadcast_join(
         build_keys,
         probe_keys,
         projection: join.projection.as_ref().map(|p| p.to_vec()),
+        matched: gathered,
     };
     // The build side is collected whole, so nothing in it depends on
     // its partitioning: it may shuffle too.
     let build = shuffle(join.left().clone(), true, config)?;
+    if gathered {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let index = Field::new("__b_row", DataType::UInt64, true);
+        let returned = if matches!(join.join_type(), JoinType::Left | JoinType::Full) {
+            let mut fields: Vec<_> = join.schema().fields().iter().cloned().collect();
+            fields.push(Arc::new(index));
+            Schema::new(fields)
+        } else {
+            Schema::new(vec![index])
+        };
+        let probe = Arc::new(probe.broadcast(spec, Arc::new(returned)));
+        return Ok(Some(Arc::new(AccountedExec::new(
+            "RemoteBroadcast",
+            Arc::new(RemoteGatheredJoinExec::new(
+                build,
+                probe,
+                *join.join_type(),
+                join.schema(),
+                join.right().schema(),
+                join.projection.as_ref().map(|p| p.to_vec()),
+            )),
+        ))));
+    }
     let probe = Arc::new(probe.broadcast(spec, join.schema()));
     Ok(Some(Arc::new(AccountedExec::new(
         "RemoteBroadcast",
@@ -2140,6 +2409,7 @@ mod tests {
                 build_keys: vec!["k".into()],
                 probe_keys: vec!["id".into()],
                 projection: None,
+                matched: true,
             }),
             write: Some(WriteTo {
                 metadata_location: "s3://b/u/metadata/v1.metadata.json".into(),

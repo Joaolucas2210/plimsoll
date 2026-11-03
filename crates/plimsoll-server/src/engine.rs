@@ -379,6 +379,21 @@ fn broadcast_join(
     use plimsoll_core::datafusion::datasource::MemTable;
     use plimsoll_core::datafusion::prelude::Expr;
     let fail = |e: DataFusionError| classify(&e);
+    let join_type: JoinType = spec.join_type.parse().map_err(fail)?;
+    // A gathered join (ADR 0097): each build row numbered, the join run as
+    // inner (right, for full), and the numbers returned for the
+    // coordinator to add the build-only rows.
+    let (schema, batches, run_as) = if spec.matched {
+        let (schema, batches) = numbered(schema, batches).map_err(fail)?;
+        let run_as = match join_type {
+            JoinType::Full => JoinType::Right,
+            _ => JoinType::Inner,
+        };
+        (schema, batches, run_as)
+    } else {
+        (schema, batches, join_type)
+    };
+    let build_width = schema.fields().len();
     let build = MemTable::try_new(schema, vec![batches])
         .and_then(|t| ctx.read_table(Arc::new(t)))
         .and_then(|df| df.alias("b"))
@@ -386,11 +401,74 @@ fn broadcast_join(
     let on = spec.build_keys.iter().zip(&spec.probe_keys).map(|(a, b)| {
         Expr::Column(Column::new(Some("b"), a)).eq(Expr::Column(Column::new(Some("p"), b)))
     });
-    let join_type: JoinType = spec.join_type.parse().map_err(fail)?;
     let df = build
-        .join_on(probe.alias("p").map_err(fail)?, join_type, on)
+        .join_on(probe.alias("p").map_err(fail)?, run_as, on)
         .map_err(fail)?;
-    project(df, spec.projection.as_deref())
+    if !spec.matched {
+        return project(df, spec.projection.as_deref());
+    }
+    let columns = df.schema().columns();
+    let index = columns.get(build_width - 1).cloned().map(Expr::Column);
+    let Some(index) = index else {
+        return Err(EngineError::InvalidQuery(
+            "gathered join without its build index".into(),
+        ));
+    };
+    if matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
+        return df
+            .select(vec![index])
+            .and_then(|df| df.distinct())
+            .map_err(fail);
+    }
+    // The join's own columns (build without its index, then probe), its
+    // projection, then the index.
+    let own: Vec<Expr> = columns
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != build_width - 1)
+        .map(|(_, c)| Expr::Column(c.clone()))
+        .collect();
+    let mut kept = match &spec.projection {
+        Some(p) => p
+            .iter()
+            .map(|&i| own.get(i).cloned())
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| EngineError::InvalidQuery("join projection out of range".into()))?,
+        None => own,
+    };
+    kept.push(index);
+    df.select(kept).map_err(fail)
+}
+
+/// `batches` with a last `__b_row` column numbering their rows from 0, in
+/// order (ADR 0097).
+fn numbered(
+    schema: plimsoll_core::datafusion::arrow::datatypes::SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<
+    (
+        plimsoll_core::datafusion::arrow::datatypes::SchemaRef,
+        Vec<RecordBatch>,
+    ),
+    DataFusionError,
+> {
+    use plimsoll_core::datafusion::arrow::array::UInt64Array;
+    use plimsoll_core::datafusion::arrow::datatypes::{DataType, Field, Schema};
+    let mut fields: Vec<_> = schema.fields().iter().cloned().collect();
+    fields.push(Arc::new(Field::new("__b_row", DataType::UInt64, false)));
+    let numbered = Arc::new(Schema::new(fields));
+    let mut next = 0u64;
+    let batches = batches
+        .into_iter()
+        .map(|b| {
+            let n = b.num_rows() as u64;
+            let mut columns = b.columns().to_vec();
+            columns.push(Arc::new(UInt64Array::from_iter_values(next..next + n)));
+            next += n;
+            Ok(RecordBatch::try_new(numbered.clone(), columns)?)
+        })
+        .collect::<Result<Vec<_>, DataFusionError>>()?;
+    Ok((numbered, batches))
 }
 
 /// `df` with only the columns at `projection`, if any (a join's own

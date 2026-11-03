@@ -361,14 +361,14 @@ async fn distributed_scans_match_local_ones() {
                 format!(
                     "SELECT a.id, b.id AS b FROM {t} a JOIN {t} b ON a.id = b.id ORDER BY a.id"
                 ),
-                true,
+                Some(true),
             ),
             (
                 format!(
                     "SELECT count(*), sum(a.id) FROM {t} a \
                      JOIN (SELECT id FROM {t} WHERE id < 5) b ON a.id = b.id"
                 ),
-                true,
+                Some(true),
             ),
             // DataFusion sorts the probe side below the join for the ORDER
             // BY; that order would not survive the workers.
@@ -377,26 +377,69 @@ async fn distributed_scans_match_local_ones() {
                     "SELECT a.id FROM {t} a JOIN (SELECT id FROM {t} WHERE id < 5) b \
                      ON a.id = b.id WHERE a.id % 2 = 0 ORDER BY a.id"
                 ),
-                false,
+                Some(false),
             ),
-            // Driven by the build side: each worker would emit build rows.
+            // Driven by the build side (ADR 0097): workers return which
+            // build rows matched, the coordinator adds the build-only rows.
             (
                 format!(
                     "SELECT id FROM {t} WHERE id IN (SELECT id FROM {t} WHERE id % 3 = 0) ORDER BY id"
                 ),
-                false,
+                Some(true),
             ),
+            (
+                format!(
+                    "SELECT a.id, b.id AS b FROM (SELECT id FROM {t} WHERE id < 8) a \
+                     LEFT JOIN (SELECT id FROM {t} WHERE id % 2 = 0) b ON a.id = b.id ORDER BY a.id"
+                ),
+                Some(true),
+            ),
+            (
+                format!(
+                    "SELECT a.id, b.id AS b FROM (SELECT id FROM {t} WHERE id < 8) a \
+                     FULL JOIN (SELECT id FROM {t} WHERE id % 2 = 0) b ON a.id = b.id \
+                     ORDER BY a.id, b"
+                ),
+                Some(true),
+            ),
+            (
+                format!(
+                    "SELECT a.id FROM (SELECT id FROM {t} WHERE id < 8) a \
+                     WHERE EXISTS (SELECT 1 FROM {t} b WHERE b.id = a.id AND b.id % 2 = 0) ORDER BY a.id"
+                ),
+                Some(true),
+            ),
+            (
+                format!(
+                    "SELECT a.id FROM (SELECT id FROM {t} WHERE id < 8) a \
+                     WHERE NOT EXISTS (SELECT 1 FROM {t} b WHERE b.id = a.id AND b.id % 2 = 0) \
+                     ORDER BY a.id"
+                ),
+                Some(true),
+            ),
+            // NOT IN is null-aware: it stays as planned.
+            (
+                format!(
+                    "SELECT id FROM {t} WHERE id NOT IN (SELECT id FROM {t} WHERE id % 3 = 0) ORDER BY id"
+                ),
+                Some(false),
+            ),
+            // Swapped by DataFusion into a left join with the smaller side
+            // collected (gathered, ADR 0097), or kept as a right join over a
+            // sorted probe side (local): either way, the same answer.
             (
                 format!(
                     "SELECT x.id, y.id AS y FROM {t} x RIGHT JOIN (SELECT id FROM {t} WHERE id > 3) y \
                      ON x.id = y.id ORDER BY y"
                 ),
-                false,
+                None,
             ),
         ] {
             let (want, _) = run(&local, &sql).await;
             let (got, plan) = run(&coordinator, &sql).await;
-            assert_eq!(plan.contains("RemoteBroadcast"), broadcast, "{sql}: {plan}");
+            if let Some(broadcast) = broadcast {
+                assert_eq!(plan.contains("RemoteBroadcast"), broadcast, "{sql}: {plan}");
+            }
             assert_eq!(got, want, "{sql}");
         }
     }
