@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Bound parameters in Flight SQL prepared statements: stateless handles carry them, `?` numbered as `$n` (ADR 0127)
 - [x] TPC-H benchmark: generator and oracle from DuckDB, 22/22 checked, SF1 2.4 s and SF10 32 s on one node under 4 GiB (ADR 0126)
 - [x] Releases from a `v*` tag: version and changelog checked, image on ghcr.io, checksummed binary, GitHub release (ADR 0125)
 - [x] Arrow Flight SQL front door: statements, prepared statements, catalog listings, handshake with the HTTP API's tokens, run through `/v1/sql` (ADR 0124)
@@ -159,9 +160,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Bound parameters in Flight SQL prepared statements** — JDBC's `?`
-and ADBC's bind: the parameter batch becomes the statement's `params`
-(ADR 0043, 0124).
+**TPC-H on a cluster** — the benchmark's tables loaded into the
+quickstart's catalog and the 22 queries run on its coordinator and
+workers, numbers next to the single-node ones (ADR 0126).
 
 ## Missing
 
@@ -198,7 +199,7 @@ and ADBC's bind: the parameter batch becomes the statement's `params`
 **Security and operations**
 - Benchmarks: TPC-H on a cluster over Iceberg; full result comparison
   (ADR 0126). Releases: arm64 images and signed
-  releases (ADR 0125). Flight SQL: bound parameters, `include_schema` table
-  listings, `DoPut` ingestion, certificate reload (ADR 0124).
+  releases (ADR 0125). Flight SQL: `include_schema` table listings, batched
+  executes, a parameter schema (ADR 0127), `DoPut` ingestion, certificate reload (ADR 0124).
 - Shuffle map spans (ADR 0120); per-kind fragment latencies (ADR
   0119); failed fragments' spill on the coordinator (ADR 0121).

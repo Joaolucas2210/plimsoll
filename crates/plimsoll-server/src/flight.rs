@@ -12,6 +12,7 @@
 
 use std::pin::Pin;
 
+use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
@@ -21,8 +22,8 @@ use arrow_flight::sql::{
     ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest,
     ActionCreatePreparedStatementResult, CommandGetCatalogs, CommandGetDbSchemas,
     CommandGetSqlInfo, CommandGetTableTypes, CommandGetTables, CommandPreparedStatementQuery,
-    CommandPreparedStatementUpdate, CommandStatementQuery, CommandStatementUpdate, ProstMessageExt,
-    SqlInfo, TicketStatementQuery,
+    CommandPreparedStatementUpdate, CommandStatementQuery, CommandStatementUpdate,
+    DoPutPreparedStatementResult, ProstMessageExt, SqlInfo, TicketStatementQuery,
 };
 use arrow_flight::{
     Action, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse,
@@ -65,8 +66,17 @@ impl Gateway {
 
     /// Posts `sql` to `/v1/sql` as the caller; a non-200 answer is its
     /// typed error as a gRPC status.
-    async fn post(&self, md: &MetadataMap, sql: &str, format: &str) -> Result<Body, Status> {
+    async fn post(
+        &self,
+        md: &MetadataMap,
+        sql: &str,
+        params: &[Value],
+        format: &str,
+    ) -> Result<Body, Status> {
         let mut body = json!({ "sql": sql, "format": format });
+        if !params.is_empty() {
+            body["params"] = json!(params);
+        }
         // Development only (`PLIMSOLL_AUTH=disabled`): the user as sent.
         for (key, field) in [
             ("x-plimsoll-user", "user"),
@@ -108,9 +118,17 @@ impl Gateway {
 
     /// The statement's result as Arrow batches, with its schema even when
     /// it has no rows.
-    async fn query(&self, md: &MetadataMap, sql: &str) -> Result<(SchemaRef, Batches), Status> {
+    async fn query(
+        &self,
+        md: &MetadataMap,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<(SchemaRef, Batches), Status> {
         let mut ipc = Ipc {
-            body: self.post(md, sql, "arrow").await?.into_data_stream(),
+            body: self
+                .post(md, sql, params, "arrow")
+                .await?
+                .into_data_stream(),
             decoder: StreamDecoder::new(),
             buf: Buffer::from_vec(Vec::<u8>::new()),
         };
@@ -135,12 +153,18 @@ impl Gateway {
     ///
     /// ponytail: plans twice per statement (here and on `DoGet`); cache by
     /// SQL and snapshot if planning shows up in latencies.
-    async fn schema(&self, md: &MetadataMap, sql: &str) -> Result<SchemaRef, Status> {
+    async fn schema(
+        &self,
+        md: &MetadataMap,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<SchemaRef, Status> {
         let probe = format!(
             "SELECT * FROM ({}) LIMIT 0",
             sql.trim().trim_end_matches(';')
         );
-        let body = match self.post(md, &probe, "arrow").await {
+        // Unbound placeholders do not plan: no schema until bound.
+        let body = match self.post(md, &probe, params, "arrow").await {
             Ok(body) => body,
             Err(s) if s.code() == tonic::Code::InvalidArgument => {
                 return Ok(Schema::empty().into());
@@ -156,8 +180,13 @@ impl Gateway {
     }
 
     /// The rows of a statement run as JSON (catalog listings, updates).
-    async fn rows(&self, md: &MetadataMap, sql: &str) -> Result<Vec<Vec<Value>>, Status> {
-        let bytes = axum::body::to_bytes(self.post(md, sql, "json").await?, 64 << 20)
+    async fn rows(
+        &self,
+        md: &MetadataMap,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<Vec<Value>>, Status> {
+        let bytes = axum::body::to_bytes(self.post(md, sql, params, "json").await?, 64 << 20)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         let v: Value =
@@ -166,8 +195,8 @@ impl Gateway {
     }
 
     /// Rows a DML statement changed; 0 for DDL.
-    async fn update(&self, md: &MetadataMap, sql: &str) -> Result<i64, Status> {
-        let rows = self.rows(md, sql).await?;
+    async fn update(&self, md: &MetadataMap, sql: &str, params: &[Value]) -> Result<i64, Status> {
+        let rows = self.rows(md, sql, params).await?;
         Ok(rows
             .first()
             .and_then(|r| r.first())
@@ -175,8 +204,13 @@ impl Gateway {
             .unwrap_or(0))
     }
 
-    async fn stream(&self, md: &MetadataMap, sql: &str) -> Result<Response<DataStream>, Status> {
-        let (schema, batches) = self.query(md, sql).await?;
+    async fn stream(
+        &self,
+        md: &MetadataMap,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Response<DataStream>, Status> {
+        let (schema, batches) = self.query(md, sql, params).await?;
         Ok(Response::new(encode(schema, batches)))
     }
 
@@ -187,6 +221,7 @@ impl Gateway {
                 md,
                 "SELECT table_catalog, table_schema, table_name, table_type \
                  FROM information_schema.tables",
+                &[],
             )
             .await?;
         Ok(rows
@@ -268,6 +303,106 @@ fn one(batch: Result<RecordBatch, impl std::fmt::Display>) -> Result<Response<Da
 
 fn sql_text(handle: &[u8]) -> Result<String, Status> {
     String::from_utf8(handle.to_vec()).map_err(|_| Status::invalid_argument("handle is not SQL"))
+}
+
+/// A prepared statement's handle: its SQL and, once bound, its
+/// parameters. Clients hand it back on every call (stateless).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Prepared {
+    sql: String,
+    #[serde(default)]
+    params: Vec<Value>,
+}
+
+impl Prepared {
+    fn decode(handle: &[u8]) -> Result<Self, Status> {
+        serde_json::from_slice(handle)
+            .map_err(|_| Status::invalid_argument("unknown statement handle"))
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, Status> {
+        serde_json::to_vec(self).map_err(|e| Status::internal(e.to_string()))
+    }
+}
+
+/// JDBC's and ODBC's `?` placeholders as `$1`, `$2`, ... in order, outside
+/// string literals, quoted identifiers and comments. DataFusion reads
+/// every bare `?` as the same parameter.
+fn numbered(sql: &str) -> String {
+    let (mut out, mut n) = (String::with_capacity(sql.len()), 0);
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' => {
+                out.push(c);
+                // A doubled quote is an escaped one: leaving and re-entering
+                // the literal copies it unchanged.
+                for d in chars.by_ref() {
+                    out.push(d);
+                    if d == c {
+                        break;
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                out.push(c);
+                for d in chars.by_ref() {
+                    out.push(d);
+                    if d == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                out.push(c);
+                let mut last = ' ';
+                for d in chars.by_ref() {
+                    out.push(d);
+                    if last == '*' && d == '/' {
+                        break;
+                    }
+                    last = d;
+                }
+            }
+            '?' => {
+                n += 1;
+                out.push_str(&format!("${n}"));
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The one row of a bound parameter batch, as `/v1/sql` takes them (ADR
+/// 0043): JSON scalars, cast there to what each placeholder needs.
+fn bound(batches: &[RecordBatch]) -> Result<Vec<Value>, Status> {
+    use plimsoll_core::datafusion::common::ScalarValue;
+    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    let Some(batch) = batches.iter().find(|b| b.num_rows() > 0) else {
+        return Ok(Vec::new());
+    };
+    if rows > 1 {
+        return Err(Status::unimplemented(
+            "one parameter row per execution (no batched executes yet)",
+        ));
+    }
+    batch
+        .columns()
+        .iter()
+        .map(|col| {
+            let v = ScalarValue::try_from_array(col, 0)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            Ok(match &v {
+                v if v.is_null() => Value::Null,
+                ScalarValue::Boolean(Some(b)) => Value::Bool(*b),
+                v if v.data_type().is_numeric() => {
+                    serde_json::from_str(&v.to_string()).unwrap_or_else(|_| json!(v.to_string()))
+                }
+                v => json!(v.to_string()),
+            })
+        })
+        .collect()
 }
 
 /// A `FlightInfo` whose one endpoint's ticket is `command`.
@@ -353,7 +488,7 @@ impl FlightSqlService for Gateway {
         query: CommandStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let schema = self.schema(request.metadata(), &query.query).await?;
+        let schema = self.schema(request.metadata(), &query.query, &[]).await?;
         let ticket = TicketStatementQuery {
             statement_handle: query.query.into_bytes().into(),
         };
@@ -366,7 +501,7 @@ impl FlightSqlService for Gateway {
         request: Request<Ticket>,
     ) -> Result<Response<DataStream>, Status> {
         let sql = sql_text(&ticket.statement_handle)?;
-        self.stream(request.metadata(), &sql).await
+        self.stream(request.metadata(), &sql, &[]).await
     }
 
     async fn do_put_statement_update(
@@ -374,7 +509,7 @@ impl FlightSqlService for Gateway {
         command: CommandStatementUpdate,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        self.update(request.metadata(), &command.query).await
+        self.update(request.metadata(), &command.query, &[]).await
     }
 
     async fn do_action_create_prepared_statement(
@@ -382,20 +517,43 @@ impl FlightSqlService for Gateway {
         query: ActionCreatePreparedStatementRequest,
         request: Request<Action>,
     ) -> Result<ActionCreatePreparedStatementResult, Status> {
-        let schema = self.schema(request.metadata(), &query.query).await?;
+        let prepared = Prepared {
+            sql: numbered(&query.query),
+            params: Vec::new(),
+        };
+        let schema = self.schema(request.metadata(), &prepared.sql, &[]).await?;
         let IpcMessage(dataset_schema) = SchemaAsIpc::new(&schema, &IpcWriteOptions::default())
             .try_into()
             .map_err(|e: plimsoll_core::datafusion::arrow::error::ArrowError| {
                 Status::internal(e.to_string())
             })?;
         Ok(ActionCreatePreparedStatementResult {
-            prepared_statement_handle: query.query.into_bytes().into(),
+            prepared_statement_handle: prepared.encode()?.into(),
             dataset_schema,
             parameter_schema: Default::default(),
         })
     }
 
-    /// Nothing to free: the handle is the SQL.
+    /// Binds a parameter row: the new handle carries it.
+    async fn do_put_prepared_statement_query(
+        &self,
+        query: CommandPreparedStatementQuery,
+        request: Request<PeekableFlightDataStream>,
+    ) -> Result<DoPutPreparedStatementResult, Status> {
+        let mut prepared = Prepared::decode(&query.prepared_statement_handle)?;
+        let batches: Vec<RecordBatch> = FlightRecordBatchStream::new_from_flight_data(
+            request.into_inner().map_err(FlightError::from),
+        )
+        .try_collect()
+        .await
+        .map_err(Status::from)?;
+        prepared.params = bound(&batches)?;
+        Ok(DoPutPreparedStatementResult {
+            prepared_statement_handle: Some(prepared.encode()?.into()),
+        })
+    }
+
+    /// Nothing to free: the handle is the statement.
     async fn do_action_close_prepared_statement(
         &self,
         _query: ActionClosePreparedStatementRequest,
@@ -409,8 +567,8 @@ impl FlightSqlService for Gateway {
         query: CommandPreparedStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let sql = sql_text(&query.prepared_statement_handle)?;
-        let schema = self.schema(request.metadata(), &sql).await?;
+        let p = Prepared::decode(&query.prepared_statement_handle)?;
+        let schema = self.schema(request.metadata(), &p.sql, &p.params).await?;
         info(&schema, query, request.into_inner())
     }
 
@@ -419,8 +577,8 @@ impl FlightSqlService for Gateway {
         query: CommandPreparedStatementQuery,
         request: Request<Ticket>,
     ) -> Result<Response<DataStream>, Status> {
-        let sql = sql_text(&query.prepared_statement_handle)?;
-        self.stream(request.metadata(), &sql).await
+        let p = Prepared::decode(&query.prepared_statement_handle)?;
+        self.stream(request.metadata(), &p.sql, &p.params).await
     }
 
     async fn do_put_prepared_statement_update(
@@ -428,8 +586,8 @@ impl FlightSqlService for Gateway {
         query: CommandPreparedStatementUpdate,
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
-        let sql = sql_text(&query.prepared_statement_handle)?;
-        self.update(request.metadata(), &sql).await
+        let p = Prepared::decode(&query.prepared_statement_handle)?;
+        self.update(request.metadata(), &p.sql, &p.params).await
     }
 
     async fn get_flight_info_sql_info(
@@ -740,6 +898,71 @@ mod tests {
         assert_eq!(basic("Bearer abc"), None);
         assert_eq!(basic("Basic !!!"), None);
         assert_eq!(basic("Basic YW5h"), None); // "ana", no colon
+    }
+
+    #[test]
+    fn question_marks_are_numbered_outside_literals_and_comments() {
+        assert_eq!(
+            numbered("SELECT * FROM t WHERE a = ? AND b IN (?, ?)"),
+            "SELECT * FROM t WHERE a = $1 AND b IN ($2, $3)"
+        );
+        assert_eq!(
+            numbered("SELECT '?', 'it''s ?', \"col?\" FROM t -- why?\nWHERE x = ? /* or ? */"),
+            "SELECT '?', 'it''s ?', \"col?\" FROM t -- why?\nWHERE x = $1 /* or ? */"
+        );
+        assert_eq!(numbered("SELECT $1"), "SELECT $1");
+    }
+
+    #[tokio::test]
+    async fn prepared_statements_bind_parameters() {
+        use plimsoll_core::datafusion::arrow::array::{ArrayRef, Int64Array as I64};
+        let mut client = serve_one().await;
+        client.handshake("ana", "t1").await.unwrap();
+        let mut prepared = client
+            .prepare(
+                "SELECT column2 AS city FROM trips WHERE column1 = ? AND column2 <> ?".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        let params = RecordBatch::try_from_iter([
+            ("0", Arc::new(I64::from(vec![1])) as ArrayRef),
+            (
+                "1",
+                Arc::new(StringArray::from(vec!["nowhere"])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        prepared.set_parameters(params).unwrap();
+        let info = prepared.execute().await.unwrap();
+        // Bound, the statement plans: its schema comes with the info.
+        assert_eq!(
+            info.clone().try_decode_schema().unwrap().field(0).name(),
+            "city"
+        );
+        let batches = fetch(&mut client, info).await.unwrap();
+        let city = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!((city.len(), city.value(0)), (1, "lisbon"));
+
+        // Updates take them too; a mismatched count is the API's error.
+        let mut update = client.prepare("SELECT ? + 1".into(), None).await.unwrap();
+        let six =
+            RecordBatch::try_from_iter([("0", Arc::new(I64::from(vec![6])) as ArrayRef)]).unwrap();
+        update.set_parameters(six).unwrap();
+        assert_eq!(update.execute_update().await.unwrap(), 7);
+        let mut two = client.prepare("SELECT ? + ?".into(), None).await.unwrap();
+        let one =
+            RecordBatch::try_from_iter([("0", Arc::new(I64::from(vec![1])) as ArrayRef)]).unwrap();
+        two.set_parameters(one).unwrap();
+        let info = two.execute().await.unwrap();
+        assert_eq!(
+            code(fetch(&mut client, info).await.unwrap_err()),
+            tonic::Code::InvalidArgument
+        );
     }
 
     #[tokio::test]
