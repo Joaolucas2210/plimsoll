@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] A web console in the server (`/ui`): catalog tree, SQL editor, bounded results, cancel; the quickstart pulls the released image (ADR 0135)
 - [x] A build cache for releases, saved by the `main` dry run and restored by tags (ADR 0134)
 - [x] A batched `INSERT … VALUES` over Flight SQL as one statement and one commit (ADR 0133)
 - [x] arm64 releases: cross-compiled on the x86_64 runner, a multi-platform image packed from the release binaries, a `workflow_dispatch` dry run (ADR 0132)

@@ -125,6 +125,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/maintenance/compact", post(compact))
         .route("/v1/maintenance/expire-snapshots", post(expire_snapshots))
         .route("/v1/maintenance/remove-orphans", post(remove_orphans))
+        // The web console (ADR 0135): static, calls the routes above.
+        .merge(crate::ui::routes())
         .with_state(state)
 }
 

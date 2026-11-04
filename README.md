@@ -86,7 +86,10 @@ workers, all on a local warehouse volume (ADR 0123):
 TOKEN=$(openssl rand -hex 32)
 export PLIMSOLL_AUTH_TOKENS="ana:sha256:$(printf %s "$TOKEN" | sha256sum | cut -d' ' -f1)"
 export PLIMSOLL_WORKER_TOKEN=$(openssl rand -hex 16)
-docker compose up -d --build --wait   # first build: ~10 min
+# The released image: log in once (a token with read:packages); without
+# it, compose builds the image here instead (~10 min).
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u <github-user> --password-stdin
+docker compose up -d --wait
 
 sql() { curl -s localhost:8080/v1/sql -H 'content-type: application/json' \
              -H "authorization: Bearer $TOKEN" -d "{\"sql\": \"$1\"}"; echo; }
@@ -96,6 +99,12 @@ sql "SELECT city, count(*) AS trips, sum(fare) AS fares FROM bronze.trips GROUP 
 
 docker compose down -v   # -v also drops the warehouse
 ```
+
+**Web console:** open http://localhost:8080 and sign in with `$TOKEN`.
+It lists the catalogs, schemas, tables and columns `ana` may read (click a
+table for its columns, double-click to query it). It runs SQL with
+Ctrl+Enter, shows up to 1,000 rows and can cancel a query (ADR 0135).
+It is part of the server, on every node's HTTP port.
 
 Any Arrow Flight SQL client connects on port 32010 (ADR 0124), with
 `ana` as the username and the token as the password: ADBC
@@ -289,7 +298,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 ## Decision records
 
 Index with status, date and the one-line decision of every ADR:
-[docs/adr/README.md](docs/adr/README.md) (0001–0134; template in
+[docs/adr/README.md](docs/adr/README.md) (0001–0135; template in
 [docs/adr/0000-template.md](docs/adr/0000-template.md)).
 
 Roadmap: [ROADMAP.md](ROADMAP.md).

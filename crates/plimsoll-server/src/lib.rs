@@ -16,3 +16,4 @@ pub mod system;
 pub mod tables;
 pub mod tls;
 pub mod trace;
+pub mod ui;

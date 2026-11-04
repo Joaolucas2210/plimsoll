@@ -8,6 +8,17 @@ variables; each such change is listed here. Decisions are in
 
 ## [Unreleased]
 
+### Added
+- A web console at `/ui` on every node: catalog tree with columns,
+  SQL editor, results grid, cancel; signs in with a token and goes
+  through `/v1/sql` (ADR 0135).
+- Flight SQL batched inserts as one statement and one commit (ADR 0133).
+- A build cache for releases (ADR 0134).
+
+### Changed
+- The quickstart pulls the released image, building it only when it
+  cannot (ADR 0135).
+
 ## [0.1.0]
 
 First release: an open lakehouse query engine on DataFusion and Iceberg

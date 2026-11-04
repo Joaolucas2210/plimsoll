@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plimsoll Console</title>
+<link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+<header>
+  <strong>Plimsoll</strong>
+  <span id="who"></span>
+  <button id="logout" hidden>Sign out</button>
+</header>
+
+<form id="login" hidden>
+  <h1>Sign in</h1>
+  <label>Token <input id="token" type="password" autocomplete="current-password" required></label>
+  <label>User <small>(only with PLIMSOLL_AUTH=disabled)</small> <input id="user" autocomplete="username"></label>
+  <button type="submit">Sign in</button>
+  <p id="login-error" class="error" role="alert"></p>
+</form>
+
+<main id="app" hidden>
+  <nav aria-label="Catalog">
+    <div class="nav-head">
+      <span>Catalog</span>
+      <button id="refresh" title="Reload the catalog">↻</button>
+    </div>
+    <input id="filter" type="search" placeholder="Filter tables" aria-label="Filter tables">
+    <ul id="tree" role="tree"></ul>
+  </nav>
+  <section>
+    <textarea id="sql" spellcheck="false" aria-label="SQL">SELECT 1 AS ok</textarea>
+    <div class="bar">
+      <button id="run">Run <kbd>Ctrl</kbd>+<kbd>Enter</kbd></button>
+      <button id="cancel" disabled>Cancel</button>
+      <span id="status" role="status"></span>
+    </div>
+    <div id="out"></div>
+  </section>
+</main>
+<script src="/ui/app.js"></script>
+</body>
+</html>

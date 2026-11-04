@@ -1,11 +1,14 @@
 # Quickstart (ADR 0123): an Iceberg REST catalog over a local warehouse
 # volume, one coordinator and two workers. Local use only: plain HTTP.
 #   export PLIMSOLL_AUTH_TOKENS=... PLIMSOLL_WORKER_TOKEN=...  (see README)
-#   docker compose up -d --build
+#   docker compose up -d --wait
+# The released image is pulled (`docker login ghcr.io` first, the package
+# is private); without it, or with `--build`, it is built here (ADR 0135).
 
 x-plimsoll: &plimsoll
+  image: ghcr.io/joaolucas2210/plimsoll:${PLIMSOLL_VERSION:-latest}
   build: .
-  image: plimsoll:local
+  pull_policy: missing
   volumes: [warehouse:/warehouse]
   environment: &env
     PLIMSOLL_AUTH_TOKENS: ${PLIMSOLL_AUTH_TOKENS:?set PLIMSOLL_AUTH_TOKENS}
