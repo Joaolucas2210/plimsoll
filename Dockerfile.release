@@ -1,0 +1,13 @@
+# Release image (ADR 0132): the binaries the release job built, one per
+# platform, packed without compiling again. `Dockerfile` builds from
+# source for the quickstart.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 1000 --create-home plimsoll
+ARG TARGETARCH
+COPY dist/${TARGETARCH}/plimsoll-server /usr/local/bin/
+USER plimsoll
+ENV PLIMSOLL_BIND=0.0.0.0:8080
+EXPOSE 8080 32010
+ENTRYPOINT ["plimsoll-server"]

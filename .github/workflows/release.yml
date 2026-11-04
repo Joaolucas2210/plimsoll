@@ -1,11 +1,14 @@
 name: release
 
-# ADR 0125: a `v*` tag publishes the binary and the image. Tags only, so
+# ADR 0125: a `v*` tag publishes the binaries and the image. Tags only, so
 # it costs nothing between releases (ADR 0011). The tag must match the
-# workspace version and have a CHANGELOG section.
+# workspace version and have a CHANGELOG section. `workflow_dispatch`
+# builds everything without publishing, to try the job before a tag
+# (ADR 0132).
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write # the GitHub release
@@ -15,60 +18,90 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # ADR 0132: arm64 cross-compiled here, at native speed.
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+  CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+  PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
   release:
-    name: binary + image
+    name: binaries + image
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
       - name: tag matches the version and the changelog
         run: |
+          # Registries take lowercase names only (the owner has capitals).
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          if [ "$PUBLISH" != true ]; then
+            echo "TAG=dry-run" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "TAG=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
           version="${GITHUB_REF_NAME#v}"
           grep -qx "version = \"$version\"" Cargo.toml || { echo "Cargo.toml is not $version" >&2; exit 1; }
           awk -v v="$version" '$0 ~ "^## \\[" v "\\]" {f=1; next} /^## \[/ {f=0} f' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
           test -s "$RUNNER_TEMP/notes.md" || { echo "CHANGELOG.md has no [$version] section" >&2; exit 1; }
-          # Registries take lowercase names only (the owner has capitals).
-          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
-      # One build: the image packs the binary built here, so the release
-      # asset and the image are the same bytes.
+      - name: toolchains
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+
+      # One build per platform: the archives and the image hold the same
+      # bytes.
+      - name: build
+        run: |
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            cargo build --release --locked -p plimsoll-server --target "$t"
+          done
+          mkdir -p dist/amd64 dist/arm64
+          cp target/x86_64-unknown-linux-gnu/release/plimsoll-server dist/amd64/
+          cp target/aarch64-unknown-linux-gnu/release/plimsoll-server dist/arm64/
+          file dist/*/plimsoll-server
+
+      - name: archives
+        run: |
+          for pair in amd64:x86_64 arm64:aarch64; do
+            name="plimsoll-server-${TAG}-${pair#*:}-linux-gnu"
+            tar czf "$name.tar.gz" -C "dist/${pair%%:*}" plimsoll-server -C "$GITHUB_WORKSPACE" LICENSE README.md
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          done
+
+      # QEMU only runs the runtime stage's apt-get for arm64; nothing is
+      # compiled under emulation.
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
+        if: env.PUBLISH == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: build and push the image
+      - name: image
         id: image
         uses: docker/build-push-action@v6
         with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: ${{ env.PUBLISH == 'true' }}
           # SBOM and build provenance attached to the image (ADR 0131).
           sbom: true
           provenance: mode=max
-          context: .
-          push: true
           tags: |
-            ${{ env.IMAGE }}:${{ github.ref_name }}
+            ${{ env.IMAGE }}:${{ env.TAG }}
             ${{ env.IMAGE }}:latest
-          labels: org.opencontainers.image.version=${{ github.ref_name }}
-
-      - name: binary from the image
-        run: |
-          image="$IMAGE:${GITHUB_REF_NAME}"
-          name="plimsoll-server-${GITHUB_REF_NAME}-x86_64-linux-gnu"
-          id=$(docker create "$image")
-          docker cp "$id:/usr/local/bin/plimsoll-server" plimsoll-server
-          docker rm "$id"
-          tar czf "$name.tar.gz" plimsoll-server LICENSE README.md
-          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          labels: org.opencontainers.image.version=${{ env.TAG }}
 
       # Keyless: the signature names this workflow and tag, logged in
       # Sigstore's transparency log; no key to keep (ADR 0131).
       - uses: sigstore/cosign-installer@v3
-      - name: sign the image and the archive
+        if: env.PUBLISH == 'true'
+      - name: sign the image and the archives
+        if: env.PUBLISH == 'true'
         run: |
           cosign sign --yes "$IMAGE@${{ steps.image.outputs.digest }}"
           for f in plimsoll-server-*.tar.gz; do
@@ -76,6 +109,7 @@ jobs:
           done
 
       - name: GitHub release
+        if: env.PUBLISH == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
