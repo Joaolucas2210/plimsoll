@@ -18,7 +18,7 @@ use plimsoll_core::engine::Engine;
 use plimsoll_core::memory::CeilingPool;
 use plimsoll_server::app::{self, AppState};
 use plimsoll_server::auth::Auth;
-use plimsoll_server::config::Config;
+use plimsoll_server::config::{AdmissionScope, Config};
 use plimsoll_server::engine::CoreEngine;
 use plimsoll_server::log::{self, Level};
 use plimsoll_server::metrics::PoolStats;
@@ -93,28 +93,50 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             ));
             let checked = peers.clone();
             // ADR 0103: the limits are the cluster's; this node's part
-            // follows the live coordinators, itself counted once.
-            let shared = cfg.cluster_admission.then(|| admission.clone());
+            // follows the live coordinators, itself counted once. ADR
+            // 0104: exactly, through the elected leader, with the parts
+            // as the fallback while it cannot be reached.
+            let shared = (cfg.admission_scope != AdmissionScope::Node).then(|| admission.clone());
+            let gate = (cfg.admission_scope == AdmissionScope::Exact).then(|| {
+                let gate = Arc::new(plimsoll_server::peers::LeaderGate::new(
+                    peers.clone(),
+                    cfg.query_timeout,
+                ));
+                admission.set_gate(gate.clone());
+                gate
+            });
             tokio::spawn(async move {
-                let mut last = 0;
+                let mut last = (0, None);
                 loop {
                     checked
                         .0
                         .check_health(std::time::Duration::from_secs(2))
                         .await;
                     if let Some(admission) = &shared {
-                        let mut nodes = checked.nodes().await;
-                        nodes.push(admission.registry().first_id());
-                        nodes.sort_unstable();
-                        nodes.dedup();
-                        if nodes.len() != last {
-                            last = nodes.len();
-                            admission.share_with(last);
+                        let me = admission.registry().first_id();
+                        let now = plimsoll_server::peers::elect(me, &checked.nodes().await);
+                        if now != last {
+                            let (coordinators, leader) = now.clone();
+                            match &gate {
+                                Some(gate) => {
+                                    // A leader holds the whole limits.
+                                    admission.share_with(match leader {
+                                        Some(_) => coordinators,
+                                        None => 1,
+                                    });
+                                    gate.follow(leader.clone());
+                                }
+                                None => admission.share_with(coordinators),
+                            }
                             log::emit(
                                 Level::Info,
                                 "admission_shared",
-                                json!({ "coordinators": last }),
+                                json!({
+                                    "coordinators": coordinators,
+                                    "leader": gate.as_ref().map(|_| leader.as_deref().unwrap_or("self")),
+                                }),
                             );
+                            last = now;
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;

@@ -132,7 +132,7 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_SLOW_QUERY_MS` | unset (off) | Queries at least this long also log a `slow_query` warn line: timings, `reads`, and each planning event (catalog loads; Iceberg files/manifests/deletes/cache hits). Never SQL text (ADR 0057) |
 | `PLIMSOLL_WORKER_TOKEN` | unset | Shared secret (≥ 16 chars, env only) between coordinator and workers; on a worker it enables `POST /v1/fragment` (ADR 0058) |
 | `PLIMSOLL_COORDINATORS` | unset | The other coordinators (URLs or `dns+http(s)://name:port`, may include this node; needs `PLIMSOLL_WORKER_TOKEN`): `system.runtime.queries` lists every coordinator's queries and `DELETE /v1/queries/{id}` reaches them (ADR 0102) |
-| `PLIMSOLL_ADMISSION_SCOPE` | `node` | `cluster`: the admission limits are the cluster's; each coordinator enforces `ceil(limit / live coordinators)`, recounted every 5 s (needs `PLIMSOLL_COORDINATORS`, ADR 0103) |
+| `PLIMSOLL_ADMISSION_SCOPE` | `node` | `cluster`: the admission limits are the cluster's; each coordinator enforces `ceil(limit / live coordinators)`, recounted every 5 s (ADR 0103). `exact`: the live coordinator with the lowest node id admits for all, slots held while its response streams; its peers fall back to `cluster` parts while it is unreachable (ADR 0104). Both need `PLIMSOLL_COORDINATORS` |
 | `PLIMSOLL_WORKERS` | unset | `http://w1:8080,http://w2:8080`: this node coordinates; Iceberg scans fan out to the workers whose `/readyz` answers (checked every 5 s; none healthy = local scan); tables with vended credentials stay local (ADR 0058, 0059). An entry `dns+http://workers.ns.svc:8080` makes every address that name resolves to (e.g. a Kubernetes headless service) a worker, re-resolved every 5 s so workers join and leave without a restart (ADR 0070). On workers, a `fragments` resource group (`PLIMSOLL_RESOURCE_GROUPS=fragments=8/16/50%`) bounds fragment concurrency and memory |
 | `PLIMSOLL_SPILL_DIR` | unset | Spill directory; unset = no spill, pressure fails the query |
 | `PLIMSOLL_PARQUET_TABLES` | unset | `bronze.trips=/data/trips/,gold.daily=/data/d.parquet` |
@@ -236,7 +236,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 ## Decision records
 
 Index with status, date and the one-line decision of every ADR:
-[docs/adr/README.md](docs/adr/README.md) (0001–0103; template in
+[docs/adr/README.md](docs/adr/README.md) (0001–0104; template in
 [docs/adr/0000-template.md](docs/adr/0000-template.md)).
 
 Roadmap: [ROADMAP.md](ROADMAP.md).
@@ -249,8 +249,8 @@ Roadmap: [ROADMAP.md](ROADMAP.md).
   authentication is bearer tokens (ADR 0021).
 - Several coordinators can share workers and the catalog behind a load
   balancer (ADR 0101), list and cancel each other's queries (ADR 0102)
-  and share admission limits (ADR 0103, rounded up per node, so not
-  exact).
+  and share admission limits (ADR 0103), exactly through an elected
+  leader if asked (ADR 0104).
 - Writes are `CREATE` (with `AS SELECT`, ADR 0090), `ALTER` (columns,
   nested fields, properties and partition fields) and `DROP TABLE`, `INSERT INTO`, `UPDATE`, `DELETE
   FROM`, `MERGE INTO` and table maintenance (compaction, snapshot

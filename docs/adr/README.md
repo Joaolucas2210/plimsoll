@@ -111,6 +111,7 @@ are allowed in place.
 | [0101](0101-several-coordinators.md) | Several coordinators | Accepted | 2026-11-03 | Query ids start at a random multiple of 2^32 below 2^53 per node, so a cancel never reaches another coordinator's query; scheduled maintenance claims each table for one interval with a conditional-write lease at `<location>/.plimsoll-maintenance`, so one coordinator maintains it per interval; admission and caches stay per node | 0034, 0058, 0074, 0086 |
 | [0102](0102-queries-across-coordinators.md) | Queries across coordinators | Accepted | 2026-11-03 | `PLIMSOLL_COORDINATORS` (seeds or `dns+`, health-checked like workers); `/v1/peer/queries` list and cancel under the worker token, never forwarded; `system.runtime.queries` merges every healthy peer's rows by id before scoping, an unreachable peer is skipped and logged; a cancel not visible locally goes to the peers with the caller's scoping | 0022, 0034, 0058, 0101 |
 | [0103](0103-cluster-admission.md) | Admission limits shared by the coordinators | Accepted | 2026-11-03 | `PLIMSOLL_ADMISSION_SCOPE=cluster`: every limit is the cluster's, each node enforces `ceil(limit / N)`; N = distinct node ids (`/v1/peer/node`, the first query id) of live peers plus itself, recounted every 5 s; queued queries start when N drops | 0023, 0101, 0102 |
+| [0104](0104-exact-cluster-admission.md) | Exact cluster admission through an elected leader | Accepted | 2026-11-03 | `PLIMSOLL_ADMISSION_SCOPE=exact`: lowest live node id leads; followers' `Gate` posts `/v1/peer/admit`, the leader's own counters decide, the slot lives while its response streams (1 byte/s, ends at the query timeout); unreachable leader → ADR 0103 parts; a new leader starts at zero | 0023, 0102, 0103 |
 
 ## Reading order
 
@@ -121,7 +122,7 @@ are allowed in place.
 - Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074 → 0091 → 0092 → 0093 → 0094 → 0097 → 0098 → 0099 → 0101 → 0102.
 - Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084 → 0085 → 0086 → 0087 → 0088 → 0089 → 0090 → 0091 → 0092 → 0093 → 0094 → 0095 → 0096.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057 → 0100.
-- Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046 → 0103.
+- Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046 → 0103 → 0104.
 
 ## Conventions
 

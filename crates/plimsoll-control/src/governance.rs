@@ -301,7 +301,8 @@ impl AdmissionConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Scope {
     Global,
     Group(String),
@@ -318,7 +319,10 @@ impl fmt::Display for Scope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// Serialized when a cluster's leader admits for another coordinator
+/// (ADR 0104).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AdmissionError {
     #[error("{scope} queue is full ({limit} queued)")]
     QueueFull { scope: Scope, limit: usize },
@@ -429,6 +433,21 @@ impl State {
 struct Inner {
     cfg: AdmissionConfig,
     state: Mutex<State>,
+    /// Where admission is decided when not here (ADR 0104).
+    gate: std::sync::OnceLock<Arc<dyn Gate>>,
+}
+
+/// What a [`Gate`] grants: the slot is held where it was granted until
+/// this is dropped.
+pub type Permit = Box<dyn std::any::Any + Send>;
+
+/// Admission decided by another node: a cluster's leader, which holds the
+/// counters for every coordinator (ADR 0104).
+#[async_trait::async_trait]
+pub trait Gate: Send + Sync {
+    /// `Ok(Some)`: admitted there. `Ok(None)`: there is nobody else to ask
+    /// (this node leads, or the leader cannot be reached): admit here.
+    async fn admit(&self, user: &str, group: &str) -> Result<Option<Permit>, AdmissionError>;
 }
 
 /// Admission controller + registry. Cheap to clone (shared state).
@@ -444,6 +463,8 @@ pub struct AdmissionSlot {
     inner: Arc<Inner>,
     user: String,
     group: String,
+    /// Granted by a [`Gate`]: released there when dropped.
+    _permit: Option<Permit>,
 }
 
 impl Drop for AdmissionSlot {
@@ -481,10 +502,25 @@ fn promote(
             inner: Arc::clone(inner),
             user: w.user,
             group: w.group,
+            _permit: None,
         };
         out.push((w.tx, slot));
     }
     out
+}
+
+/// A query counted as queued while a [`Gate`] decides; uncounted when
+/// the decision comes or the wait is dropped.
+struct Waiting<'a> {
+    inner: &'a Inner,
+    user: &'a str,
+    group: &'a str,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        lock(&self.inner.state).update(self.user, self.group, |c| c.queued -= 1);
+    }
 }
 
 /// Removes a still-queued waiter if the acquiring future is dropped
@@ -526,6 +562,7 @@ impl Admission {
             inner: Arc::new(Inner {
                 cfg,
                 state: Mutex::new(State::default()),
+                gate: std::sync::OnceLock::new(),
             }),
             registry,
         }
@@ -559,8 +596,45 @@ impl Admission {
         (st.global.running, st.global.queued)
     }
 
-    /// Waits for a running slot, or fails fast if the relevant queue is full.
+    /// Admission is asked of `gate` first from now on (ADR 0104). Set once.
+    pub fn set_gate(&self, gate: Arc<dyn Gate>) {
+        let _ = self.inner.gate.set(gate);
+    }
+
+    /// Waits for a running slot, or fails fast if the relevant queue is
+    /// full: through the gate when one is set and decides, here otherwise.
     pub async fn acquire(&self, user: &str, group: &str) -> Result<AdmissionSlot, AdmissionError> {
+        if let Some(gate) = self.inner.gate.get() {
+            // Queued here while the leader decides, for the gauges and as
+            // a count local admission sees if it has to take over.
+            let waiting = Waiting {
+                inner: &self.inner,
+                user,
+                group,
+            };
+            lock(&self.inner.state).update(user, group, |c| c.queued += 1);
+            let permit = gate.admit(user, group).await;
+            drop(waiting);
+            if let Some(permit) = permit? {
+                lock(&self.inner.state).update(user, group, |c| c.running += 1);
+                return Ok(AdmissionSlot {
+                    inner: Arc::clone(&self.inner),
+                    user: user.to_owned(),
+                    group: group.to_owned(),
+                    _permit: Some(permit),
+                });
+            }
+        }
+        self.acquire_here(user, group).await
+    }
+
+    /// [`Self::acquire`] by this node's own counters, never through the
+    /// gate: what a leader runs for other coordinators.
+    pub async fn acquire_here(
+        &self,
+        user: &str,
+        group: &str,
+    ) -> Result<AdmissionSlot, AdmissionError> {
         let (id, rx) = {
             let mut st = lock(&self.inner.state);
             if st.can_run(&self.inner.cfg, user, group) {
@@ -569,6 +643,7 @@ impl Admission {
                     inner: Arc::clone(&self.inner),
                     user: user.to_owned(),
                     group: group.to_owned(),
+                    _permit: None,
                 });
             }
             st.queue_check(&self.inner.cfg, user, group)?;
@@ -680,6 +755,64 @@ mod tests {
             resource_group: "default".into(),
             sql: "select 1".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_gate_decides_before_local_limits() {
+        // The leader's answer, by user: admitted there, refused, or "ask
+        // yourself" (no leader).
+        struct Leader(Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Gate for Leader {
+            async fn admit(&self, user: &str, _: &str) -> Result<Option<Permit>, AdmissionError> {
+                struct Held(Arc<std::sync::atomic::AtomicUsize>);
+                impl Drop for Held {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+                match user {
+                    "remote" => {
+                        self.0.fetch_add(1, Ordering::SeqCst);
+                        Ok(Some(Box::new(Held(self.0.clone()))))
+                    }
+                    "full" => Err(AdmissionError::QueueFull {
+                        scope: Scope::Global,
+                        limit: 0,
+                    }),
+                    _ => Ok(None),
+                }
+            }
+        }
+        let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let adm = admission(lim(1, 0), lim(1, 0), lim(1, 0));
+        adm.set_gate(Arc::new(Leader(held.clone())));
+        // Granted by the leader: local limits do not apply, but it counts.
+        let a = adm.acquire("remote", DEFAULT_GROUP).await.unwrap();
+        let b = adm.acquire("remote", DEFAULT_GROUP).await.unwrap();
+        assert_eq!((held.load(Ordering::SeqCst), adm.load()), (2, (2, 0)));
+        drop(a);
+        assert_eq!((held.load(Ordering::SeqCst), adm.load()), (1, (1, 0)));
+        let err = adm.acquire("full", DEFAULT_GROUP).await.err().unwrap();
+        assert!(matches!(err, AdmissionError::QueueFull { limit: 0, .. }));
+        // No leader: local limits, which see the leader's grants (1 running).
+        let err = adm.acquire("local", DEFAULT_GROUP).await.err().unwrap();
+        assert!(matches!(err, AdmissionError::QueueFull { .. }), "{err}");
+        drop(b);
+        let _c = adm.acquire("local", DEFAULT_GROUP).await.unwrap();
+        assert_eq!(adm.load(), (1, 0));
+        let json = serde_json::to_value(AdmissionError::QueueFull {
+            scope: Scope::User("ana".into()),
+            limit: 2,
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::from_value::<AdmissionError>(json).unwrap(),
+            AdmissionError::QueueFull {
+                scope: Scope::User("ana".into()),
+                limit: 2
+            }
+        );
     }
 
     #[tokio::test]

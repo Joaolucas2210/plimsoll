@@ -56,9 +56,8 @@ pub struct Config {
     /// `PLIMSOLL_COORDINATORS`: the other coordinators, as `workers` are
     /// given; this node may be among them (ADR 0102).
     pub coordinators: Vec<String>,
-    /// `PLIMSOLL_ADMISSION_SCOPE=cluster`: the admission limits are the
-    /// cluster's, shared by the live coordinators (ADR 0103).
-    pub cluster_admission: bool,
+    /// `PLIMSOLL_ADMISSION_SCOPE` (ADR 0103, 0104).
+    pub admission_scope: AdmissionScope,
     /// `PLIMSOLL_TLS_CERT` / `PLIMSOLL_TLS_KEY`: serve TLS (ADR 0099).
     pub tls: Option<crate::tls::TlsFiles>,
     /// `PLIMSOLL_TLS_CA`: a PEM bundle trusted, besides the system roots,
@@ -158,21 +157,22 @@ impl Config {
         // ADR 0102: the same shapes, and the same token between them.
         let coordinators = nodes(&lookup, "PLIMSOLL_COORDINATORS", worker_token.is_some())?;
         const SCOPE: &str = "PLIMSOLL_ADMISSION_SCOPE";
-        let cluster_admission = match lookup(SCOPE).as_deref().map(str::trim) {
-            None | Some("node") => false,
-            Some("cluster") if !coordinators.is_empty() => true,
-            Some("cluster") => {
+        let admission_scope = match lookup(SCOPE).as_deref().map(str::trim) {
+            None | Some("node") => AdmissionScope::Node,
+            Some(v @ ("cluster" | "exact")) if coordinators.is_empty() => {
                 return Err(ConfigError {
                     var: SCOPE,
-                    value: "cluster".into(),
+                    value: v.to_owned(),
                     reason: "needs PLIMSOLL_COORDINATORS",
                 });
             }
+            Some("cluster") => AdmissionScope::Cluster,
+            Some("exact") => AdmissionScope::Exact,
             Some(other) => {
                 return Err(ConfigError {
                     var: SCOPE,
                     value: other.to_owned(),
-                    reason: "expected node or cluster",
+                    reason: "expected node, cluster or exact",
                 });
             }
         };
@@ -237,7 +237,7 @@ impl Config {
             worker_token,
             workers,
             coordinators,
-            cluster_admission,
+            admission_scope,
             tls,
             tls_ca,
             broadcast_max_bytes,
@@ -358,6 +358,18 @@ fn resource_groups(lookup: &impl Fn(&str) -> Option<String>) -> Result<GroupConf
         }
     }
     Ok((groups, shares))
+}
+
+/// Whose admission limits these are (ADR 0103, 0104).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionScope {
+    /// This node's own (the default).
+    Node,
+    /// The cluster's: each live coordinator enforces `ceil(limit / N)`.
+    Cluster,
+    /// The cluster's, exactly: the leader admits for every coordinator,
+    /// and `Cluster` parts apply while it cannot be reached.
+    Exact,
 }
 
 /// `var`: node base URLs, or `dns+http(s)://name:port` entries whose
@@ -569,21 +581,21 @@ mod tests {
         );
         let e = cfg(&[token, ("PLIMSOLL_COORDINATORS", "c2:8080")]).unwrap_err();
         assert_eq!(e.var, "PLIMSOLL_COORDINATORS");
-        assert!(!c.cluster_admission);
+        assert_eq!(c.admission_scope, AdmissionScope::Node);
         let peers = ("PLIMSOLL_COORDINATORS", "http://c2:8080");
         let scope = |v| ("PLIMSOLL_ADMISSION_SCOPE", v);
-        assert!(
-            cfg(&[token, peers, scope("cluster")])
-                .unwrap()
-                .cluster_admission
-        );
-        assert!(
-            !cfg(&[token, peers, scope("node")])
-                .unwrap()
-                .cluster_admission
-        );
-        let e = cfg(&[scope("cluster")]).unwrap_err();
-        assert_eq!(e.reason, "needs PLIMSOLL_COORDINATORS");
+        for (v, want) in [
+            ("node", AdmissionScope::Node),
+            ("cluster", AdmissionScope::Cluster),
+            ("exact", AdmissionScope::Exact),
+        ] {
+            let c = cfg(&[token, peers, scope(v)]).unwrap();
+            assert_eq!(c.admission_scope, want);
+        }
+        for v in ["cluster", "exact"] {
+            let e = cfg(&[scope(v)]).unwrap_err();
+            assert_eq!(e.reason, "needs PLIMSOLL_COORDINATORS");
+        }
         assert!(cfg(&[token, peers, scope("global")]).is_err());
     }
 

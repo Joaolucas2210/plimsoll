@@ -6,13 +6,17 @@
 //! passed to the others. They answer on `/v1/peer/queries`, with the
 //! worker token, and never forward further, so the peer list may
 //! include this node itself (a `dns+` name resolving to every replica).
+//!
+//! They also count each other to share admission limits (ADR 0103), and
+//! with exact limits elect the one that admits for all (ADR 0104).
 
 use std::collections::BTreeMap;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use axum::http::StatusCode;
 use plimsoll_connectors::remote::Workers;
-use plimsoll_control::governance::{QueryId, QueryInfo};
+use plimsoll_control::governance::{AdmissionError, Gate, Permit, QueryId, QueryInfo};
 use serde_json::{Value, json};
 
 use crate::log::{self, Level};
@@ -65,9 +69,10 @@ impl Peers {
             .collect()
     }
 
-    /// The ids of the peers that answer: with this node's, every live
-    /// coordinator once (ADR 0103), whether or not the list names this one.
-    pub async fn nodes(&self) -> Vec<QueryId> {
+    /// The ids and URLs of the peers that answer: with this node's, every
+    /// live coordinator once (ADR 0103), whether or not the list names
+    /// this one.
+    pub async fn nodes(&self) -> Vec<(QueryId, String)> {
         let urls = self.0.healthy_urls();
         let calls = urls.iter().map(|url| async move {
             let r = self
@@ -80,7 +85,7 @@ impl Peers {
                 .error_for_status()
                 .ok()?;
             let body: Value = serde_json::from_slice(&r.bytes().await.ok()?).ok()?;
-            body["node"].as_u64()
+            Some((body["node"].as_u64()?, url.clone()))
         });
         futures::future::join_all(calls)
             .await
@@ -117,6 +122,91 @@ impl Peers {
             .into_iter()
             .flatten()
             .next()
+    }
+}
+
+/// The live coordinators, `me` and `peers` each counted once, and the
+/// one that admits for all under exact limits (ADR 0104): the lowest id,
+/// as a URL, or `None` when that is `me`.
+pub fn elect(me: QueryId, peers: &[(QueryId, String)]) -> (usize, Option<String>) {
+    let mut ids: Vec<QueryId> = peers.iter().map(|(id, _)| *id).chain([me]).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let leader = peers
+        .iter()
+        .filter(|(id, _)| *id < me)
+        .min_by_key(|(id, _)| *id)
+        .map(|(_, url)| url.clone());
+    (ids.len(), leader)
+}
+
+/// Exact cluster limits (ADR 0104): admission asked of the leader, whose
+/// own counters then cover every coordinator. The slot is held there for
+/// as long as the leader's response streams, so it is given back when
+/// the query ends, or when this node dies.
+#[derive(Debug)]
+pub struct LeaderGate {
+    peers: std::sync::Arc<Peers>,
+    /// The leader's URL; `None` while this node leads.
+    leader: RwLock<Option<String>>,
+    /// How long a slot may be held: the query timeout.
+    hold: Duration,
+}
+
+impl LeaderGate {
+    pub fn new(peers: std::sync::Arc<Peers>, hold: Duration) -> Self {
+        Self {
+            peers,
+            leader: RwLock::new(None),
+            hold,
+        }
+    }
+
+    /// The leader from now on, as [`elect`] found it.
+    pub fn follow(&self, leader: Option<String>) {
+        *self.leader.write().unwrap_or_else(|e| e.into_inner()) = leader;
+    }
+}
+
+#[async_trait::async_trait]
+impl Gate for LeaderGate {
+    async fn admit(&self, user: &str, group: &str) -> Result<Option<Permit>, AdmissionError> {
+        let leader = self
+            .leader
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(url) = leader else {
+            return Ok(None);
+        };
+        // No overall timeout: the wait is the leader's queue, bounded by
+        // the caller's deadline, and the body lasts as long as the query.
+        let sent = self
+            .peers
+            .0
+            .request(reqwest::Method::POST, &format!("{url}/v1/peer/admit"))
+            .header("content-type", "application/json")
+            .header("x-plimsoll-deadline-ms", self.hold.as_millis().to_string())
+            .body(json!({ "user": user, "group": group }).to_string())
+            .send()
+            .await;
+        let failure = match sent {
+            Ok(r) if r.status() == reqwest::StatusCode::OK => return Ok(Some(Box::new(r))),
+            Ok(r) if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                let body = r.bytes().await.unwrap_or_default();
+                return Err(serde_json::from_slice(&body).unwrap_or(AdmissionError::Closed));
+            }
+            Ok(r) => format!("HTTP {}", r.status()),
+            Err(e) => e.to_string(),
+        };
+        // The leader is gone or not one: this node's part decides
+        // (ADR 0103) until the next round elects another.
+        log::emit(
+            Level::Warn,
+            "admission_leader_unreachable",
+            json!({ "leader": url, "error": failure }),
+        );
+        Ok(None)
     }
 }
 
@@ -158,5 +248,21 @@ mod tests {
         let all = merge(vec![q(5, "a"), q(9, "b")], vec![q(5, "a"), q(7, "c")]);
         let ids: Vec<_> = all.iter().map(|q| q.id).collect();
         assert_eq!(ids, [5, 7, 9]);
+    }
+
+    #[test]
+    fn the_lowest_live_node_leads() {
+        let peers = |ids: &[u64]| -> Vec<(u64, String)> {
+            ids.iter()
+                .map(|id| (*id, format!("http://n{id}")))
+                .collect()
+        };
+        // Alone, or listed among its own peers: it leads, counted once.
+        assert_eq!(elect(5, &[]), (1, None));
+        assert_eq!(elect(5, &peers(&[5, 9])), (2, None));
+        assert_eq!(
+            elect(5, &peers(&[9, 3, 5, 7])),
+            (4, Some("http://n3".into()))
+        );
     }
 }

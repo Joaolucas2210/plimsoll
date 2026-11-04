@@ -86,6 +86,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/queries/{id}", delete(cancel_query))
         .route("/v1/fragment", post(fragment))
         .route("/v1/peer/node", get(peer_node))
+        .route("/v1/peer/admit", post(peer_admit))
         .route("/v1/peer/queries", get(peer_queries))
         .route("/v1/peer/queries/{id}", delete(peer_cancel))
         .route("/v1/maintenance/compact", post(compact))
@@ -395,6 +396,53 @@ async fn peer_node(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         return r;
     }
     Json(json!({ "node": st.admission.registry().first_id() })).into_response()
+}
+
+/// `POST /v1/peer/admit` (ADR 0104): `{"user", "group"}` admitted by this
+/// node's own counters (never forwarded) for another coordinator. The
+/// response comes once a slot is granted (429 with the error otherwise),
+/// and the slot is held while its body streams: one byte a second, so a
+/// closed connection fails a write and drops it, up to the deadline.
+async fn peer_admit(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(r) = node_auth(&st, &headers) {
+        return r;
+    }
+    let request: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    let (Some(user), Some(group)) = (request["user"].as_str(), request["group"].as_str()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if !st.admission.config().has_group(group) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let hold = headers
+        .get("x-plimsoll-deadline-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(st.query_timeout, |ms| {
+            Duration::from_millis(ms).min(st.query_timeout)
+        });
+    let slot = match tokio::time::timeout(hold, st.admission.acquire_here(user, group)).await {
+        Ok(Ok(slot)) => slot,
+        Ok(Err(e)) => return (StatusCode::TOO_MANY_REQUESTS, Json(e)).into_response(),
+        Err(_) => return StatusCode::GATEWAY_TIMEOUT.into_response(),
+    };
+    let until = tokio::time::Instant::now() + hold;
+    let beats = futures::stream::unfold((slot, true), move |(slot, first)| async move {
+        if !first {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        (tokio::time::Instant::now() < until).then(|| {
+            (
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"\n")),
+                (slot, false),
+            )
+        })
+    });
+    axum::body::Body::from_stream(beats).into_response()
 }
 
 /// `GET /v1/peer/queries` (ADR 0102): this node's queries, unscoped, for
@@ -2239,7 +2287,10 @@ mod tests {
             tokio::task::yield_now().await;
         }
         // ADR 0103: the peer names itself by its first query id.
-        assert_eq!(a.peers.as_ref().unwrap().nodes().await, [7 << 32 | 1]);
+        assert_eq!(
+            a.peers.as_ref().unwrap().nodes().await,
+            [(7 << 32 | 1, url.clone())]
+        );
         let listed = a.peers.as_ref().unwrap().queries().await;
         assert_eq!(listed.len(), 1);
         assert_eq!((listed[0].id, listed[0].user.as_str()), (id, "ana"));
@@ -2258,6 +2309,24 @@ mod tests {
         let (status, body) = q.await.unwrap();
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(error_code(&body), "query_cancelled");
+
+        // ADR 0104: `b` leads; `a` admits through it, and the slot is
+        // `b`'s until `a` lets go of it.
+        let gate = Arc::new(crate::peers::LeaderGate::new(
+            a.peers.clone().unwrap(),
+            Duration::from_secs(30),
+        ));
+        gate.follow(Some(url.clone()));
+        a.admission.set_gate(gate);
+        let slot = a.admission.acquire("ana", DEFAULT_GROUP).await.unwrap();
+        assert_eq!((a.admission.load(), b.admission.load()), ((1, 0), (1, 0)));
+        drop(slot);
+        let released = std::time::Instant::now();
+        while b.admission.load() != (0, 0) {
+            assert!(released.elapsed() < Duration::from_secs(10), "slot leaked");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(a.admission.load(), (0, 0));
 
         // The peer endpoints only answer the worker token.
         let (status, _) = call(router(b.clone()), get_req("/v1/peer/queries")).await;
