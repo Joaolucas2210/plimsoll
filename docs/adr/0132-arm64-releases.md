@@ -21,6 +21,11 @@ of an hour of paid minutes per release in a private repository (ADR
   - `gcc-aarch64-linux-gnu` is the linker and the C compiler ring
     needs (`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER`,
     `CC_aarch64_unknown_linux_gnu`).
+  - `libc6-dev-arm64-cross` holds arm64's libc headers. It is only a
+    "recommends" of the cross gcc, so `--no-install-recommends` drops
+    it. Without it, ring's C picked up the host's `/usr/include` and
+    failed (`bits/libc-header-start.h: No such file or directory`), as
+    the first dry run showed.
   - One `cargo build --release --locked` per target, at native speed.
 - **Pack, don't build, the image.** `Dockerfile.release` is the
   runtime stage of `Dockerfile` (Debian slim, CA roots, uid 1000, the
@@ -33,10 +38,13 @@ of an hour of paid minutes per release in a private repository (ADR
 - **Two archives per release** (`…-x86_64-linux-gnu.tar.gz`,
   `…-aarch64-linux-gnu.tar.gz`). Each is checksummed and signed, and
   holds the same binary as the image for its platform.
-- **A dry run before the first tag.** `workflow_dispatch` runs every
-  build step (both compiles, archives, the multi-platform image)
+- **A dry run before the first tag.** `workflow_dispatch` builds
   without logging in, pushing, signing or releasing (`PUBLISH` is true
   only for `v*` tags). Its tag is `dry-run`.
+  - It compiles **only aarch64** and packs only `linux/arm64`. The
+    x86_64 build is what the normal CI already proves, so the dry run
+    spends minutes only on what nothing else checks.
+  - A tag builds both (`TARGETS`, `PLATFORMS`, set by the first step).
 - The source `Dockerfile` stays as it was, for the quickstart (ADR
   0123): it builds from source on whatever machine runs it.
 
@@ -66,4 +74,9 @@ of an hour of paid minutes per release in a private repository (ADR
     as uid 1000 and answers `200` on `/readyz`.
 - Not run locally: the aarch64 cross-compile (no cross toolchain or
   root on the development machine). The `workflow_dispatch` dry run is
-  its first check, and it runs before any tag.
+  its check, and it runs before any tag.
+  - The first dry run failed on ring's C (missing arm64 libc headers);
+    `libc6-dev-arm64-cross` fixes it.
+  - The build and archive loops were run locally, with stand-in
+    binaries, for both target lists: the dry run makes only the
+    aarch64 archive, a tag makes both.

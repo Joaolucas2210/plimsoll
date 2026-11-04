@@ -36,9 +36,14 @@ jobs:
           # Registries take lowercase names only (the owner has capitals).
           echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
           if [ "$PUBLISH" != true ]; then
+            # Dry run: only what the normal CI does not prove (ADR 0132).
             echo "TAG=dry-run" >> "$GITHUB_ENV"
+            echo "TARGETS=aarch64-unknown-linux-gnu" >> "$GITHUB_ENV"
+            echo "PLATFORMS=linux/arm64" >> "$GITHUB_ENV"
             exit 0
           fi
+          echo "TARGETS=x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu" >> "$GITHUB_ENV"
+          echo "PLATFORMS=linux/amd64,linux/arm64" >> "$GITHUB_ENV"
           echo "TAG=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
           version="${GITHUB_REF_NAME#v}"
           grep -qx "version = \"$version\"" Cargo.toml || { echo "Cargo.toml is not $version" >&2; exit 1; }
@@ -47,26 +52,29 @@ jobs:
 
       - name: toolchains
         run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+          # The libc headers are only a "recommends" of the cross gcc; without
+          # them ring's C falls back to the host's headers and fails.
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross
           rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 
       # One build per platform: the archives and the image hold the same
       # bytes.
       - name: build
         run: |
-          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+          for t in $TARGETS; do
             cargo build --release --locked -p plimsoll-server --target "$t"
+            arch=$([ "$t" = aarch64-unknown-linux-gnu ] && echo arm64 || echo amd64)
+            mkdir -p "dist/$arch" && cp "target/$t/release/plimsoll-server" "dist/$arch/"
           done
-          mkdir -p dist/amd64 dist/arm64
-          cp target/x86_64-unknown-linux-gnu/release/plimsoll-server dist/amd64/
-          cp target/aarch64-unknown-linux-gnu/release/plimsoll-server dist/arm64/
           file dist/*/plimsoll-server
 
       - name: archives
         run: |
-          for pair in amd64:x86_64 arm64:aarch64; do
-            name="plimsoll-server-${TAG}-${pair#*:}-linux-gnu"
-            tar czf "$name.tar.gz" -C "dist/${pair%%:*}" plimsoll-server -C "$GITHUB_WORKSPACE" LICENSE README.md
+          for t in $TARGETS; do
+            arch=$([ "$t" = aarch64-unknown-linux-gnu ] && echo arm64 || echo amd64)
+            name="plimsoll-server-${TAG}-${t%%-*}-linux-gnu"
+            tar czf "$name.tar.gz" -C "dist/$arch" plimsoll-server -C "$GITHUB_WORKSPACE" LICENSE README.md
             sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
           done
 
@@ -86,7 +94,7 @@ jobs:
         with:
           context: .
           file: Dockerfile.release
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ env.PLATFORMS }}
           push: ${{ env.PUBLISH == 'true' }}
           # SBOM and build provenance attached to the image (ADR 0131).
           sbom: true
