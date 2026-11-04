@@ -151,6 +151,7 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_TLS_CERT` / `PLIMSOLL_TLS_KEY` | unset | PEM certificate chain and key: the node serves TLS (1.2/1.3) on its listener (API, metrics, worker fragments); the files are reloaded when they change on disk; both or neither (ADR 0099) |
 | `PLIMSOLL_TLS_CA` | unset | PEM bundle trusted (besides system roots) for `https://` workers, e.g. a private CA (ADR 0099) |
 | `PLIMSOLL_BROADCAST_MAX_BYTES` | `67108864` | Largest build side a broadcast join sends to workers (Arrow IPC bytes); a larger one is joined on the coordinator; `0` = no broadcasts (ADR 0099) |
+| `PLIMSOLL_BROADCAST_CACHE_BYTES` | `0` (off) | Collected broadcast build sides that read only pinned Iceberg snapshots kept (under the memory ceiling) and sent again instead of collected again; least recently used first out (ADR 0116) |
 
 ### SQL API
 
@@ -236,7 +237,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 ## Decision records
 
 Index with status, date and the one-line decision of every ADR:
-[docs/adr/README.md](docs/adr/README.md) (0001–0115; template in
+[docs/adr/README.md](docs/adr/README.md) (0001–0116; template in
 [docs/adr/0000-template.md](docs/adr/0000-template.md)).
 
 Roadmap: [ROADMAP.md](ROADMAP.md).

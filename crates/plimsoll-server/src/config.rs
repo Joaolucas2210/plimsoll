@@ -66,6 +66,9 @@ pub struct Config {
     /// `PLIMSOLL_BROADCAST_MAX_BYTES`: the largest build side a broadcast
     /// join sends to workers (ADR 0099); 0 = no broadcasts.
     pub broadcast_max_bytes: usize,
+    /// `PLIMSOLL_BROADCAST_CACHE_BYTES`: collected build sides of pinned
+    /// snapshots kept for reuse; 0 (the default) keeps none (ADR 0116).
+    pub broadcast_cache_bytes: usize,
 }
 
 impl Config {
@@ -139,6 +142,12 @@ impl Config {
             &lookup,
             "PLIMSOLL_BROADCAST_MAX_BYTES",
             Some(plimsoll_connectors::remote::DEFAULT_BROADCAST_LIMIT),
+            "expected a non-negative integer (bytes)",
+        )?;
+        let broadcast_cache_bytes: usize = parse(
+            &lookup,
+            "PLIMSOLL_BROADCAST_CACHE_BYTES",
+            Some(0),
             "expected a non-negative integer (bytes)",
         )?;
 
@@ -241,6 +250,7 @@ impl Config {
             tls,
             tls_ca,
             broadcast_max_bytes,
+            broadcast_cache_bytes,
         })
     }
 }
@@ -604,6 +614,10 @@ mod tests {
         let c = cfg(&[]).unwrap();
         assert_eq!(c.tls, None);
         assert_eq!(c.broadcast_max_bytes, 64 << 20);
+        assert_eq!(c.broadcast_cache_bytes, 0);
+        let c = cfg(&[("PLIMSOLL_BROADCAST_CACHE_BYTES", "33554432")]).unwrap();
+        assert_eq!(c.broadcast_cache_bytes, 32 << 20);
+        assert!(cfg(&[("PLIMSOLL_BROADCAST_CACHE_BYTES", "lots")]).is_err());
         let c = cfg(&[
             ("PLIMSOLL_TLS_CERT", "/etc/plimsoll/tls.crt"),
             ("PLIMSOLL_TLS_KEY", "/etc/plimsoll/tls.key"),

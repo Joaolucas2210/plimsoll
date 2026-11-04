@@ -70,6 +70,95 @@ pub struct Workers {
     /// The largest build side sent to workers, as Arrow IPC (ADR 0099);
     /// a larger one is joined here. 0: no broadcasts.
     broadcast_limit: usize,
+    /// Build sides already collected, by what they read (ADR 0116).
+    builds: Arc<BuildCache>,
+}
+
+/// Collected broadcast build sides, as the Arrow IPC sent to workers, by
+/// [`build_key`] (ADR 0116): a build side reading only Iceberg tables at
+/// pinned snapshots is the same rows every time. Each entry holds its own
+/// reservation in the memory pool, released when it is evicted. Oldest
+/// used first out, within `max` bytes; 0 keeps nothing.
+#[derive(Debug, Default)]
+struct BuildCache {
+    max: usize,
+    entries: std::sync::Mutex<
+        std::collections::VecDeque<(
+            String,
+            Bytes,
+            Arc<datafusion::execution::memory_pool::MemoryReservation>,
+        )>,
+    >,
+    hits: std::sync::atomic::AtomicU64,
+}
+
+impl BuildCache {
+    fn get(
+        &self,
+        key: &str,
+    ) -> Option<(
+        Bytes,
+        Arc<datafusion::execution::memory_pool::MemoryReservation>,
+    )> {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let i = entries.iter().position(|(k, _, _)| k == key)?;
+        let entry = entries.remove(i)?;
+        let found = (entry.1.clone(), entry.2.clone());
+        entries.push_back(entry);
+        self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(found)
+    }
+
+    fn put(
+        &self,
+        key: String,
+        bytes: Bytes,
+        memory: Arc<datafusion::execution::memory_pool::MemoryReservation>,
+    ) {
+        if bytes.len() > self.max {
+            return;
+        }
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.retain(|(k, _, _)| *k != key);
+        let mut held: usize = entries.iter().map(|(_, b, _)| b.len()).sum();
+        while held + bytes.len() > self.max {
+            let Some((_, evicted, _)) = entries.pop_front() else {
+                break;
+            };
+            held -= evicted.len();
+        }
+        entries.push_back((key, bytes, memory));
+    }
+}
+
+/// What a build side reads, as a cache key (ADR 0116), or `None` unless
+/// every source is an Iceberg scan pinned to a snapshot. Each node by its
+/// one-line display and output fields (filters, projections and joins
+/// all show there), except accounted scans, whose labels carry planning
+/// counters: those by their pinned table, snapshot and schema.
+fn build_key(plan: &Arc<dyn ExecutionPlan>) -> Option<String> {
+    use datafusion::physical_plan::displayable;
+    plimsoll_core::result_cache::key("", plan)?;
+    fn walk(plan: &Arc<dyn ExecutionPlan>, depth: usize, out: &mut String) {
+        use std::fmt::Write;
+        let line = match plan.as_ref().downcast_ref::<AccountedExec>() {
+            Some(a) => format!("Accounted[{}]", a.pinned().unwrap_or("-")),
+            None => displayable(plan.as_ref()).one_line().to_string(),
+        };
+        let fields: Vec<String> = plan
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| format!("{}:{}", f.name(), f.data_type()))
+            .collect();
+        let _ = writeln!(out, "{depth} {} [{}]", line.trim_end(), fields.join(","));
+        for c in plan.children() {
+            walk(c, depth + 1, out);
+        }
+    }
+    let mut out = String::new();
+    walk(plan, 0, &mut out);
+    Some(out)
 }
 
 /// The default [`Workers::with_broadcast_limit`]: 64 MiB.
@@ -127,7 +216,24 @@ impl Workers {
                 .build()?,
             members: Arc::new(std::sync::RwLock::new(members)),
             broadcast_limit: DEFAULT_BROADCAST_LIMIT,
+            builds: Arc::default(),
         })
+    }
+
+    /// Keeps up to `bytes` of collected build sides that read pinned
+    /// snapshots only, and sends them again instead of collecting them
+    /// again (ADR 0116). 0, the default, keeps none.
+    pub fn with_build_cache(mut self, bytes: usize) -> Self {
+        self.builds = Arc::new(BuildCache {
+            max: bytes,
+            ..BuildCache::default()
+        });
+        self
+    }
+
+    /// How many broadcasts reused a cached build side (ADR 0116).
+    pub fn build_cache_hits(&self) -> u64 {
+        self.builds.hits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Caps the build side a broadcast join sends (ADR 0099): one larger
@@ -1363,11 +1469,22 @@ impl ExecutionPlan for RemoteBroadcastExec {
             self.join.clone(),
         );
         let limit = self.probe.workers.broadcast_limit;
+        // Cached build sides (ADR 0116), keyed by what they read.
+        let cache = self.probe.workers.builds.clone();
+        let key = (cache.max > 0).then(|| build_key(&self.build)).flatten();
         let task = ctx.clone();
         let body = stream::once(async move {
             let built = shipped
                 .get_or_init(|| async move {
                     let fail = |e: DataFusionError| e.to_string();
+                    if let Some((bytes, memory)) = key.as_deref().and_then(|k| cache.get(k)) {
+                        if bytes.len() <= limit {
+                            return Ok(Built::Shipped {
+                                bytes,
+                                _memory: memory,
+                            });
+                        }
+                    }
                     let schema = build.schema();
                     let batches = datafusion::physical_plan::collect(build, ctx.clone())
                         .await
@@ -1393,9 +1510,15 @@ impl ExecutionPlan for RemoteBroadcastExec {
                         datafusion::execution::memory_pool::MemoryConsumer::new("broadcast-build")
                             .register(ctx.memory_pool());
                     memory.try_grow(bytes.len()).map_err(fail)?;
+                    let (bytes, memory) = (Bytes::from(bytes), Arc::new(memory));
+                    // The cache shares the reservation: counted once, freed
+                    // when neither holds it.
+                    if let Some(key) = key {
+                        cache.put(key, bytes.clone(), memory.clone());
+                    }
                     Ok(Built::Shipped {
-                        bytes: Bytes::from(bytes),
-                        _memory: Arc::new(memory),
+                        bytes,
+                        _memory: memory,
                     })
                 })
                 .await

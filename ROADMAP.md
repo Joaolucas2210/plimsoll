@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Broadcast build sides of pinned snapshots cached and sent again (`PLIMSOLL_BROADCAST_CACHE_BYTES`), keyed by the build plan (ADR 0116)
 - [x] Non-equi (nested-loop) joins against a small side broadcast to the workers, with gathered left/full/semi/anti variants and the broadcast limit's fallback (ADR 0115)
 - [x] Distinct counts from the metadata of statistics files (Puffin `ndv`), and row estimates net of position deletes, so joins on repeated keys are sized (ADR 0114)
 - [x] Column statistics from manifests (bounds, null counts, inexact) and the scan's own filter selectivity, so filtered sides are sized for broadcast or shuffle (ADR 0113)
@@ -148,10 +149,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Broadcast build sides cached per snapshot** — a collected side that
-reads only Iceberg tables at pinned snapshots is the same rows every
-time: keep its Arrow IPC (under the memory ceiling) and send it again
-instead of collecting it again (ADR 0066, 0038).
+**Skewed shuffles** — spill the largest bucket first and split hot
+join buckets across reducers, so one heavy key does not hold a whole
+shuffle back (ADR 0067).
 
 ## Missing
 
@@ -166,8 +166,8 @@ instead of collecting it again (ADR 0066, 0038).
   `CREATE OR REPLACE TABLE … AS SELECT`.
 
 **Distribution**
-- Caching broadcast build sides per snapshot (above); range-partitioned
-  joins of two large sides (ADR 0115); join sides under projections
+- Caching gathered joins' build rows (ADR 0116); range-partitioned joins
+  of two large sides (ADR 0115); join sides under projections
   that also prune columns (ADR 0111).
 - Joins with a subquery (ADR 0065); with an aggregation under `HAVING`
   or joined on part of its group keys (ADR 0112).
@@ -181,7 +181,7 @@ instead of collecting it again (ADR 0066, 0038).
   maintenance (ADR 0114);
   ordered joins kept local once a filtered side becomes the build side; skip the shuffle for few-group
   aggregations (ADR 0064/0066).
-- Skew: spill the largest bucket first, split hot buckets (ADR 0067).
+- Skew (above).
 - Spilling hash-join build sides (DataFusion upstream, ADR 0068).
 
 **Security and operations**

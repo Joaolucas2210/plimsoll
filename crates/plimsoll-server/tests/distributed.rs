@@ -630,6 +630,43 @@ async fn distributed_scans_match_local_ones() {
             assert_eq!(got, run(&local, &sql).await.0, "{sql}");
         }
     }
+    // Cached build sides (ADR 0116): the same pinned build side is sent
+    // again rather than collected again; another one is not.
+    let cache = Workers::new(urls.clone(), TOKEN.into())
+        .unwrap()
+        .with_build_cache(16 << 20);
+    let cached = Engine::new(
+        Arc::new(CeilingPool::new(256 << 20, 8 << 20).unwrap()),
+        None,
+    )
+    .unwrap();
+    coordinate(&cached, cache.clone());
+    {
+        let state = cached.context().state_ref();
+        let mut state = state.write();
+        let optimizer = &mut state.config_mut().options_mut().optimizer;
+        optimizer.hash_join_single_partition_threshold = 1 << 20;
+        optimizer.hash_join_single_partition_threshold_rows = 128 * 1024;
+    }
+    let (name, location) = &tables[0];
+    IcebergConnector::try_new(name.to_lowercase(), location, &cached.context().state())
+        .await
+        .unwrap()
+        .register(cached.context())
+        .unwrap();
+    let t = name.to_lowercase();
+    let small = |bound: i64| {
+        format!(
+            "SELECT count(*), sum(a.id) FROM {t} a \
+             JOIN (SELECT id FROM {t} WHERE id < {bound}) b ON a.id = b.id"
+        )
+    };
+    for (sql, hits) in [(small(5), 0), (small(5), 1), (small(9), 1), (small(9), 2)] {
+        let (got, plan) = run(&cached, &sql).await;
+        assert!(plan.contains("RemoteBroadcast"), "{sql}: {plan}");
+        assert_eq!(got, run(&local, &sql).await.0, "{sql}");
+        assert_eq!(cache.build_cache_hits(), hits, "{sql}");
+    }
     collect_left(false);
     // Grouped by the join key: the final aggregation may rely on the
     // join's partitioning, so the join must then stay as planned.
