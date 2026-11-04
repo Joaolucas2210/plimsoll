@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Per-query spill: the coordinator's in the query log and `system.runtime.queries` (failed queries included, through a spill sink), each worker fragment's in its log line (ADR 0118)
 - [x] Hot join buckets split across reducers, after a size round over the maps; only the side whose rows appear once in the output splits (ADR 0117)
 - [x] Broadcast build sides of pinned snapshots cached and sent again (`PLIMSOLL_BROADCAST_CACHE_BYTES`), keyed by the build plan (ADR 0116)
 - [x] Non-equi (nested-loop) joins against a small side broadcast to the workers, with gathered left/full/semi/anti variants and the broadcast limit's fallback (ADR 0115)
@@ -150,9 +151,10 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Per-query spill attribution** — the spill bytes each query caused,
-on the coordinator and its workers' fragments, in the query log and
-`system.runtime.queries` (ADR 0069).
+**Per-kind fragment counters** — fragments served by kind (scan,
+partial aggregate, shuffle map, reduce, broadcast probe, write) and
+outcome in `/metrics`, so a worker's load is visible without logs
+(ADR 0069/0071).
 
 ## Missing
 
@@ -187,5 +189,6 @@ on the coordinator and its workers' fragments, in the query log and
 - Spilling hash-join build sides (DataFusion upstream, ADR 0068).
 
 **Security and operations**
-- Per-query spill attribution (above); shuffle-map operator spans;
-  per-kind fragment counters (ADR 0069/0071).
+- Per-kind fragment counters (above); shuffle-map operator spans;
+  workers' spill summed on the coordinator; shuffle spill by query (ADR
+  0118).

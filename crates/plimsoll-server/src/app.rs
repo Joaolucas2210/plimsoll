@@ -757,6 +757,9 @@ impl Drop for FragmentReport {
                 "bytes": self.bytes,
                 "error": self.error,
                 "total_ms": (elapsed.as_micros() as f64) / 1e3,
+                // What this fragment's own plan spilled here (ADR 0118):
+                // summed by query_id, a query's spill on its workers.
+                "spilled_bytes": self.plan.as_ref().map(|p| plimsoll_core::memory::spilled_bytes(p) as u64),
             }),
         );
         if let (Some(tracer), true) = (&self.st.tracer, self.ctx.sampled) {
@@ -1066,11 +1069,16 @@ async fn sql(
                 log.reads = s.reads;
                 log.plan_events = s.plan_events;
                 log.operators = s.operators;
+                log.spilled_bytes = Some(s.spilled_bytes);
+                if let Some(id) = log.query_id {
+                    st.admission.registry().record_spill(id, s.spilled_bytes);
+                }
                 log.planning = Some(s.phases.planning);
                 log.execution = Some(s.phases.execution);
                 log.serialization = Some(s.phases.serialization);
             }
             log.total = started.elapsed();
+            settle_spill(&st, &mut log);
             let error = outcome.error.as_ref().map(|(c, m)| (*c, m.as_str()));
             let level = if error.is_some() {
                 Level::Warn
@@ -1086,6 +1094,7 @@ async fn sql(
         return response;
     }
     log.total = started.elapsed();
+    settle_spill(&st, &mut log);
     let error = response
         .extensions()
         .get::<ErrorInfo>()
@@ -1096,6 +1105,18 @@ async fn sql(
         tracer.record(trace::spans(&ctx, wall, &log, status, error));
     }
     response
+}
+
+/// A query that ran but reported no spill (it failed) is credited what
+/// its stream counted when dropped (ADR 0118), in its log line and its
+/// registry entry.
+fn settle_spill(st: &AppState, log: &mut QueryLog) {
+    let (None, Some(id), Some(sink)) = (log.spilled_bytes, log.query_id, &log.spill) else {
+        return;
+    };
+    let bytes = sink.bytes();
+    log.spilled_bytes = Some(bytes);
+    st.admission.registry().record_spill(id, bytes);
 }
 
 /// `slow_query` (ADR 0057): above `PLIMSOLL_SLOW_QUERY_MS`, the query's
@@ -1454,6 +1475,8 @@ async fn run_sql(
     };
     let mut viewer = st.auth.viewer(&request.user);
     viewer.group = Some(request.resource_group.clone());
+    // What its plan spills, should it fail before saying (ADR 0118).
+    log.spill = Some(viewer.spill.clone());
     // What this query's fragments tell workers (ADR 0059); the id is set
     // once admission assigns it.
     viewer.tag = Some(plimsoll_core::engine::QueryTag {
@@ -1530,6 +1553,10 @@ async fn run_sql(
             log.reads = out.reads.clone();
             log.plan_events = out.plan_events.clone();
             log.operators = out.operators.clone();
+            log.spilled_bytes = Some(out.spilled_bytes);
+            if let Some(id) = query_id {
+                st.admission.registry().record_spill(id, out.spilled_bytes);
+            }
             log.planning = Some(out.phases.planning);
             log.execution = Some(out.phases.execution);
             log.serialization = Some(out.phases.serialization);

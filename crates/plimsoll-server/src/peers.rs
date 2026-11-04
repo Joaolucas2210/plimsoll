@@ -527,6 +527,7 @@ mod tests {
             started_at_ms: Some(2),
             finished_at_ms: None,
             error: None,
+            spilled_bytes: None,
         };
         let json = serde_json::to_value(vec![q(5, "a")]).unwrap();
         assert_eq!(json[0]["state"], "running");

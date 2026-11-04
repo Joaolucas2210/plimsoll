@@ -50,6 +50,8 @@ pub struct QueryResult {
     pub reads: Vec<TableRead>,
     /// The executed plan's nodes, for execution spans (ADR 0071).
     pub operators: Vec<crate::plan_trace::OperatorSpan>,
+    /// Bytes its operators spilled to disk (ADR 0118).
+    pub spilled_bytes: u64,
 }
 
 /// One scan of a query, for the audit trail (ADR 0046): the table as
@@ -116,7 +118,35 @@ pub trait TableAccess: Send + Sync + 'static {
     fn tag(&self) -> Option<QueryTag> {
         None
     }
+
+    /// Where this query's spill is counted when its stream is dropped,
+    /// finished or failed (ADR 0118).
+    fn spill_sink(&self) -> Option<SpillSink> {
+        None
+    }
 }
+
+/// A query's own spill count (ADR 0118), shared by its caller and its
+/// stream: the stream adds what its plan spilled when it is dropped, so a
+/// failed query's spill is known too. A counter, not part of the identity
+/// of what holds it: every sink equals every other.
+#[derive(Debug, Clone, Default)]
+pub struct SpillSink(Arc<AtomicU64>);
+
+impl SpillSink {
+    /// Bytes spilled by the streams dropped so far.
+    pub fn bytes(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl PartialEq for SpillSink {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for SpillSink {}
 
 /// A query's identity across nodes (ADR 0059): what a coordinator tells
 /// the workers running its fragments.
@@ -287,6 +317,7 @@ impl Engine {
         let planning = query.planning;
         let reads = std::mem::take(&mut query.reads);
         let operators = query.operators();
+        let spilled_bytes = query.spilled_bytes();
         drop(query);
         Ok(QueryResult {
             batches,
@@ -295,6 +326,7 @@ impl Engine {
             execution: started.elapsed() - planning,
             reads,
             operators,
+            spilled_bytes,
         })
     }
 
@@ -514,6 +546,7 @@ impl Engine {
             reads,
             physical,
             spilled_total: self.spilled_total.clone(),
+            sink: access.and_then(TableAccess::spill_sink),
         })
     }
 }
@@ -608,6 +641,7 @@ impl Engine {
             reads,
             physical,
             spilled_total: self.spilled_total.clone(),
+            sink: access.and_then(TableAccess::spill_sink),
         })
     }
 }
@@ -699,6 +733,8 @@ pub struct QueryStream {
     pub reads: Vec<TableRead>,
     physical: Arc<dyn ExecutionPlan>,
     spilled_total: Arc<AtomicU64>,
+    /// The query's own count, when its caller keeps one (ADR 0118).
+    sink: Option<SpillSink>,
 }
 
 impl QueryStream {
@@ -707,12 +743,21 @@ impl QueryStream {
     pub fn operators(&self) -> Vec<crate::plan_trace::OperatorSpan> {
         crate::plan_trace::operators(&self.physical, crate::plan_trace::TRACED_OPERATORS)
     }
+
+    /// Bytes the plan's operators spilled so far, every node counted
+    /// (ADR 0118): the query's own share of the engine's spill total.
+    pub fn spilled_bytes(&self) -> u64 {
+        spilled_bytes(&self.physical) as u64
+    }
 }
 
 impl Drop for QueryStream {
     fn drop(&mut self) {
-        self.spilled_total
-            .fetch_add(spilled_bytes(&self.physical) as u64, Ordering::Relaxed);
+        let spilled = spilled_bytes(&self.physical) as u64;
+        self.spilled_total.fetch_add(spilled, Ordering::Relaxed);
+        if let Some(sink) = &self.sink {
+            sink.0.fetch_add(spilled, Ordering::Relaxed);
+        }
     }
 }
 
@@ -724,6 +769,40 @@ mod tests {
     fn engine(limit: usize) -> Engine {
         let pool = Arc::new(CeilingPool::new(limit, limit / 8).unwrap());
         Engine::new(pool, None).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_query_reports_what_it_spilled() {
+        // ADR 0118: a sort over more than the ceiling spills; the query's
+        // own count is what the engine's total grew by.
+        let dir = std::env::temp_dir().join(format!("plimsoll-qspill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = Arc::new(CeilingPool::new(8 << 20, 1 << 20).unwrap());
+        let engine = Engine::new(pool, Some(dir.clone())).unwrap();
+        // One sorter: twelve would each reserve their merge space first.
+        engine
+            .context()
+            .state_ref()
+            .write()
+            .config_mut()
+            .options_mut()
+            .execution
+            .target_partitions = 1;
+        let out = engine
+            .sql(
+                "SELECT count(*), max(r) FROM (SELECT row_number() OVER (ORDER BY v) AS r FROM \
+                 (SELECT concat('row-', lpad(CAST(value AS VARCHAR), 40, '0')) AS v \
+                  FROM generate_series(1, 200000)))",
+            )
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.spilled_bytes > 0, "expected a spill");
+        assert_eq!(engine.spilled_bytes_total(), out.spilled_bytes);
+        // A query that spills nothing says so.
+        let small = engine.sql("SELECT 1").await.unwrap();
+        assert_eq!(small.spilled_bytes, 0);
+        assert_eq!(engine.spilled_bytes_total(), out.spilled_bytes);
     }
 
     #[tokio::test]

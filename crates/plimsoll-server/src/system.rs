@@ -121,6 +121,7 @@ impl TableProvider for QueriesTable {
             ts(|r| r.started_at_ms),
             ts(|r| r.finished_at_ms),
             text(|r| r.error.as_deref()),
+            Arc::new(UInt64Array::from_iter(rows.iter().map(|r| r.spilled_bytes))),
         ];
         let batch = RecordBatch::try_new(self.schema.clone(), columns)?;
         Ok(MemorySourceConfig::try_new_exec(

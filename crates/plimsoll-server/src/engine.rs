@@ -43,6 +43,8 @@ pub struct QueryOutput {
     pub plan_events: Vec<PlanEvent>,
     /// Executed plan nodes, for execution spans (ADR 0071).
     pub operators: Vec<OperatorSpan>,
+    /// Bytes spilled to disk by this query's plan here (ADR 0118).
+    pub spilled_bytes: u64,
 }
 
 /// Where a successful query spent its time (the admission queue is timed by
@@ -65,6 +67,7 @@ impl QueryOutput {
             reads: Vec::new(),
             plan_events: Vec::new(),
             operators: Vec::new(),
+            spilled_bytes: 0,
         }
     }
 }
@@ -128,6 +131,8 @@ pub struct Streamed {
     pub plan_events: Vec<PlanEvent>,
     /// Executed plan nodes, for execution spans (ADR 0071).
     pub operators: Vec<OperatorSpan>,
+    /// Bytes spilled to disk by this query's plan here (ADR 0118).
+    pub spilled_bytes: u64,
 }
 
 /// The receiver is gone (client disconnected). The caller cancels the query
@@ -244,6 +249,7 @@ pub trait QueryEngine: Send + Sync {
             reads: out.reads,
             plan_events: out.plan_events,
             operators: out.operators,
+            spilled_bytes: out.spilled_bytes,
         })
     }
 }
@@ -1406,6 +1412,7 @@ impl QueryEngine for CoreEngine {
             execution,
             reads,
             operators,
+            spilled_bytes,
         } = {
             let (result, events) =
                 plan_trace::collect(self.0.sql_with(sql, params, Arc::new(viewer))).await;
@@ -1456,6 +1463,7 @@ impl QueryEngine for CoreEngine {
             reads,
             plan_events,
             operators,
+            spilled_bytes,
         })
     }
 
@@ -1550,6 +1558,7 @@ impl QueryEngine for CoreEngine {
             reads: std::mem::take(&mut query.reads),
             plan_events,
             operators: query.operators(),
+            spilled_bytes: query.spilled_bytes(),
             phases: Phases {
                 planning,
                 // Includes time spent waiting for the reader.

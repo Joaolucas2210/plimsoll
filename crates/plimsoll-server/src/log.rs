@@ -77,6 +77,11 @@ pub struct QueryLog {
     pub execution: Option<Duration>,
     pub serialization: Option<Duration>,
     pub total: Duration,
+    /// Bytes its plan spilled here (ADR 0118); `None` when it never ran.
+    pub spilled_bytes: Option<u64>,
+    /// The query's spill count, read when it did not report one (it
+    /// failed); not logged.
+    pub spill: Option<plimsoll_core::engine::SpillSink>,
 }
 
 impl QueryLog {
@@ -119,6 +124,7 @@ impl QueryLog {
             "execution_ms": ms(self.execution),
             "serialization_ms": ms(self.serialization),
             "total_ms": ms(Some(self.total)),
+            "spilled_bytes": self.spilled_bytes,
         })
     }
 }

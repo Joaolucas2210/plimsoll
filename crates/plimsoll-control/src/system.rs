@@ -42,6 +42,8 @@ pub const QUERIES_COLUMNS: &[Column] = &[
     col("started_at", ColumnType::TimestampMillis, true),
     col("finished_at", ColumnType::TimestampMillis, true),
     col("error", ColumnType::Utf8, true),
+    // ADR 0118: on the coordinator; workers log theirs per fragment.
+    col("spilled_bytes", ColumnType::UInt64, true),
 ];
 
 /// Point-in-time rows for `system.runtime.queries`.
@@ -77,7 +79,12 @@ mod tests {
         assert_eq!(rows[0].error.as_deref(), Some("memory limit"));
         assert_eq!(rows[1].state, QueryState::Running);
         assert!(rows[1].started_at_ms.is_some());
-        assert_eq!(QUERIES_COLUMNS.len(), 9);
+        // What a query spilled, once it ended (ADR 0118).
+        assert_eq!(rows[0].spilled_bytes, None);
+        reg.record_spill(a, 4096);
+        assert_eq!(queries_snapshot(&reg)[0].spilled_bytes, Some(4096));
+        assert_eq!(QUERIES_COLUMNS.len(), 10);
         assert_eq!(QUERIES_COLUMNS[0].name, "query_id");
+        assert_eq!(QUERIES_COLUMNS[9].name, "spilled_bytes");
     }
 }

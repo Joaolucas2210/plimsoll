@@ -125,6 +125,7 @@ are allowed in place.
 | [0115](0115-non-equi-joins-on-workers.md) | Non-equi joins against a small side on workers | Accepted | 2026-11-04 | `broadcast_join` takes a `NestedLoopJoinExec` (collected left side, filter only) like a `CollectLeft` hash join: probe-driven types on the workers, left/full/semi/anti gathered, over the limit joined locally; the worker's keyless broadcast join is a nested loop | 0066, 0097, 0098, 0099, 0111 |
 | [0116](0116-broadcast-build-cache.md) | Broadcast build sides cached per snapshot | Accepted | 2026-11-04 | Per-coordinator LRU of encoded build sides keyed by the build plan (pinned scans by id, other nodes by display and fields), only when every source is pinned; entries share the broadcast's reservation; `PLIMSOLL_BROADCAST_CACHE_BYTES` (off by default) | 0038, 0066, 0099, 0115 |
 | [0117](0117-hot-join-buckets.md) | Hot join buckets split across reducers | Accepted | 2026-11-04 | A size round asks every map its buckets' bytes (same hash keys as reducers); a bucket over `PLIMSOLL_SKEW_BYTES` and 4× its side's median splits by map groups into parts on successive reducers, the other side's bucket read by each (`readers`); only a side whose rows appear once in the output splits | 0065, 0067, 0072, 0111, 0112 |
+| [0118](0118-per-query-spill.md) | Per-query spill attribution | Accepted | 2026-11-04 | A query's plan spill (every node) in its `query` log line and `system.runtime.queries.spilled_bytes`; failed queries through a `SpillSink` their stream adds to when dropped; each worker `fragment` line adds its own | 0003, 0022, 0069, 0071, 0102 |
 
 ## Reading order
 
@@ -134,7 +135,7 @@ are allowed in place.
 - Federation: 0005 → 0006.
 - Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074 → 0091 → 0092 → 0093 → 0094 → 0097 → 0098 → 0099 → 0101 → 0102 → 0111 → 0112 → 0115 → 0116 → 0117.
 - Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084 → 0085 → 0086 → 0087 → 0088 → 0089 → 0090 → 0091 → 0092 → 0093 → 0094 → 0095 → 0096.
-- Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057 → 0100.
+- Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057 → 0100 → 0118.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046 → 0103 → 0104 → 0105 → 0106 → 0107 → 0108 → 0109 → 0110.
 
 ## Conventions

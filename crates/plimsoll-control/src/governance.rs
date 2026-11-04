@@ -70,6 +70,10 @@ pub struct QueryInfo {
     pub started_at_ms: Option<u64>,
     pub finished_at_ms: Option<u64>,
     pub error: Option<String>,
+    /// Bytes its plan spilled on the coordinator, once it ended (ADR
+    /// 0118). Absent from older peers' listings.
+    #[serde(default)]
+    pub spilled_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -202,9 +206,18 @@ impl QueryRegistry {
             started_at_ms: None,
             finished_at_ms: None,
             error: None,
+            spilled_bytes: None,
         };
         lock(&self.queries).insert(id, info);
         id
+    }
+
+    /// Records what `id`'s plan spilled (ADR 0118), when it is known: once
+    /// its stream ended, whatever its state.
+    pub fn record_spill(&self, id: QueryId, bytes: u64) {
+        if let Some(q) = lock(&self.queries).get_mut(&id) {
+            q.spilled_bytes = Some(bytes);
+        }
     }
 
     pub fn mark_running(&self, id: QueryId) {

@@ -354,6 +354,7 @@ impl Auth {
                 denied_columns: None,
                 row_filters: None,
                 tag: None,
+                spill: Default::default(),
             };
         };
         Viewer {
@@ -367,6 +368,7 @@ impl Auth {
             denied_columns: column_deny.get(principal).cloned(),
             row_filters: row_filters.get(principal).cloned(),
             tag: None,
+            spill: Default::default(),
         }
     }
 
@@ -411,6 +413,8 @@ pub struct Viewer {
     pub row_filters: Option<Arc<HashMap<String, String>>>,
     /// The query's identity for its fragments on workers (ADR 0059).
     pub tag: Option<plimsoll_core::engine::QueryTag>,
+    /// Where the query's spill is counted, finished or failed (ADR 0118).
+    pub spill: plimsoll_core::engine::SpillSink,
 }
 
 impl TableAccess for Viewer {
@@ -420,6 +424,10 @@ impl TableAccess for Viewer {
 
     fn tag(&self) -> Option<plimsoll_core::engine::QueryTag> {
         self.tag.clone()
+    }
+
+    fn spill_sink(&self) -> Option<plimsoll_core::engine::SpillSink> {
+        Some(self.spill.clone())
     }
 
     fn row_filter(&self, table: &ResolvedTableReference) -> Option<String> {
