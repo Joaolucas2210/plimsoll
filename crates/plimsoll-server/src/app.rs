@@ -57,6 +57,9 @@ pub struct AppState {
     pub peers: Option<Arc<crate::peers::Peers>>,
     /// Shared admission among them (ADR 0103–0107).
     pub coordination: Option<Arc<crate::peers::Coordination>>,
+    /// The largest `/v1/fragment` body read, once its worker token checks
+    /// out: the broadcast limit plus room for the task (ADR 0128).
+    pub fragment_body_max: usize,
 }
 
 #[derive(Default)]
@@ -553,12 +556,22 @@ async fn peer_cancel(
 async fn fragment(
     State(shared): State<Arc<AppState>>,
     headers: HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> Response {
     let st = shared.as_ref();
     if let Some(r) = node_auth(st, &headers) {
         return r;
     }
+    // Read only once authenticated: a broadcast's build side is up to the
+    // broadcast limit, far above the 2 MiB axum allows by default.
+    let body =
+        match axum::body::to_bytes(body, st.fragment_body_max).await {
+            Ok(b) => b,
+            Err(e) => {
+                return ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request", false)
+                    .respond(st, format!("fragment body: {e}"), None);
+            }
+        };
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     // Checked above; a reduce presents it to its peers.
     let token = header("authorization").and_then(|v| v.strip_prefix("Bearer "));
@@ -1703,6 +1716,7 @@ mod tests {
             coordination: None,
             slow_query: None,
             worker_token: None,
+            fragment_body_max: 1 << 20,
         })
     }
 
@@ -1819,6 +1833,31 @@ mod tests {
         assert_eq!(v["columns"], json!(["x"]));
         assert_eq!(v["rows"], json!([[1]]));
         assert_eq!(v["query_id"], 1);
+    }
+
+    /// A broadcast's build side is far above axum's 2 MiB default; the
+    /// body is read up to `fragment_body_max`, and only once the worker
+    /// token checks out (ADR 0128).
+    #[tokio::test]
+    async fn fragment_bodies_are_read_once_authenticated_up_to_the_limit() {
+        let mut st = Arc::into_inner(default_state()).unwrap();
+        st.worker_token = Some(crate::auth::token_digest("fragment-token-0123"));
+        st.fragment_body_max = 8 << 20;
+        let app = router(Arc::new(st));
+        let req = |token: Option<&str>, len: usize| {
+            let mut r = Request::post("/v1/fragment");
+            if let Some(t) = token {
+                r = r.header("authorization", format!("Bearer {t}"));
+            }
+            r.body(Body::from(vec![b'x'; len])).unwrap()
+        };
+        let (status, _) = call(app.clone(), req(None, 3 << 20)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // Read whole, then refused as a task: not as too large.
+        let (status, _) = call(app.clone(), req(Some("fragment-token-0123"), 3 << 20)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) = call(app, req(Some("fragment-token-0123"), 9 << 20)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
     }
 
     /// End to end: HTTP -> admission -> CeilingPool engine -> system table.

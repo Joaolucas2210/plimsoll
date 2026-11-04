@@ -255,6 +255,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map(plimsoll_server::auth::token_digest),
         peers,
         coordination,
+        fragment_body_max: cfg.broadcast_max_bytes.saturating_add(16 << 20),
     });
 
     // ADR 0100: the `/metrics` series, pushed to the OTLP endpoint.

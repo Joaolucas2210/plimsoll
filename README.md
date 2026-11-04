@@ -116,8 +116,10 @@ The same image runs any role; in production, point it at S3 (`AWS_*`)
 and a real catalog (`PLIMSOLL_CATALOG_*`), with TLS.
 
 TPC-H on one node under a 4 GiB ceiling: all 22 queries correct, SF10 in
-32 s total on a 12-thread laptop. To reproduce it, see
-[ADR 0126](docs/adr/0126-tpch-benchmark.md) and `scripts/tpch_bench.py`.
+32 s total on a 12-thread laptop. All 22 queries are also correct over
+Iceberg on the quickstart's coordinator and two workers. To reproduce
+them, see [ADR 0126](docs/adr/0126-tpch-benchmark.md),
+[ADR 0128](docs/adr/0128-tpch-on-a-cluster.md) and `scripts/tpch_bench.py`.
 
 Releases: `ghcr.io/joaolucas2210/plimsoll:<tag>` and checksummed Linux
 binaries on GitHub releases, from `v*` tags; see [CHANGELOG.md](CHANGELOG.md)
@@ -197,7 +199,7 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_MAINTENANCE_INTERVAL_MS` | `0` (off) | Between scheduled maintenance passes: tables with `plimsoll.maintenance.enabled = 'true'` are compacted, have snapshots expired (Iceberg's `history.expire.*` properties) and, with `plimsoll.maintenance.remove-orphans`, orphan files removed; queued under admission as `plimsoll-maintenance`; run it on one coordinator (ADR 0086); with several coordinators, each table is claimed per interval by one of them (a lease object in the table's location, ADR 0101) |
 | `PLIMSOLL_TLS_CERT` / `PLIMSOLL_TLS_KEY` | unset | PEM certificate chain and key: the node serves TLS (1.2/1.3) on its listener (API, metrics, worker fragments); the files are reloaded when they change on disk; both or neither (ADR 0099) |
 | `PLIMSOLL_TLS_CA` | unset | PEM bundle trusted (besides system roots) for `https://` workers, e.g. a private CA (ADR 0099) |
-| `PLIMSOLL_BROADCAST_MAX_BYTES` | `67108864` | Largest build side a broadcast join sends to workers (Arrow IPC bytes); a larger one is joined on the coordinator; `0` = no broadcasts (ADR 0099) |
+| `PLIMSOLL_BROADCAST_MAX_BYTES` | `67108864` | Largest build side a broadcast join sends to workers (Arrow IPC bytes); a larger one is joined on the coordinator; `0` = no broadcasts (ADR 0099). Workers read fragment bodies up to it plus 16 MiB, once authenticated: set it alike on every node (ADR 0128) |
 | `PLIMSOLL_BROADCAST_CACHE_BYTES` | `0` (off) | Collected broadcast build sides that read only pinned Iceberg snapshots kept (under the memory ceiling) and sent again instead of collected again; least recently used first out (ADR 0116) |
 | `PLIMSOLL_SKEW_BYTES` | `67108864` | A shuffled join's bucket over this many bytes (and four times its side's median) is split across reducers, its other side read by each part; `0` never splits (ADR 0117) |
 
@@ -287,7 +289,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 ## Decision records
 
 Index with status, date and the one-line decision of every ADR:
-[docs/adr/README.md](docs/adr/README.md) (0001–0127; template in
+[docs/adr/README.md](docs/adr/README.md) (0001–0128; template in
 [docs/adr/0000-template.md](docs/adr/0000-template.md)).
 
 Roadmap: [ROADMAP.md](ROADMAP.md).

@@ -797,6 +797,7 @@ mod tests {
             coordination: None,
             slow_query: None,
             worker_token: None,
+            fragment_body_max: 1 << 20,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

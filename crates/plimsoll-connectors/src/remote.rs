@@ -1974,9 +1974,9 @@ pub struct RemoteReduceExec {
     /// What is reduced, for display: `aggregate` or the join type.
     kind: String,
     properties: Arc<PlanProperties>,
-    /// Set once a partition runs: only then do workers hold maps to
-    /// release when this plan is dropped (ADR 0073).
-    executed: AtomicBool,
+    /// Releases the maps once this plan and every stream it started are
+    /// gone (ADR 0073, 0128).
+    release: Arc<Release>,
     /// Per bucket of a join, its split when hot (ADR 0117): decided once,
     /// from every map's bucket sizes, by the first partition to run.
     split_plan: Arc<tokio::sync::OnceCell<Vec<BucketSplit>>>,
@@ -2015,13 +2015,14 @@ impl RemoteReduceExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
+        let release = Arc::new(Release::of(&workers, &reduces));
         Self {
             schema,
-            workers,
             reduces,
             kind,
+            release,
             properties,
-            executed: AtomicBool::new(false),
+            workers,
             split_plan: Arc::default(),
         }
     }
@@ -2183,12 +2184,54 @@ fn plan_splits(
         .collect()
 }
 
-/// The query is over (finished, failed or cancelled): every worker that
-/// held a map or ran a reduce of this shuffle drops its maps now, instead
-/// of at the TTL (ADR 0073). Best effort, off the dropping thread.
-impl Drop for RemoteReduceExec {
+/// A shuffle's release (ADR 0073): once the query is over (finished,
+/// failed or cancelled), every worker that held a map or ran a reduce of
+/// it drops its maps now, instead of at the TTL. Held by the plan *and*
+/// by each stream it started: a plan dropped while its streams still run
+/// (a scalar subquery DataFusion evaluates while planning) must not
+/// release maps they are still reading (ADR 0128). Best effort, off the
+/// dropping thread.
+#[derive(Debug)]
+struct Release {
+    workers: Arc<Workers>,
+    urls: Vec<String>,
+    shuffle: Option<String>,
+    /// Set once a partition runs: only then do workers hold maps.
+    executed: AtomicBool,
+}
+
+impl Release {
+    fn of(workers: &Arc<Workers>, reduces: &[(String, Reduce)]) -> Self {
+        let first = reduces.first().map(|(_, r)| r);
+        let mut urls: Vec<String> = reduces
+            .iter()
+            .map(|(url, _)| url.clone())
+            .chain(
+                first
+                    .into_iter()
+                    .flat_map(|r| r.maps.iter().map(|(u, _)| u.clone())),
+            )
+            .chain(
+                first
+                    .and_then(|r| r.join.as_ref())
+                    .into_iter()
+                    .flat_map(|j| j.right.iter().map(|(u, _)| u.clone())),
+            )
+            .collect();
+        urls.sort();
+        urls.dedup();
+        Self {
+            workers: workers.clone(),
+            urls,
+            shuffle: first.map(|r| r.shuffle.clone()),
+            executed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Drop for Release {
     fn drop(&mut self) {
-        let Some((_, first)) = self.reduces.first() else {
+        let Some(shuffle) = &self.shuffle else {
             return;
         };
         if !self.executed.load(Ordering::Relaxed) {
@@ -2197,22 +2240,8 @@ impl Drop for RemoteReduceExec {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let mut urls: Vec<String> = self
-            .reduces
-            .iter()
-            .map(|(url, _)| url.clone())
-            .chain(first.maps.iter().map(|(url, _)| url.clone()))
-            .chain(
-                first
-                    .join
-                    .iter()
-                    .flat_map(|j| j.right.iter().map(|(u, _)| u.clone())),
-            )
-            .collect();
-        urls.sort();
-        urls.dedup();
-        let body = Bytes::from(json!({"release": {"shuffle": first.shuffle}}).to_string());
-        let workers = self.workers.clone();
+        let body = Bytes::from(json!({"release": {"shuffle": shuffle}}).to_string());
+        let (workers, urls) = (self.workers.clone(), std::mem::take(&mut self.urls));
         runtime.spawn(async move {
             let releases = urls.into_iter().map(|url| {
                 let request = workers
@@ -2286,7 +2315,7 @@ impl ExecutionPlan for RemoteReduceExec {
     ) -> Result<SendableRecordBatchStream> {
         let tag = ctx.session_config().get_extension::<QueryTag>();
         let schema = self.schema.clone();
-        self.executed.store(true, Ordering::Relaxed);
+        self.release.executed.store(true, Ordering::Relaxed);
         let Some((url, reduce)) = self.reduces.get(partition) else {
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 schema,
@@ -2302,10 +2331,11 @@ impl ExecutionPlan for RemoteReduceExec {
             .as_ref()
             .and_then(|j| j.join_type.parse::<datafusion::common::JoinType>().ok());
         let workers = self.workers.clone();
+        let release = self.release.clone();
         let Some(join_type) = join_type.filter(|_| workers.skew_bytes > 0) else {
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 schema.clone(),
-                with_retry(workers, targets, tag, schema),
+                holding(with_retry(workers, targets, tag, schema), release),
             )));
         };
         // Hot buckets (ADR 0117): sized once, split into parts that run on
@@ -2350,8 +2380,22 @@ impl ExecutionPlan for RemoteReduceExec {
             stream::select_all(parts).boxed()
         })
         .flatten();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, body)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            holding(body, release),
+        )))
     }
+}
+
+/// `stream`, keeping `release` alive until it ends or is dropped.
+fn holding<S: futures::Stream + Send + 'static>(
+    stream: S,
+    release: Arc<Release>,
+) -> impl futures::Stream<Item = S::Item> + Send {
+    stream.map(move |item| {
+        let _ = &release;
+        item
+    })
 }
 
 /// Moves partial aggregations into worker fragments (ADR 0061).

@@ -9,7 +9,10 @@
 //! (`load_table` returns the `metadata-location` IcebergConnector takes).
 
 use plimsoll_connectors::{Connector, IcebergConnector, ParquetConnector, PostgresConnector};
+use plimsoll_core::datafusion::catalog::MemorySchemaProvider;
+use plimsoll_core::datafusion::error::DataFusionError;
 use plimsoll_core::datafusion::prelude::SessionContext;
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TablesError {
@@ -41,6 +44,30 @@ fn entries(var: &'static str, value: &str) -> Result<Vec<(String, String)>, Tabl
         .collect()
 }
 
+/// A `schema.table` name may name a schema nothing created (not a
+/// medallion one, not a catalog namespace): it is created, in memory, so
+/// `tpch.lineitem=/data/lineitem.parquet` works like `bronze.trips`.
+fn ensure_schema(ctx: &SessionContext, name: &str) -> Result<(), DataFusionError> {
+    let parts: Vec<&str> = name.split('.').collect();
+    let [schema, _table] = parts.as_slice() else {
+        return Ok(());
+    };
+    let default = ctx
+        .state()
+        .config()
+        .options()
+        .catalog
+        .default_catalog
+        .clone();
+    let Some(catalog) = ctx.catalog(&default) else {
+        return Ok(());
+    };
+    if catalog.schema(schema).is_none() {
+        catalog.register_schema(schema, Arc::new(MemorySchemaProvider::new()))?;
+    }
+    Ok(())
+}
+
 pub async fn register_from_env(
     ctx: &SessionContext,
     lookup: impl Fn(&str) -> Option<String>,
@@ -53,6 +80,7 @@ pub async fn register_from_env(
             name: name.clone(),
             source: e,
         };
+        ensure_schema(ctx, &name).map_err(|e| reg(e.into()))?;
         ParquetConnector::try_new(name.as_str(), &path, &ctx.state())
             .await
             .map_err(|e| reg(e.into()))?
@@ -67,6 +95,7 @@ pub async fn register_from_env(
             name: name.clone(),
             source: e,
         };
+        ensure_schema(ctx, &name).map_err(|e| reg(e.into()))?;
         IcebergConnector::try_new(name.as_str(), &location, &ctx.state())
             .await
             .map_err(|e| reg(e.into()))?
@@ -87,6 +116,7 @@ pub async fn register_from_env(
             name: name.clone(),
             source: e,
         };
+        ensure_schema(ctx, &name).map_err(|e| reg(e.into()))?;
         PostgresConnector::from_env(name.as_str(), schema, table)
             .await
             .map_err(|e| reg(e.into()))?
@@ -98,8 +128,26 @@ pub async fn register_from_env(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_tables_create_their_schema() {
+        let ctx = SessionContext::new();
+        ensure_schema(&ctx, "tpch.lineitem").unwrap();
+        let catalog = ctx.catalog("datafusion").unwrap();
+        assert!(catalog.schema("tpch").is_some());
+        // Existing schemas are kept as they are; bare names need none.
+        let public = catalog.schema("public").unwrap();
+        ensure_schema(&ctx, "public.t").unwrap();
+        assert!(Arc::ptr_eq(&public, &catalog.schema("public").unwrap()));
+        ensure_schema(&ctx, "t").unwrap();
+        ensure_schema(&ctx, "a.b.c").unwrap();
+        let mut names = catalog.schema_names();
+        names.sort();
+        assert_eq!(names, ["public", "tpch"]);
+    }
 
     #[test]
     fn parses_entries_and_rejects_garbage() {

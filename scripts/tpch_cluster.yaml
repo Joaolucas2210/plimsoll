@@ -1,0 +1,30 @@
+# TPC-H on the quickstart's cluster (ADR 0128), with compose.yaml:
+#   TPCH_DATA=/tmp/tpch docker compose -f compose.yaml -f scripts/tpch_cluster.yaml up -d --wait
+# The coordinator reads the generated Parquet as `tpch.*`; `tpch_bench.py
+# load` copies it into the catalog's `public` namespace, which the
+# unqualified queries then read, over the workers.
+x-limits: &limits
+  PLIMSOLL_MEMORY_LIMIT_BYTES: "3221225472"
+  PLIMSOLL_QUERY_TIMEOUT_MS: "1800000"
+
+services:
+  worker-1:
+    environment: *limits
+  worker-2:
+    environment: *limits
+  coordinator:
+    volumes: ["${TPCH_DATA:?set TPCH_DATA}:/tpch:ro"]
+    environment:
+      <<: *limits
+      PLIMSOLL_PARQUET_TABLES: tpch.customer=/tpch/customer.parquet,tpch.lineitem=/tpch/lineitem.parquet,tpch.nation=/tpch/nation.parquet,tpch.orders=/tpch/orders.parquet,tpch.part=/tpch/part.parquet,tpch.partsupp=/tpch/partsupp.parquet,tpch.region=/tpch/region.parquet,tpch.supplier=/tpch/supplier.parquet
+      PLIMSOLL_AUTH_WRITE_GRANTS: ana=bronze|silver|gold|public
+  namespaces:
+    entrypoint:
+      - sh
+      - -c
+      - |
+        for ns in bronze silver gold public; do
+          curl -s -o /dev/null -XPOST http://catalog:8181/v1/namespaces \
+            -H 'content-type: application/json' -d "{\"namespace\": [\"$$ns\"]}"
+          curl -sf -o /dev/null http://catalog:8181/v1/namespaces/$$ns || exit 1
+        done

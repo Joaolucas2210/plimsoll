@@ -51,6 +51,19 @@ def tables(args):
     print(",".join(f"public.{t}={root}/{t}.parquet" for t in TABLES))
 
 
+def load(args):
+    """Copies `tpch.*` into the catalog's `public` (cluster runs)."""
+    token = os.environ.get("PLIMSOLL_TOKEN")
+    for t in TABLES:
+        started = time.monotonic()
+        out = post(args.url, token, f"CREATE TABLE public.{t} AS SELECT * FROM tpch.{t}", args.timeout)
+        if "error" in out:
+            print(f"{t}: {out['error']['code']}: {out['error']['message']}", file=sys.stderr)
+            return 1
+        print(f"{t}: {out['rows'][0][0]} rows in {time.monotonic() - started:.1f}s")
+    return 0
+
+
 def post(url, token, sql, timeout):
     body = json.dumps({"sql": sql}).encode()
     req = urllib.request.Request(f"{url}/v1/sql", data=body, method="POST")
@@ -123,13 +136,16 @@ def main():
     t = sub.add_parser("tables", help="PLIMSOLL_PARQUET_TABLES for the data")
     t.add_argument("--data", required=True)
     t.add_argument("--prefix", help="where the node sees --data (e.g. /data in a container)")
+    lo = sub.add_parser("load", help="copy tpch.* into the catalog's public namespace")
+    lo.add_argument("--url", default="http://localhost:8080")
+    lo.add_argument("--timeout", type=float, default=3600)
     r = sub.add_parser("run")
     r.add_argument("--data", required=True)
     r.add_argument("--url", default="http://localhost:8080")
     r.add_argument("--runs", type=int, default=3)
     r.add_argument("--timeout", type=float, default=600)
     args = p.parse_args()
-    sys.exit({"generate": generate, "tables": tables, "run": run}[args.cmd](args) or 0)
+    sys.exit({"generate": generate, "tables": tables, "load": load, "run": run}[args.cmd](args) or 0)
 
 
 if __name__ == "__main__":

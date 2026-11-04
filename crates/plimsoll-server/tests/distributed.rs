@@ -56,6 +56,7 @@ async fn worker_with(groups: std::collections::HashMap<String, Limits>) -> (Stri
         worker_token: Some(token_digest(TOKEN)),
         peers: None,
         coordination: None,
+        fragment_body_max: (64 << 20) + (16 << 20),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -325,6 +326,16 @@ async fn distributed_scans_match_local_ones() {
             "{partial_keys}: {plan}"
         );
         assert_eq!(got, run(&local, &partial_keys).await.0, "{partial_keys}");
+        // A shuffled aggregation read twice, once by a scalar subquery
+        // DataFusion runs while planning (TPC-H Q15): its maps outlive the
+        // plan that started them, until every read of them ends (ADR 0128).
+        let twice = format!(
+            "WITH r AS (SELECT id, count(*) AS c FROM {t} GROUP BY id) \
+             SELECT r.id, r.c FROM r WHERE r.c = (SELECT max(c) FROM r) ORDER BY r.id"
+        );
+        let (got, plan) = run(&coordinator, &twice).await;
+        assert!(plan.contains(" shuffled"), "{twice}: {plan}");
+        assert_eq!(got, run(&local, &twice).await.0, "{twice}");
         // The local scan's own filtering, checked against a filter it
         // never sees (an aggregate's FILTER clause).
         let (filtered, plan) = run(
