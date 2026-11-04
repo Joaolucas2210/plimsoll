@@ -343,13 +343,16 @@ async fn distributed_scans_match_local_ones() {
                 "SELECT a.id, b.{group} FROM {t} a JOIN {t} b ON a.id = b.id ORDER BY a.id, b.{group}"
             ),
             // Outer, with a filtered side (filters travel, ADR 0062).
+            // Unordered: estimated small (ADR 0113), the filtered side
+            // becomes the build side, and an ORDER BY would sort the other
+            // below the join.
             format!(
-                "SELECT a.id, b.id AS b FROM {t} a \
-                 LEFT JOIN (SELECT id FROM {t} WHERE id % 2 = 0) b ON a.id = b.id ORDER BY a.id"
+                "SELECT count(*), sum(a.id), count(b.id) FROM {t} a \
+                 LEFT JOIN (SELECT id FROM {t} WHERE id % 2 = 0) b ON a.id = b.id"
             ),
-            // Semi and anti joins.
+            // Semi and anti joins (unordered, as above).
             format!(
-                "SELECT id FROM {t} WHERE id IN (SELECT id FROM {t} WHERE id % 3 = 0) ORDER BY id"
+                "SELECT count(*), sum(id) FROM {t} WHERE id IN (SELECT id FROM {t} WHERE id % 3 = 0)"
             ),
             // (Unordered: with ORDER BY, DataFusion may sort the probe
             // side below the join and keep its order, which a shuffle
@@ -409,9 +412,7 @@ async fn distributed_scans_match_local_ones() {
         let t = name.to_lowercase();
         for (sql, broadcast) in [
             (
-                format!(
-                    "SELECT a.id, b.id AS b FROM {t} a JOIN {t} b ON a.id = b.id ORDER BY a.id"
-                ),
+                format!("SELECT a.id, b.id AS b FROM {t} a JOIN {t} b ON a.id = b.id"),
                 Some(true),
             ),
             (
@@ -433,38 +434,34 @@ async fn distributed_scans_match_local_ones() {
             // Driven by the build side (ADR 0097): workers return which
             // build rows matched, the coordinator adds the build-only rows.
             (
+                format!("SELECT id FROM {t} WHERE id IN (SELECT id FROM {t} WHERE id % 3 = 0)"),
+                Some(true),
+            ),
+            (
                 format!(
-                    "SELECT id FROM {t} WHERE id IN (SELECT id FROM {t} WHERE id % 3 = 0) ORDER BY id"
+                    "SELECT a.id, b.id AS b FROM (SELECT id FROM {t} WHERE id < 8) a \
+                     LEFT JOIN (SELECT id FROM {t} WHERE id % 2 = 0) b ON a.id = b.id"
                 ),
                 Some(true),
             ),
             (
                 format!(
                     "SELECT a.id, b.id AS b FROM (SELECT id FROM {t} WHERE id < 8) a \
-                     LEFT JOIN (SELECT id FROM {t} WHERE id % 2 = 0) b ON a.id = b.id ORDER BY a.id"
-                ),
-                Some(true),
-            ),
-            (
-                format!(
-                    "SELECT a.id, b.id AS b FROM (SELECT id FROM {t} WHERE id < 8) a \
-                     FULL JOIN (SELECT id FROM {t} WHERE id % 2 = 0) b ON a.id = b.id \
-                     ORDER BY a.id, b"
+                     FULL JOIN (SELECT id FROM {t} WHERE id % 2 = 0) b ON a.id = b.id"
                 ),
                 Some(true),
             ),
             (
                 format!(
                     "SELECT a.id FROM (SELECT id FROM {t} WHERE id < 8) a \
-                     WHERE EXISTS (SELECT 1 FROM {t} b WHERE b.id = a.id AND b.id % 2 = 0) ORDER BY a.id"
+                     WHERE EXISTS (SELECT 1 FROM {t} b WHERE b.id = a.id AND b.id % 2 = 0)"
                 ),
                 Some(true),
             ),
             (
                 format!(
                     "SELECT a.id FROM (SELECT id FROM {t} WHERE id < 8) a \
-                     WHERE NOT EXISTS (SELECT 1 FROM {t} b WHERE b.id = a.id AND b.id % 2 = 0) \
-                     ORDER BY a.id"
+                     WHERE NOT EXISTS (SELECT 1 FROM {t} b WHERE b.id = a.id AND b.id % 2 = 0)"
                 ),
                 Some(true),
             ),
@@ -480,14 +477,14 @@ async fn distributed_scans_match_local_ones() {
                 format!(
                     "SELECT a.id, b.id AS b FROM (SELECT id FROM {t} WHERE id < 8) a \
                      LEFT JOIN (SELECT id FROM {t} WHERE id % 2 = 0) b \
-                     ON a.id = b.id AND a.id + b.id > 6 ORDER BY a.id"
+                     ON a.id = b.id AND a.id + b.id > 6"
                 ),
                 Some(true),
             ),
             (
                 format!(
                     "SELECT a.id FROM (SELECT id FROM {t} WHERE id < 8) a WHERE EXISTS \
-                     (SELECT 1 FROM {t} b WHERE b.id = a.id AND b.id + a.id > 6) ORDER BY a.id"
+                     (SELECT 1 FROM {t} b WHERE b.id = a.id AND b.id + a.id > 6)"
                 ),
                 Some(true),
             ),
@@ -511,8 +508,7 @@ async fn distributed_scans_match_local_ones() {
             (
                 format!(
                     "SELECT a.id, b.id AS b FROM (SELECT id FROM {t} WHERE id < 8) a \
-                     LEFT JOIN (SELECT id FROM {t} WHERE id % 2 = 0) b ON a.id * 2 = b.id \
-                     ORDER BY a.id"
+                     LEFT JOIN (SELECT id FROM {t} WHERE id % 2 = 0) b ON a.id * 2 = b.id"
                 ),
                 Some(true),
             ),
@@ -548,7 +544,22 @@ async fn distributed_scans_match_local_ones() {
             if let Some(broadcast) = broadcast {
                 assert_eq!(plan.contains("RemoteBroadcast"), broadcast, "{sql}: {plan}");
             }
-            assert_eq!(got, want, "{sql}");
+            // Broadcast joins are unordered here: with estimates from the
+            // bounds (ADR 0113), DataFusion may make a filtered side the
+            // build side and sort the other below the join for an ORDER
+            // BY, which keeps it local. Rows compare in any order (an empty
+            // answer may come with or without a header).
+            let lines = |s: &str| {
+                let mut l: Vec<String> = s
+                    .lines()
+                    .filter(|l| l.starts_with('|'))
+                    .skip(1)
+                    .map(str::to_owned)
+                    .collect();
+                l.sort();
+                l
+            };
+            assert_eq!(lines(&got), lines(&want), "{sql}");
         }
     }
     // Build sides over the broadcast limit (ADR 0099) are joined on the
@@ -580,9 +591,10 @@ async fn distributed_scans_match_local_ones() {
         let t = name.to_lowercase();
         for sql in [
             format!("SELECT a.id, b.id AS b FROM {t} a JOIN {t} b ON a.id = b.id ORDER BY a.id"),
+            // Unordered, for the reason given above.
             format!(
-                "SELECT a.id, b.id AS b FROM (SELECT id FROM {t} WHERE id < 8) a \
-                 LEFT JOIN (SELECT id FROM {t} WHERE id % 2 = 0) b ON a.id = b.id ORDER BY a.id"
+                "SELECT count(*), sum(a.id), count(b.id) FROM (SELECT id FROM {t} WHERE id < 8) a \
+                 LEFT JOIN (SELECT id FROM {t} WHERE id % 2 = 0) b ON a.id = b.id"
             ),
         ] {
             let (got, plan) = run(&capped, &sql).await;

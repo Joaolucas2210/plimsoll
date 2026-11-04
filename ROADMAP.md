@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Column statistics from manifests (bounds, null counts, inexact) and the scan's own filter selectivity, so filtered sides are sized for broadcast or shuffle (ADR 0113)
 - [x] Joins between a remote scan and a grouped aggregation of one, on its group keys: partial states are one side's maps, merged and joined in the same reducers (ADR 0112)
 - [x] Expression join keys on workers: the planner's key projection over a remote scan computed by the fragments (`computed`), so shuffled and broadcast joins take `ON lower(a.k) = lower(b.k)` (ADR 0111)
 - [x] The fast peer rounds back off (1, 2, 4, 5 s) while the same coordinators stay down, and restart at 1 s when the set changes (ADR 0110)
@@ -145,9 +146,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Column statistics from manifests** — per-column bounds and null
-counts from manifest entries as DataFusion statistics, so join sides and
-broadcasts are chosen from real sizes and selectivities (ADR 0064/0066).
+**Distinct counts from Puffin statistics** — the `statistics` files
+Spark and others write (`apache-datasketches-theta-v1`) as per-column
+distinct counts, for join cardinality estimates (ADR 0113).
 
 ## Missing
 
@@ -173,8 +174,8 @@ broadcasts are chosen from real sizes and selectivities (ADR 0064/0066).
 - SRV-based discovery; TLS to workers discovered by IP (ADR 0070).
 
 **Planning and performance**
-- Column statistics from manifests (above) and filter selectivity for
-  estimates; skip the shuffle for few-group
+- Distinct counts (above) and in-memory byte estimates (ADR 0113);
+  ordered joins kept local once a filtered side becomes the build side; skip the shuffle for few-group
   aggregations (ADR 0064/0066).
 - Skew: spill the largest bucket first, split hot buckets (ADR 0067).
 - Spilling hash-join build sides (DataFusion upstream, ADR 0068).

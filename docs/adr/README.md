@@ -120,12 +120,13 @@ are allowed in place.
 | [0110](0110-back-off-fast-rounds.md) | Backing off the fast peer rounds | Accepted | 2026-11-03 | `peers::Pace`: 1, 2, 4, 5 s while the same members stay down, back to 1 s when the down set changes, 5 s with none down | 0102, 0109 |
 | [0111](0111-expression-join-keys-on-workers.md) | Expression join keys on workers | Accepted | 2026-11-03 | The planner's key projection (every scan column, then the key expressions) over a remote scan becomes the scan with `Fragment::computed` (name, SQL) evaluated by the workers; join keys, schema and projection unchanged, so shuffles, broadcasts and gathered joins take expression keys; sent only when set, so old workers refuse | 0063, 0065, 0066, 0097, 0098 |
 | [0112](0112-joins-with-aggregations-on-workers.md) | Joins between a remote scan and an aggregation on workers | Accepted | 2026-11-03 | A shuffled join's side may be a grouped aggregation of a remote scan joined on exactly its group keys: its partial states are the maps, the reducer merges them, picks the side's columns as `c0…` and joins; one shuffle | 0064, 0065, 0098, 0111 |
+| [0113](0113-column-statistics-from-manifests.md) | Column statistics from manifests, and the scan's own filter estimates | Accepted | 2026-11-03 | Bounds' union and null counts over the kept files as inexact column statistics; the scan estimates its exact-pushed filters with DataFusion's `analyze` (default selectivity otherwise), so filtered sides are sized for broadcast or shuffle | 0010, 0054, 0055, 0062, 0066 |
 
 ## Reading order
 
 - Invariant first: 0003 (memory, with 0012, 0018 and 0036), 0005 (correctness).
 - Shape of the system: 0001, 0002, 0004.
-- Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
+- Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042 → 0113.
 - Federation: 0005 → 0006.
 - Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074 → 0091 → 0092 → 0093 → 0094 → 0097 → 0098 → 0099 → 0101 → 0102 → 0111 → 0112.
 - Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084 → 0085 → 0086 → 0087 → 0088 → 0089 → 0090 → 0091 → 0092 → 0093 → 0094 → 0095 → 0096.

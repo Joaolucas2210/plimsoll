@@ -962,6 +962,99 @@ async fn reads_a_spark_merge_on_read_table() {
         .unwrap()
         .register(&ctx)
         .unwrap();
+    // Column statistics from the manifests (ADR 0113): the data files'
+    // bounds, deleted rows included, so the live ids 1..=47 lie within
+    // them; and null counts. Estimates, never exact.
+    {
+        use datafusion::common::stats::Precision;
+        let plan = ctx
+            .sql("SELECT id, name FROM mor")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+        let stats = StatisticsContext::new()
+            .compute(plan.as_ref(), &StatisticsArgs::new())
+            .unwrap();
+        let id = &stats.column_statistics[0];
+        let as_i64 = |p: &Precision<datafusion::common::ScalarValue>| match p {
+            Precision::Inexact(v) => v.cast_to(&DataType::Int64).ok().and_then(|v| match v {
+                datafusion::common::ScalarValue::Int64(n) => n,
+                _ => None,
+            }),
+            other => panic!("expected an inexact bound, got {other:?}"),
+        };
+        let (lo, hi) = (
+            as_i64(&id.min_value).unwrap(),
+            as_i64(&id.max_value).unwrap(),
+        );
+        assert!(lo <= 1 && hi >= 47, "id bounds [{lo}, {hi}]");
+        assert!(
+            matches!(id.null_count, Precision::Inexact(0)),
+            "{:?}",
+            id.null_count
+        );
+        assert!(
+            matches!(stats.column_statistics[1].null_count, Precision::Inexact(_)),
+            "{:?}",
+            stats.column_statistics[1]
+        );
+        // Filters the scan applies itself are estimated from the bounds
+        // (ADR 0113): ids below 5 are a small share of [1, 47+].
+        let filtered = ctx
+            .sql("SELECT id FROM mor WHERE id < 5")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let estimate = StatisticsContext::new()
+            .compute(filtered.as_ref(), &StatisticsArgs::new())
+            .unwrap()
+            .num_rows;
+        assert!(
+            matches!(estimate, Precision::Inexact(n) if n <= 8),
+            "{estimate:?}"
+        );
+    }
+    // And the join planner sees it: with a 20-row threshold for collecting
+    // a side, the selective side is collected (a broadcast, distributed),
+    // the unselective one is not.
+    {
+        let config = SessionConfig::new().with_target_partitions(4);
+        let joins = session_context_with_ceiling(pool.clone(), None, config).unwrap();
+        {
+            let state = joins.state_ref();
+            let mut state = state.write();
+            let optimizer = &mut state.config_mut().options_mut().optimizer;
+            optimizer.hash_join_single_partition_threshold_rows = 20;
+        }
+        IcebergConnector::try_new("mor", &location, &joins.state())
+            .await
+            .unwrap()
+            .register(&joins)
+            .unwrap();
+        let mode = async |bound: i64| {
+            let plan = joins
+                .sql(&format!(
+                    "SELECT a.name FROM mor a JOIN mor b ON a.id = b.id WHERE b.id < {bound}"
+                ))
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+            datafusion::physical_plan::displayable(plan.as_ref())
+                .indent(true)
+                .to_string()
+        };
+        let selective = mode(5).await;
+        assert!(selective.contains("mode=CollectLeft"), "{selective}");
+        let broad = mode(45).await;
+        assert!(broad.contains("mode=Partitioned"), "{broad}");
+    }
     let check = async |sql: &str, expected: &str| {
         let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
         let out = datafusion::arrow::util::pretty::pretty_format_batches(&batches)

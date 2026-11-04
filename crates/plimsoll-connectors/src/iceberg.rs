@@ -21,7 +21,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit}
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::config::TableParquetOptions;
 use datafusion::common::stats::Precision;
-use datafusion::common::{DFSchema, Statistics};
+use datafusion::common::{ColumnStatistics, DFSchema, Statistics};
 use datafusion::common::{JoinType, NullEquality};
 use datafusion::datasource::listing::{ListingTableUrl, PartitionedFile};
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -561,6 +561,78 @@ struct PlanStats {
     cache_hits: usize,
     /// Manifest lists and manifests served from the cache (ADR 0039).
     manifest_cache_hits: usize,
+    /// Per top-level column (by field id), over the kept data files: what
+    /// their statistics say (ADR 0113).
+    columns: HashMap<i64, ColumnBounds>,
+}
+
+/// One column over the kept data files (ADR 0113): the union of their
+/// bounds and the sum of their null counts, each kept only while every
+/// file has it. Bounds stay bounds whatever deletes remove; counts become
+/// upper bounds. Both are estimates for DataFusion, never answers.
+#[derive(Debug, Clone)]
+struct ColumnBounds {
+    prim: Prim,
+    /// Every file so far had both bounds.
+    bounded: bool,
+    lo: Option<prune::Datum>,
+    hi: Option<prune::Datum>,
+    nulls: Option<u64>,
+}
+
+impl ColumnBounds {
+    fn new(prim: Prim) -> Self {
+        Self {
+            prim,
+            bounded: true,
+            lo: None,
+            hi: None,
+            nulls: Some(0),
+        }
+    }
+
+    fn add(
+        &mut self,
+        id: i64,
+        lower: &HashMap<i64, Vec<u8>>,
+        upper: &HashMap<i64, Vec<u8>>,
+        nulls: &HashMap<i64, i64>,
+    ) {
+        let decode = |m: &HashMap<i64, Vec<u8>>| m.get(&id).and_then(|b| self.prim.decode(b));
+        match (decode(lower), decode(upper)) {
+            (Some(lo), Some(hi)) if self.bounded => {
+                if self.lo.as_ref().is_none_or(|l| lo < *l) {
+                    self.lo = Some(lo);
+                }
+                if self.hi.as_ref().is_none_or(|h| hi > *h) {
+                    self.hi = Some(hi);
+                }
+            }
+            // An all-null file has no bounds either: unknown, not empty.
+            _ => self.bounded = false,
+        }
+        self.nulls = match (
+            self.nulls,
+            nulls.get(&id).and_then(|n| u64::try_from(*n).ok()),
+        ) {
+            (Some(total), Some(n)) => Some(total + n),
+            _ => None,
+        };
+    }
+
+    fn statistics(&self, ty: &DataType) -> ColumnStatistics {
+        let mut c = ColumnStatistics::new_unknown();
+        if let (true, Some(lo), Some(hi)) = (self.bounded, &self.lo, &self.hi) {
+            if let (Some(lo), Some(hi)) = (self.prim.scalar(lo, ty), self.prim.scalar(hi, ty)) {
+                c.min_value = Precision::Inexact(lo);
+                c.max_value = Precision::Inexact(hi);
+            }
+        }
+        if let Some(n) = self.nulls.and_then(|n| usize::try_from(n).ok()) {
+            c.null_count = Precision::Inexact(n);
+        }
+        c
+    }
 }
 
 impl IcebergTable {
@@ -729,6 +801,33 @@ impl IcebergTable {
         })
     }
 
+    /// The share of rows `filters` keep (ADR 0113): DataFusion's interval
+    /// analysis over the columns' bounds, else its default filter
+    /// selectivity, as FilterExec estimates.
+    fn selectivity(
+        &self,
+        state: &dyn Session,
+        filters: &[Expr],
+        columns: &[ColumnStatistics],
+    ) -> f64 {
+        let default =
+            f64::from(state.config_options().optimizer.default_filter_selectivity) / 100.0;
+        let analyzed = || -> Option<f64> {
+            let predicate = datafusion::logical_expr::utils::conjunction(filters.to_vec())?;
+            let schema = DFSchema::try_from(self.schema.as_ref().clone()).ok()?;
+            let physical = state.create_physical_expr(predicate, &schema).ok()?;
+            let context = datafusion::physical_expr::AnalysisContext::try_from_statistics(
+                &self.schema,
+                columns,
+            )
+            .ok()?;
+            datafusion::physical_expr::analyze(&physical, context, &self.schema)
+                .ok()?
+                .selectivity
+        };
+        analyzed().unwrap_or(default)
+    }
+
     /// Live data files of the pinned snapshot that may match `pruner`, with
     /// position deletes applied as row selections (ADR 0014) and the equality
     /// delete sets that apply to each (ADR 0016). Manifest bytes, the planned
@@ -743,6 +842,13 @@ impl IcebergTable {
         let Some(list_path) = &self.manifest_list else {
             return Ok((vec![], vec![], stats));
         };
+        // Top-level columns whose bounds compare (ADR 0113).
+        let tracked: Vec<(i64, Prim)> = self
+            .schema
+            .fields()
+            .iter()
+            .filter_map(|f| self.columns.get(f.name()).copied())
+            .collect();
         self.register_scoped(state);
         let reservation = MemoryConsumer::new(format!("IcebergPlanning[{}]", self.name))
             .register(&state.runtime_env().memory_pool);
@@ -950,22 +1056,34 @@ impl IcebergTable {
                     }
                 }
                 stats.files += 1;
+                let (lower, upper) = (
+                    bound_map(file, "lower_bounds"),
+                    bound_map(file, "upper_bounds"),
+                );
+                let nulls = count_map(file, "null_value_counts");
                 if !pruner.is_empty()
                     && !(pruner.may_match_partition(
                         self.specs.get(&spec_id).map_or(&[][..], Vec::as_slice),
                         field(file, "partition"),
                     ) && pruner.may_match_file(
-                        &bound_map(file, "lower_bounds"),
-                        &bound_map(file, "upper_bounds"),
+                        &lower,
+                        &upper,
                         &prune::Counts {
                             values: count_map(file, "value_counts"),
-                            nulls: count_map(file, "null_value_counts"),
+                            nulls: nulls.clone(),
                         },
                     ))
                 {
                     continue;
                 }
                 stats.files_kept += 1;
+                for &(id, prim) in &tracked {
+                    stats
+                        .columns
+                        .entry(id)
+                        .or_insert_with(|| ColumnBounds::new(prim))
+                        .add(id, &lower, &upper, &nulls);
+                }
                 // The planned file list grows with the table: reserve it too.
                 // ponytail: released when planning returns; the list then
                 // lives in the plan (O(files) paths) until the query ends.
@@ -1354,7 +1472,8 @@ impl TableProvider for IcebergTable {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let pruner = Pruner::new(filters, &self.columns);
         let planning = std::time::Instant::now();
-        let (mut files, sets, stats) = self.data_files(state, &pruner).await?;
+        let (mut files, sets, mut stats) = self.data_files(state, &pruner).await?;
+        let stats_columns = std::mem::take(&mut stats.columns);
         // A span in the query's trace (ADR 0056): where planning time went.
         plimsoll_core::plan_trace::record(
             "iceberg.plan",
@@ -1603,17 +1722,49 @@ impl TableProvider for IcebergTable {
                 .and_then(|n| usize::try_from(n).ok())
                 .map(Precision::Inexact)
         });
-        Ok(Arc::new(match rows {
-            Some(rows) => {
-                let schema = match projection {
-                    Some(p) => Arc::new(self.schema.project(p)?),
-                    None => self.schema.clone(),
+        // Per column, what the kept files' bounds and null counts say
+        // (ADR 0113), over the whole table: the filters may read columns
+        // the projection drops.
+        let mut table = Statistics::new_unknown(&self.schema);
+        for (field, c) in self
+            .schema
+            .fields()
+            .iter()
+            .zip(&mut table.column_statistics)
+        {
+            if let Some(b) = self
+                .columns
+                .get(field.name())
+                .and_then(|(id, _)| stats_columns.get(id))
+            {
+                *c = b.statistics(field.data_type());
+            }
+        }
+        // The filters this scan applies itself (exact pushdown, ADR 0055,
+        // 0062) leave no FilterExec to estimate them: their selectivity is
+        // estimated here, as FilterExec would from the same bounds.
+        let rows = match (rows, filters.is_empty()) {
+            (Some(rows), false) => Some(rows.with_estimated_selectivity(self.selectivity(
+                state,
+                filters,
+                &table.column_statistics,
+            ))),
+            (rows, _) => rows,
+        };
+        let known = table
+            .column_statistics
+            .iter()
+            .any(|c| c != &ColumnStatistics::new_unknown());
+        Ok(Arc::new(match (rows, known) {
+            (None, false) => scan,
+            (rows, _) => {
+                let mut statistics = match projection {
+                    Some(p) => table.project(Some(p)),
+                    None => table,
                 };
-                let mut statistics = Statistics::new_unknown(&schema);
-                statistics.num_rows = rows;
+                statistics.num_rows = rows.unwrap_or(Precision::Absent);
                 scan.with_statistics(statistics)
             }
-            None => scan,
         }))
     }
 }

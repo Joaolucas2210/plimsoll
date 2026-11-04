@@ -67,7 +67,7 @@ impl Prim {
     }
 
     /// Iceberg single-value binary serialization -> comparable datum.
-    fn decode(self, bytes: &[u8]) -> Option<Datum> {
+    pub(super) fn decode(self, bytes: &[u8]) -> Option<Datum> {
         Some(match self {
             Self::Bool => Datum::Int(i64::from(*bytes.first()? != 0)),
             Self::Int | Self::Date => {
@@ -85,6 +85,49 @@ impl Prim {
                 be[16 - bytes.len()..].copy_from_slice(bytes);
                 Datum::Big(i128::from_be_bytes(be))
             }
+        })
+    }
+}
+
+impl Prim {
+    /// A bound as the value of a column of type `ty` (ADR 0113), or `None`
+    /// when the two do not correspond (a type DataFusion reads differently
+    /// than Iceberg stores it).
+    pub(super) fn scalar(
+        self,
+        d: &Datum,
+        ty: &datafusion::arrow::datatypes::DataType,
+    ) -> Option<ScalarValue> {
+        use datafusion::arrow::datatypes::{DataType, TimeUnit};
+        Some(match (self, d, ty) {
+            (Self::Bool, Datum::Int(v), DataType::Boolean) => ScalarValue::Boolean(Some(*v != 0)),
+            (Self::Int, Datum::Int(v), DataType::Int32) => {
+                ScalarValue::Int32(Some(i32::try_from(*v).ok()?))
+            }
+            (Self::Int | Self::Long, Datum::Int(v), DataType::Int64) => {
+                ScalarValue::Int64(Some(*v))
+            }
+            (Self::Date, Datum::Int(v), DataType::Date32) => {
+                ScalarValue::Date32(Some(i32::try_from(*v).ok()?))
+            }
+            (Self::Timestamp, Datum::Int(v), DataType::Timestamp(TimeUnit::Microsecond, tz)) => {
+                ScalarValue::TimestampMicrosecond(Some(*v), tz.clone())
+            }
+            // A truncated bound is still a bound: the lower one a prefix,
+            // the upper one past every value (spec).
+            (Self::String, Datum::Bytes(b), DataType::Utf8) => {
+                ScalarValue::Utf8(Some(String::from_utf8(b.clone()).ok()?))
+            }
+            (Self::String, Datum::Bytes(b), DataType::LargeUtf8) => {
+                ScalarValue::LargeUtf8(Some(String::from_utf8(b.clone()).ok()?))
+            }
+            (Self::String, Datum::Bytes(b), DataType::Utf8View) => {
+                ScalarValue::Utf8View(Some(String::from_utf8(b.clone()).ok()?))
+            }
+            (Self::Decimal(s), Datum::Big(v), DataType::Decimal128(p, t)) if s == *t => {
+                ScalarValue::Decimal128(Some(*v), *p, *t)
+            }
+            _ => return None,
         })
     }
 }
