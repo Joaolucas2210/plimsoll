@@ -1064,6 +1064,11 @@ impl QueryEngine for CoreEngine {
             df = df.aggregate(groups, aggregates).map_err(fail)?;
         } else {
             df = df.select(f.columns.iter().map(ident)).map_err(fail)?;
+            // Expression join keys (ADR 0111), computed where the rows are.
+            for (name, sql) in &f.computed {
+                let e = df.parse_sql_expr(sql).map_err(fail)?;
+                df = df.with_column(name, e).map_err(fail)?;
+            }
         }
         if let Some(b) = &f.broadcast {
             let Some((schema, batches)) = build else {
@@ -1176,7 +1181,9 @@ impl QueryEngine for CoreEngine {
                 names
                     .iter()
                     .map(|k| {
-                        f.columns.iter().position(|c| c == k).ok_or_else(|| {
+                        // Computed keys follow the columns (ADR 0111).
+                        let mut output = f.columns.iter().chain(f.computed.iter().map(|(n, _)| n));
+                        output.position(|c| c == k).ok_or_else(|| {
                             EngineError::InvalidQuery(format!("join key {k} is not a map column"))
                         })
                     })
@@ -1672,6 +1679,7 @@ mod tests {
             write: None,
             change: None,
             merge: None,
+            computed: Vec::new(),
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         for id in ["rel-a", "rel-a~m1r0"] {

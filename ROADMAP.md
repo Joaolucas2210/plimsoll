@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Expression join keys on workers: the planner's key projection over a remote scan computed by the fragments (`computed`), so shuffled and broadcast joins take `ON lower(a.k) = lower(b.k)` (ADR 0111)
 - [x] The fast peer rounds back off (1, 2, 4, 5 s) while the same coordinators stay down, and restart at 1 s when the set changes (ADR 0110)
 - [x] Peer rounds every 1 s instead of 5 s while a coordinator is down, so a returning one is counted within a second (ADR 0109)
 - [x] A leader announces itself to peers it sees after the election (late, healed, booted) and holds until they follow (ADR 0108)
@@ -143,9 +144,10 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Expression join keys on workers** — hash expression keys
-(`ON lower(a.k) = lower(b.k)`) on the maps, shipped as SQL like
-aggregation keys, so shuffled and broadcast joins take them too.
+**Joins between a remote scan and an aggregate** — a join whose side
+is a grouped aggregation of a remote scan (ADR 0064) shuffles that
+aggregation's reduce output by the join keys instead of gathering it
+on the coordinator (ADR 0065).
 
 ## Missing
 
@@ -155,16 +157,16 @@ aggregation keys, so shuffled and broadcast joins take them too.
 - Several deletion vectors per Puffin file; v3 compaction of files with
   equality deletes; decimal partition values; vectorized partition
   transforms.
-- Maintenance: a per-table lease for several coordinators, per-step
-  schedules, metrics.
+- Maintenance: per-step schedules, metrics.
 - DDL: nested type promotions, leaf statistics for nested fields,
   `CREATE OR REPLACE TABLE … AS SELECT`.
 
 **Distribution**
-- Expression join keys on workers (above); non-equi (nested loop)
-  joins against a small side; an explicit cap on broadcast build sides,
-  or caching them per snapshot (ADR 0066).
-- Joins between a remote scan and an aggregate or subquery (ADR 0065).
+- Non-equi (nested loop) joins against a small side; caching broadcast
+  build sides per snapshot (ADR 0066); join sides under projections
+  that also prune columns (ADR 0111).
+- Joins between a remote scan and an aggregate (above) or subquery
+  (ADR 0065).
 - Cheaper recovery: one re-run of a lost map serving every reducer;
   more than one retry per step (ADR 0072).
 - Postgres (federated) scans stay on the coordinator.

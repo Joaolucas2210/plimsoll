@@ -258,6 +258,11 @@ pub struct Fragment {
     /// source attached: `WHEN MATCHED` and `NOT MATCHED BY SOURCE` applied,
     /// the files written returned, then which source rows paired.
     pub merge: Option<MergeSpec>,
+    /// Columns computed after `columns`, `(name, SQL over them)`: the
+    /// expression join keys DataFusion projects below a join (ADR 0111).
+    /// Sent only when set, so a worker that does not know them refuses the
+    /// fragment.
+    pub computed: Vec<(String, String)>,
 }
 
 /// A `MERGE` as a worker runs it (ADR 0094): SQL over the merged row,
@@ -677,7 +682,7 @@ pub struct AggregateSpec {
 
 impl Fragment {
     pub fn to_json(&self) -> Json {
-        json!({
+        let mut v = json!({
             "metadata_location": self.metadata_location,
             "snapshot_id": self.snapshot_id,
             "files": self.files,
@@ -701,13 +706,18 @@ impl Fragment {
                 "group_by": a.group_by,
                 "aggregates": a.aggregates.iter().map(|(f, c)| json!({"fn": f, "column": c})).collect::<Vec<_>>(),
             })),
-        })
+        });
+        if !self.computed.is_empty() {
+            v["computed"] = self.computed.iter().map(|(n, e)| json!([n, e])).collect();
+        }
+        v
     }
 
     pub fn from_json(v: &Json) -> Result<Self, String> {
         // A field this worker does not know could change the answer (a
         // filter it would skip): refuse it rather than ignore it.
-        const KNOWN: [&str; 11] = [
+        const KNOWN: [&str; 12] = [
+            "computed",
             "merge",
             "change",
             "write",
@@ -752,6 +762,18 @@ impl Fragment {
             columns: strings("columns")?,
             write: WriteTo::from_json(&v["write"])?,
             merge: MergeSpec::from_json(&v["merge"])?,
+            computed: match &v["computed"] {
+                Json::Null => Vec::new(),
+                c => c
+                    .as_array()
+                    .ok_or("`computed` must be an array")?
+                    .iter()
+                    .map(|p| match (p[0].as_str(), p[1].as_str()) {
+                        (Some(n), Some(e)) => Ok((n.to_owned(), e.to_owned())),
+                        _ => Err("`computed[]` is [name, sql]".to_owned()),
+                    })
+                    .collect::<Result<_, _>>()?,
+            },
             change: match &v["change"] {
                 Json::Null => None,
                 c => Some(RowChange {
@@ -905,6 +927,7 @@ impl RemoteScanExec {
                     write: None,
                     change: None,
                     merge: None,
+                    computed: Vec::new(),
                 },
             })
             .collect();
@@ -1976,6 +1999,52 @@ pub(crate) fn remote_under(input: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn Exe
     Some(remote)
 }
 
+/// A join side the workers can produce: a plain remote scan, or one under
+/// the projection DataFusion adds to compute expression join keys (every
+/// scan column in order, then the keys), as that scan with the keys
+/// computed on the workers (ADR 0111).
+fn scan_side(input: &Arc<dyn ExecutionPlan>, config: &ConfigOptions) -> Option<RemoteScanExec> {
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion::physical_plan::projection::ProjectionExec;
+    if let Some(r) = remote_under(input) {
+        let scan = r.as_ref().downcast_ref::<RemoteScanExec>()?;
+        return Some(scan.with_schema(scan.schema.clone()));
+    }
+    let mut p = input.clone();
+    while matches!(p.name(), "RepartitionExec" | "CoalesceBatchesExec") {
+        p = p.children().first().map(|c| (*c).clone())?;
+    }
+    let projection = p.as_ref().downcast_ref::<ProjectionExec>()?;
+    let below = projection.input();
+    let r = remote_under(below)?;
+    let scan = r.as_ref().downcast_ref::<RemoteScanExec>()?;
+    let inner = below.schema();
+    let width = inner.fields().len();
+    let exprs = projection.expr();
+    if exprs.len() <= width {
+        return None;
+    }
+    for (i, e) in exprs.iter().take(width).enumerate() {
+        let c = e.expr.as_ref().downcast_ref::<Column>()?;
+        if c.index() != i || e.alias != *inner.field(i).name() {
+            return None;
+        }
+    }
+    let computed = exprs
+        .iter()
+        .skip(width)
+        .map(|e| {
+            let sql = crate::portable::physical_sql_equivalent(&e.expr, &inner, config)?;
+            Some((e.alias.clone(), sql))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let mut side = scan.with_schema(projection.schema());
+    for a in &mut side.fragments {
+        a.fragment.computed = computed.clone();
+    }
+    Some(side)
+}
+
 /// Replaces a grouped final aggregation over a pushable partial one with
 /// a shuffle between the workers (ADR 0064), when nothing above depends
 /// on its partitioning (`free`). Recurses into the children otherwise.
@@ -2049,9 +2118,11 @@ fn shuffle_join(
     {
         return None;
     }
-    let (l, r) = (remote_under(join.left())?, remote_under(join.right())?);
-    let left = l.as_ref().downcast_ref::<RemoteScanExec>()?;
-    let right = r.as_ref().downcast_ref::<RemoteScanExec>()?;
+    let (left, right) = (
+        scan_side(join.left(), config)?,
+        scan_side(join.right(), config)?,
+    );
+    let (left, right) = (&left, &right);
     let plain = |s: &RemoteScanExec| {
         !s.fragments.is_empty() && s.fragments.iter().all(|a| a.fragment.aggregate.is_none())
     };
@@ -2146,12 +2217,10 @@ fn broadcast_join(
     {
         return Ok(None);
     }
-    let Some(r) = remote_under(join.right()) else {
+    let Some(probe) = scan_side(join.right(), config) else {
         return Ok(None);
     };
-    let Some(probe) = r.as_ref().downcast_ref::<RemoteScanExec>() else {
-        return Ok(None);
-    };
+    let probe = &probe;
     if probe.workers.broadcast_limit == 0 {
         return Ok(None);
     }
@@ -2662,6 +2731,7 @@ mod tests {
                 predicate: "id > 3".into(),
                 update: Some(vec!["id".into(), "upper(name)".into()]),
             }),
+            computed: vec![("lower(name)".into(), "lower(\"name\")".into())],
             merge: Some(MergeSpec {
                 target_keys: vec!["t0".into()],
                 source_keys: vec!["s0".into()],

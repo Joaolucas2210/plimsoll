@@ -118,6 +118,7 @@ are allowed in place.
 | [0108](0108-announce-to-late-peers.md) | Announcing to peers that missed the election | Accepted | 2026-11-03 | While leading, each round announces (`/v1/peer/round`) to live peers not yet `seen` and holds until they follow (10 s bound); once per appearance, so disagreement does not stall; numbered announcements, only the latest ends the hold; alone → no hold | 0104, 0105, 0106, 0107 |
 | [0109](0109-faster-rounds-while-a-peer-is-down.md) | Faster peer rounds while a peer is down | Accepted | 2026-11-03 | `Peers::next_round`: 1 s (`FAST_ROUND`) while any member failed its last health check, 5 s otherwise; a returning coordinator is seen and re-homed within ~1 s; the takeover hold bound is unchanged | 0102, 0105, 0108 |
 | [0110](0110-back-off-fast-rounds.md) | Backing off the fast peer rounds | Accepted | 2026-11-03 | `peers::Pace`: 1, 2, 4, 5 s while the same members stay down, back to 1 s when the down set changes, 5 s with none down | 0102, 0109 |
+| [0111](0111-expression-join-keys-on-workers.md) | Expression join keys on workers | Accepted | 2026-11-03 | The planner's key projection (every scan column, then the key expressions) over a remote scan becomes the scan with `Fragment::computed` (name, SQL) evaluated by the workers; join keys, schema and projection unchanged, so shuffles, broadcasts and gathered joins take expression keys; sent only when set, so old workers refuse | 0063, 0065, 0066, 0097, 0098 |
 
 ## Reading order
 
@@ -125,7 +126,7 @@ are allowed in place.
 - Shape of the system: 0001, 0002, 0004.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042.
 - Federation: 0005 → 0006.
-- Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074 → 0091 → 0092 → 0093 → 0094 → 0097 → 0098 → 0099 → 0101 → 0102.
+- Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074 → 0091 → 0092 → 0093 → 0094 → 0097 → 0098 → 0099 → 0101 → 0102 → 0111.
 - Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084 → 0085 → 0086 → 0087 → 0088 → 0089 → 0090 → 0091 → 0092 → 0093 → 0094 → 0095 → 0096.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057 → 0100.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046 → 0103 → 0104 → 0105 → 0106 → 0107 → 0108 → 0109 → 0110.

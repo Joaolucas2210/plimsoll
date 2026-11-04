@@ -336,6 +336,15 @@ async fn distributed_scans_match_local_ones() {
                 "SELECT count(*), sum(a.id), count(b.id) FROM {t} a LEFT JOIN {t} b \
                  ON a.id = b.id AND a.id + b.id > 10"
             ),
+            // Expression keys (ADR 0111): hashed on the maps, joined on
+            // the reducers; alone, and beside a column key.
+            format!(
+                "SELECT a.id, b.id AS b FROM {t} a JOIN {t} b ON a.id + 1 = b.id ORDER BY a.id, b"
+            ),
+            format!(
+                "SELECT a.id, b.id AS b FROM {t} a LEFT JOIN {t} b \
+                 ON upper(a.{group}) = upper(b.{group}) AND a.id = b.id ORDER BY a.id, b"
+            ),
         ] {
             joins_match(&sql).await;
         }
@@ -448,6 +457,31 @@ async fn distributed_scans_match_local_ones() {
                 format!(
                     "SELECT a.id FROM (SELECT id FROM {t} WHERE id < 8) a WHERE EXISTS \
                      (SELECT 1 FROM {t} b WHERE b.id = a.id AND b.id + a.id > 6) ORDER BY a.id"
+                ),
+                Some(true),
+            ),
+            // Expression keys (ADR 0111), probed on the workers and
+            // gathered.
+            (
+                format!(
+                    "SELECT count(*), sum(a.id) FROM {t} a \
+                     JOIN (SELECT id FROM {t} WHERE id < 5) b ON a.id = b.id + 1"
+                ),
+                Some(true),
+            ),
+            // Computed on the probe side, by the workers.
+            (
+                format!(
+                    "SELECT count(*), sum(a.id) FROM {t} a \
+                     JOIN (SELECT id FROM {t} WHERE id < 5) b ON a.id + 1 = b.id"
+                ),
+                Some(true),
+            ),
+            (
+                format!(
+                    "SELECT a.id, b.id AS b FROM (SELECT id FROM {t} WHERE id < 8) a \
+                     LEFT JOIN (SELECT id FROM {t} WHERE id % 2 = 0) b ON a.id * 2 = b.id \
+                     ORDER BY a.id"
                 ),
                 Some(true),
             ),
