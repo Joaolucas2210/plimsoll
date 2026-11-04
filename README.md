@@ -226,7 +226,9 @@ than 1 hour ago is refused, as a write in flight may still commit them)
 - `/metrics` — Prometheus text: `plimsoll_pool_used_bytes`,
   `plimsoll_pool_limit_bytes`, `plimsoll_spill_bytes_total`,
   `plimsoll_queries_running`, `plimsoll_queries_queued`,
-  `plimsoll_queries_total{state}`.
+  `plimsoll_queries_total{state}`; on workers,
+  `plimsoll_fragments_total{kind,outcome}` and rows and bytes per kind
+  (ADR 0119).
 
 ### Tests and gates
 
@@ -238,7 +240,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 ## Decision records
 
 Index with status, date and the one-line decision of every ADR:
-[docs/adr/README.md](docs/adr/README.md) (0001–0118; template in
+[docs/adr/README.md](docs/adr/README.md) (0001–0119; template in
 [docs/adr/0000-template.md](docs/adr/0000-template.md)).
 
 Roadmap: [ROADMAP.md](ROADMAP.md).

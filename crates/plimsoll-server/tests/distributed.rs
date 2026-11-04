@@ -48,6 +48,7 @@ async fn worker_with(groups: std::collections::HashMap<String, Limits>) -> (Stri
         serving: AtomicBool::new(true),
         started: Instant::now(),
         errors: Default::default(),
+        fragments: Default::default(),
         latency: Default::default(),
         auth: Auth::Disabled,
         tracer: None,
@@ -796,6 +797,21 @@ async fn workers_govern_fragments_and_report_health() {
     assert!(err.to_string().contains("429"), "{err}");
     drop(held);
     assert_eq!(run(&coordinator, sql).await.0, want);
+    // What the worker served, by kind (ADR 0119): a scan per query that
+    // ran (the one refused with 429 never did), all 32 rows each.
+    let served = state.fragments.snapshot();
+    let scans = served.get("scan").copied().unwrap_or_default();
+    assert_eq!(
+        (scans.ok, scans.failed, scans.rows),
+        (2, 0, 64),
+        "{served:?}"
+    );
+    assert!(scans.bytes > 0);
+    let exposition = state.exposition();
+    assert!(
+        exposition.contains("plimsoll_fragments_total{kind=\"scan\",outcome=\"ok\"} 2"),
+        "{exposition}"
+    );
 
     // A worker that stops being ready leaves the rotation: the scan runs
     // locally with the same answer; ready again, it comes back.

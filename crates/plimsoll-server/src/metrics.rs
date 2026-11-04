@@ -84,6 +84,16 @@ impl Histogram {
     }
 }
 
+/// One kind of fragment a worker served (ADR 0119): requests that ended
+/// well or not, and the rows and Arrow bytes they sent back.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FragmentStats {
+    pub ok: u64,
+    pub failed: u64,
+    pub rows: u64,
+    pub bytes: u64,
+}
+
 /// Query latency by phase (ADR 0019). `queue` and `total` cover every query
 /// admitted to the engine; the others only successful ones (a failed query
 /// has no complete plan/execute/serialize split).
@@ -103,6 +113,7 @@ pub fn render(
     totals: QueryTotals,
     errors: &BTreeMap<&'static str, u64>,
     latency: &Latency,
+    fragments: &BTreeMap<&'static str, FragmentStats>,
 ) -> String {
     let mut out = String::new();
     let mut metric = |name: &str, kind: &str, help: &str, samples: &[(&str, u64)]| {
@@ -218,6 +229,40 @@ pub fn render(
             .iter()
             .map(|(l, n)| (l.as_str(), *n))
             .collect::<Vec<_>>(),
+    );
+    // What this node served as a worker, by kind (ADR 0119).
+    let served: Vec<(String, u64)> = fragments
+        .iter()
+        .flat_map(|(kind, s)| {
+            [
+                (format!("{{kind=\"{kind}\",outcome=\"ok\"}}"), s.ok),
+                (format!("{{kind=\"{kind}\",outcome=\"error\"}}"), s.failed),
+            ]
+        })
+        .collect();
+    metric(
+        "plimsoll_fragments_total",
+        "counter",
+        "Fragments served as a worker, by kind and outcome (ADR 0119).",
+        &refs(&served),
+    );
+    let by_kind = |f: fn(&FragmentStats) -> u64| -> Vec<(String, u64)> {
+        fragments
+            .iter()
+            .map(|(kind, s)| (format!("{{kind=\"{kind}\"}}"), f(s)))
+            .collect()
+    };
+    metric(
+        "plimsoll_fragment_rows_total",
+        "counter",
+        "Rows fragments sent back, by kind.",
+        &refs(&by_kind(|s| s.rows)),
+    );
+    metric(
+        "plimsoll_fragment_bytes_total",
+        "counter",
+        "Arrow IPC bytes fragments sent back, by kind.",
+        &refs(&by_kind(|s| s.bytes)),
     );
     let name = "plimsoll_query_duration_seconds";
     let _ = writeln!(
@@ -487,7 +532,16 @@ mod tests {
         latency.planning.observe(Duration::from_millis(3));
         latency.planning.observe(Duration::from_millis(30));
         latency.planning.observe(Duration::from_secs(900));
-        let text = render(pool, 2, 1, totals, &errors, &latency);
+        let fragments = BTreeMap::from([(
+            "scan",
+            FragmentStats {
+                ok: 5,
+                failed: 1,
+                rows: 40,
+                bytes: 2048,
+            },
+        )]);
+        let text = render(pool, 2, 1, totals, &errors, &latency, &fragments);
         for line in [
             "plimsoll_pool_used_bytes 10",
             "plimsoll_pool_limit_bytes 100",
@@ -513,6 +567,11 @@ mod tests {
             "plimsoll_query_duration_seconds_count{phase=\"planning\"} 3",
             "plimsoll_query_duration_seconds_count{phase=\"queue\"} 0",
             "plimsoll_query_errors_total{code=\"unsupported_feature\"} 1",
+            "plimsoll_fragments_total{kind=\"scan\",outcome=\"ok\"} 5",
+            "plimsoll_fragments_total{kind=\"scan\",outcome=\"error\"} 1",
+            "plimsoll_fragment_rows_total{kind=\"scan\"} 40",
+            "plimsoll_fragment_bytes_total{kind=\"scan\"} 2048",
+            "# TYPE plimsoll_fragments_total counter",
         ] {
             assert!(text.lines().any(|l| l == line), "missing {line}\n{text}");
         }
@@ -533,7 +592,15 @@ mod tests {
             failed: 1,
             cancelled: 0,
         };
-        let text = render(pool, 2, 1, totals, &BTreeMap::new(), &latency);
+        let text = render(
+            pool,
+            2,
+            1,
+            totals,
+            &BTreeMap::new(),
+            &latency,
+            &BTreeMap::new(),
+        );
         let metrics = to_otlp(&text, "1", "2");
         let get = |name: &str| {
             metrics

@@ -244,6 +244,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         serving: AtomicBool::new(false),
         started: Instant::now(),
         errors: Default::default(),
+        fragments: Default::default(),
         latency: Default::default(),
         auth: cfg.auth.clone(),
         tracer,

@@ -42,6 +42,8 @@ pub struct AppState {
     pub started: Instant,
     /// `/v1/sql` errors by `code`, for `plimsoll_query_errors_total`.
     pub errors: ErrorCounts,
+    /// Fragments served as a worker, by kind (ADR 0119).
+    pub fragments: FragmentCounts,
     pub latency: Latency,
     pub auth: Auth,
     /// OTLP export; traces are propagated even without it (ADR 0031).
@@ -71,6 +73,31 @@ impl ErrorCounts {
     }
 
     pub fn snapshot(&self) -> BTreeMap<&'static str, u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Fragments served as a worker, by kind (ADR 0119).
+#[derive(Default)]
+pub struct FragmentCounts(Mutex<BTreeMap<&'static str, metrics::FragmentStats>>);
+
+impl FragmentCounts {
+    fn record(&self, kind: &'static str, ok: bool, rows: u64, bytes: u64) {
+        let mut all = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let s = all.entry(kind).or_default();
+        if ok {
+            s.ok += 1;
+        } else {
+            s.failed += 1;
+        }
+        s.rows += rows;
+        s.bytes += bytes;
+    }
+
+    pub fn snapshot(&self) -> BTreeMap<&'static str, metrics::FragmentStats> {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -144,6 +171,7 @@ impl AppState {
             self.admission.registry().totals(),
             &self.errors.snapshot(),
             &self.latency,
+            &self.fragments.snapshot(),
         )
     }
 }
@@ -739,6 +767,9 @@ struct FragmentReport {
 impl Drop for FragmentReport {
     fn drop(&mut self) {
         let elapsed = self.started.elapsed();
+        self.st
+            .fragments
+            .record(self.kind, self.error.is_none(), self.rows, self.bytes);
         let level = if self.error.is_some() {
             Level::Warn
         } else {
@@ -1637,6 +1668,7 @@ mod tests {
             serving: AtomicBool::new(true),
             started: Instant::now(),
             errors: ErrorCounts::default(),
+            fragments: Default::default(),
             latency: Latency::default(),
             auth: Auth::Disabled,
             tracer: None,
