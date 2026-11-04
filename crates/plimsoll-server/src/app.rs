@@ -659,6 +659,10 @@ async fn fragment(
         _slot: slot,
         plan: None,
     };
+    // The spill this fragment reports after its stream when asked (ADR
+    // 0121): its plan's, a map's credit, and its maps' for a reduce.
+    let trailer = header(plimsoll_connectors::remote::TRAILER_HEADER) == Some("spill");
+    let peers_spill = plimsoll_core::engine::SpillSink::default();
     let run = match task {
         Task::Scan(f) => {
             st.engine
@@ -667,22 +671,24 @@ async fn fragment(
         }
         Task::Release(shuffle) => st.engine.release(&shuffle).await,
         Task::Reduce(r) => {
-            // Peers see the query as this worker saw it.
+            // Peers see the query as this worker saw it; what its maps
+            // spilled comes back with their buckets (ADR 0121).
             let tag = query_id.map(|query_id| {
                 Arc::new(plimsoll_core::engine::QueryTag {
                     query_id,
                     user: report.user.clone(),
                     traceparent: Some(report.ctx.traceparent()),
                     deadline: Some(Instant::now() + budget),
+                    spill: Some(peers_spill.clone()),
                 })
             });
             st.engine.reduce(r, token.unwrap_or_default(), tag).await
         }
     };
-    let stream = match run {
+    let (stream, credit) = match run {
         Ok(r) => {
             report.plan = r.plan;
-            r.stream
+            (r.stream, r.credit)
         }
         Err(e) => {
             let e = GovernedError::Failed(e);
@@ -703,8 +709,9 @@ async fn fragment(
         }
     };
     let state = (stream, Some(writer), report);
-    let chunks =
-        futures::stream::unfold(state, move |(mut stream, writer, mut report)| async move {
+    let chunks = futures::stream::unfold(state, move |(mut stream, writer, mut report)| {
+        let peers_spill = peers_spill.clone();
+        async move {
             let mut writer = writer?;
             let fail = |report: &mut FragmentReport, e: String| {
                 report.error = Some(e.clone());
@@ -734,12 +741,25 @@ async fn fragment(
                 }
                 Some(Err(e)) => fail(&mut report, e.to_string()),
                 None => match writer.finish() {
-                    Ok(()) => Ok(std::mem::take(writer.get_mut())),
+                    Ok(()) => {
+                        let mut bytes = std::mem::take(writer.get_mut());
+                        if trailer {
+                            let own = report
+                                .plan
+                                .as_ref()
+                                .map_or(0, |p| plimsoll_core::memory::spilled_bytes(p) as u64);
+                            bytes.extend(plimsoll_connectors::remote::spill_trailer(
+                                own + credit + peers_spill.bytes(),
+                            ));
+                        }
+                        Ok(bytes)
+                    }
                     Err(e) => fail(&mut report, e.to_string()),
                 },
             };
             Some((out, (stream, None, report)))
-        });
+        }
+    });
     (
         [(header::CONTENT_TYPE, "application/vnd.apache.arrow.stream")],
         axum::body::Body::from_stream(chunks),
@@ -1146,10 +1166,11 @@ async fn sql(
 /// its stream counted when dropped (ADR 0118), in its log line and its
 /// registry entry.
 fn settle_spill(st: &AppState, log: &mut QueryLog) {
-    let (None, Some(id), Some(sink)) = (log.spilled_bytes, log.query_id, &log.spill) else {
+    let (Some(id), Some(sink)) = (log.query_id, &log.spill) else {
         return;
     };
-    let bytes = sink.bytes();
+    // The sink also holds what workers reported (ADR 0121).
+    let bytes = sink.bytes().max(log.spilled_bytes.unwrap_or(0));
     log.spilled_bytes = Some(bytes);
     st.admission.registry().record_spill(id, bytes);
 }
@@ -1519,6 +1540,8 @@ async fn run_sql(
         user: request.user.clone(),
         traceparent: log.traceparent.clone(),
         deadline: Some(Instant::now() + st.query_timeout),
+        // Workers' spill joins the query's own (ADR 0121).
+        spill: Some(viewer.spill.clone()),
     });
     match req.format.as_deref() {
         None | Some("json") => {}

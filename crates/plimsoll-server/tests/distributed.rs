@@ -836,7 +836,8 @@ async fn fragments_carry_the_query_identity() {
     use plimsoll_core::engine::QueryTag;
     use tokio::sync::mpsc;
 
-    // A fake worker: records the headers, answers one row as Arrow IPC.
+    // A fake worker: records the headers, answers one row as Arrow IPC,
+    // then, when asked, what it spilled (ADR 0121).
     let (tx, mut rx) = mpsc::unbounded_channel();
     let app = axum::Router::new().route(
         "/v1/fragment",
@@ -848,6 +849,7 @@ async fn fragments_carry_the_query_identity() {
                 get("traceparent"),
                 get("x-plimsoll-deadline-ms"),
                 get("authorization"),
+                get("x-plimsoll-trailer"),
             ))
             .unwrap();
             let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -857,7 +859,11 @@ async fn fragments_carry_the_query_identity() {
             let mut w = StreamWriter::try_new(Vec::new(), &schema).unwrap();
             w.write(&batch).unwrap();
             w.finish().unwrap();
-            w.into_inner().unwrap()
+            let mut body = w.into_inner().unwrap();
+            if headers.get("x-plimsoll-trailer").is_some() {
+                body.extend(plimsoll_connectors::remote::spill_trailer(4096));
+            }
+            body
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -875,11 +881,13 @@ async fn fragments_carry_the_query_identity() {
         vec![("file:///t/data/a.parquet".into(), Some(10))],
         vec!["id".into()],
     ));
+    let spill = plimsoll_core::engine::SpillSink::default();
     let tag = |deadline: Duration| QueryTag {
         query_id: 7,
         user: "ana".into(),
         traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
         deadline: Some(Instant::now() + deadline),
+        spill: Some(spill.clone()),
     };
     let ctx = plimsoll_core::datafusion::prelude::SessionContext::new_with_config(
         plimsoll_core::datafusion::prelude::SessionConfig::new()
@@ -889,7 +897,10 @@ async fn fragments_carry_the_query_identity() {
         .await
         .unwrap();
     assert_eq!(out[0].num_rows(), 1);
-    let (id, user, tp, deadline, auth) = rx.recv().await.unwrap();
+    let (id, user, tp, deadline, auth, trailer) = rx.recv().await.unwrap();
+    // Asked for, taken off the stream, added to the query's spill.
+    assert_eq!(trailer.as_deref(), Some("spill"));
+    assert_eq!(spill.bytes(), 4096);
     assert_eq!(id.as_deref(), Some("7"));
     assert_eq!(user.as_deref(), Some("ana"));
     assert!(

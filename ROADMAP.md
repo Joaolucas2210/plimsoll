@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Workers' spill on the coordinator: fragments end their stream with a spill trailer when asked, maps credit theirs once, reduces pass their maps' on (ADR 0121)
 - [x] Shuffle map runs logged with their query (`shuffle_map`, `shuffle_spill`), and map operators' spill counted in the node's total (ADR 0120)
 - [x] Fragments served by kind and outcome, with rows and bytes, in `/metrics` (ADR 0119)
 - [x] Per-query spill: the coordinator's in the query log and `system.runtime.queries` (failed queries included, through a spill sink), each worker fragment's in its log line (ADR 0118)
@@ -153,16 +154,15 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Workers' spill summed on the coordinator** — workers report what
-each fragment spilled at the end of its stream, so the coordinator's
-query log and `system.runtime.queries` show a query's whole spill
-(ADR 0118, 0120).
+**Writes on workers for broadcast-join rows** — an `INSERT … SELECT`
+whose rows come from a broadcast join writes them where the probe
+fragments run, as plain scans' rows already are (ADR 0091, 0066).
 
 ## Missing
 
 **Lakehouse writes**
-- Writes on workers for broadcast-join rows; a shuffled `MERGE` (and a
-  spilled source) for sources larger than a node.
+- Writes on workers for broadcast-join rows (above); a shuffled `MERGE`
+  (and a spilled source) for sources larger than a node.
 - Several deletion vectors per Puffin file; v3 compaction of files with
   equality deletes; decimal partition values; vectorized partition
   transforms.
@@ -191,5 +191,5 @@ query log and `system.runtime.queries` show a query's whole spill
 - Spilling hash-join build sides (DataFusion upstream, ADR 0068).
 
 **Security and operations**
-- Workers' spill on the coordinator (above); shuffle map spans (ADR
-  0120); per-kind fragment latencies (ADR 0119).
+- Shuffle map spans (ADR 0120); per-kind fragment latencies (ADR
+  0119); failed fragments' spill on the coordinator (ADR 0121).

@@ -349,11 +349,18 @@ fn files_written(files: Vec<serde_json::Value>) -> Result<Running, EngineError> 
 pub struct Running {
     pub stream: SendableRecordBatchStream,
     pub plan: Option<Arc<dyn plimsoll_core::datafusion::physical_plan::ExecutionPlan>>,
+    /// Spill this request answers for beyond its plan's (ADR 0121): a
+    /// shuffle map's, credited to the first bucket it hands out.
+    pub credit: u64,
 }
 
 impl From<SendableRecordBatchStream> for Running {
     fn from(stream: SendableRecordBatchStream) -> Self {
-        Self { stream, plan: None }
+        Self {
+            stream,
+            plan: None,
+            credit: 0,
+        }
     }
 }
 
@@ -366,6 +373,7 @@ async fn run(df: plimsoll_core::datafusion::prelude::DataFrame) -> Result<Runnin
     Ok(Running {
         stream,
         plan: Some(plan),
+        credit: 0,
     })
 }
 
@@ -790,6 +798,9 @@ struct ShuffleMap {
     /// Times each bucket was fetched: a bucket several reduces read (ADR
     /// 0117) is handed out until the last one takes it.
     fetched: Vec<usize>,
+    /// What the map's run spilled, reported once, with the first bucket
+    /// handed out (ADR 0121).
+    spilled: Option<u64>,
     /// The in-memory buckets.
     memory: Arc<std::sync::Mutex<Reservation>>,
 }
@@ -862,7 +873,7 @@ impl CoreEngine {
         bucket: Bucket,
         deadline: Instant,
         query_id: Option<u64>,
-    ) -> Result<SendableRecordBatchStream, EngineError> {
+    ) -> Result<Running, EngineError> {
         use plimsoll_core::datafusion::physical_expr::expressions::Column;
         use plimsoll_core::datafusion::physical_plan::memory::MemoryStream;
         use plimsoll_core::datafusion::physical_plan::repartition::RepartitionExec;
@@ -978,6 +989,7 @@ impl CoreEngine {
                 );
                 Ok(Arc::new(std::sync::Mutex::new(ShuffleMap {
                     schema,
+                    spilled: Some(spilled + operators),
                     fetched: vec![0; parts.len()],
                     buckets: parts,
                     memory,
@@ -1012,12 +1024,16 @@ impl CoreEngine {
             let batch =
                 RecordBatch::try_new(schema.clone(), vec![Arc::new(UInt64Array::from(sizes))])
                     .map_err(|e| classify(&e.into()))?;
-            return Ok(Box::pin(
+            let sizes: SendableRecordBatchStream = Box::pin(
                 MemoryStream::try_new(vec![batch], schema, None).map_err(|e| classify(&e))?,
-            ));
+            );
+            return Ok(Running::from(sizes));
         }
-        let (schema, batches, done) = {
+        let (schema, batches, done, credit) = {
             let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
+            // The map's spill, reported by the first bucket handed out
+            // (ADR 0121), whichever reducer gets it.
+            let credit = m.spilled.take().unwrap_or(0);
             if m.buckets.len() != partitions {
                 return Err(EngineError::InvalidQuery(format!(
                     "shuffle {} has {} buckets, not {partitions}",
@@ -1033,7 +1049,7 @@ impl CoreEngine {
             });
             if fetched < bucket.readers {
                 let kept = m.buckets.get(bucket.index).cloned().flatten();
-                (m.schema.clone(), kept, false)
+                (m.schema.clone(), kept, false, credit)
             } else {
                 let kept = m.buckets.get_mut(bucket.index).and_then(Option::take);
                 if let Some(Kept::Memory(batches)) = &kept {
@@ -1047,6 +1063,7 @@ impl CoreEngine {
                     m.schema.clone(),
                     kept,
                     m.buckets.iter().all(Option::is_none),
+                    credit,
                 )
             }
         };
@@ -1059,7 +1076,7 @@ impl CoreEngine {
                 bucket.index, bucket.shuffle, bucket.map
             ))
         })?;
-        Ok(match kept {
+        let stream: SendableRecordBatchStream = match kept {
             Kept::Memory(batches) => {
                 Box::pin(MemoryStream::try_new(batches, schema, None).map_err(|e| classify(&e))?)
             }
@@ -1073,6 +1090,11 @@ impl CoreEngine {
                     });
                 Box::pin(RecordBatchStreamAdapter::new(schema, batches))
             }
+        };
+        Ok(Running {
+            stream,
+            plan: None,
+            credit,
         })
     }
 }
@@ -1215,10 +1237,7 @@ impl QueryEngine for CoreEngine {
             return write_rows(&ctx, df, target).await;
         }
         match f.bucket {
-            Some(bucket) => self
-                .map_bucket(df, bucket, deadline, query_id)
-                .await
-                .map(Running::from),
+            Some(bucket) => self.map_bucket(df, bucket, deadline, query_id).await,
             None => run(df).await,
         }
     }

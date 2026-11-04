@@ -3029,7 +3029,10 @@ async fn open(
         .client
         .post(format!("{url}/v1/fragment"))
         .bearer_auth(&workers.token)
-        .header("content-type", "application/json");
+        .header("content-type", "application/json")
+        // What the fragment spilled, after its stream (ADR 0121).
+        .header(TRAILER_HEADER, "spill");
+    let sink = tag.as_ref().and_then(|t| t.spill.clone());
     // The query's identity, trace and remaining time (ADR 0059).
     if let Some(tag) = tag {
         request = request
@@ -3064,10 +3067,91 @@ async fn open(
         ));
     }
     let url = Arc::new(url);
-    Ok(response
+    let body = response
         .bytes_stream()
         .map(move |b| b.map_err(|e| worker_error(format!("worker {url}: {e}"), true)))
-        .boxed())
+        .boxed();
+    Ok(split_trailer(body, sink))
+}
+
+/// Asks a worker to end a fragment's stream with [`SPILL_TRAILER`] (ADR
+/// 0121). A worker that does not know it sends a plain IPC stream.
+pub const TRAILER_HEADER: &str = "x-plimsoll-trailer";
+
+/// After a fragment's end-of-stream marker, when asked for (ADR 0121):
+/// these 8 bytes, then what the fragment spilled as a little-endian u64.
+pub const SPILL_TRAILER: &[u8; 8] = b"PLMSPILL";
+
+/// The trailer as a worker appends it.
+pub fn spill_trailer(bytes: u64) -> Vec<u8> {
+    let mut out = SPILL_TRAILER.to_vec();
+    out.extend_from_slice(&bytes.to_le_bytes());
+    out
+}
+
+/// `body` without its spill trailer (ADR 0121), which is added to `sink`.
+/// The last 16 bytes are held back until the body ends: a trailer is
+/// taken off, anything else (a worker that sends none) goes on as IPC.
+fn split_trailer(
+    body: BoxStream<'static, Result<Bytes>>,
+    sink: Option<plimsoll_core::engine::SpillSink>,
+) -> BoxStream<'static, Result<Bytes>> {
+    const LEN: usize = 16;
+    // (body, bytes held back, an error to send after them, ended)
+    type State = (
+        BoxStream<'static, Result<Bytes>>,
+        Vec<u8>,
+        Option<DataFusionError>,
+        bool,
+    );
+    let start: State = (body, Vec::new(), None, false);
+    stream::unfold(start, move |(mut body, mut held, error, ended)| {
+        let sink = sink.clone();
+        async move {
+            if let Some(e) = error {
+                return Some((Err(e), (body, held, None, true)));
+            }
+            if ended {
+                return None;
+            }
+            loop {
+                match body.next().await {
+                    Some(Ok(chunk)) => {
+                        held.extend_from_slice(&chunk);
+                        if held.len() > LEN {
+                            let out = held.split_off(held.len() - LEN);
+                            let ready = std::mem::replace(&mut held, out);
+                            return Some((Ok(Bytes::from(ready)), (body, held, None, false)));
+                        }
+                    }
+                    // The bytes held back go first, as they would have
+                    // without a trailer: a batch they complete is emitted
+                    // before the error, so nothing is retried (ADR 0072).
+                    Some(Err(e)) if !held.is_empty() => {
+                        let ready = Bytes::from(std::mem::take(&mut held));
+                        return Some((Ok(ready), (body, held, Some(e), false)));
+                    }
+                    Some(Err(e)) => return Some((Err(e), (body, held, None, true))),
+                    None => {
+                        if held.len() == LEN && held.starts_with(SPILL_TRAILER) {
+                            let mut n = [0u8; 8];
+                            n.copy_from_slice(&held[8..]);
+                            if let Some(sink) = &sink {
+                                sink.add(u64::from_le_bytes(n));
+                            }
+                            return None;
+                        }
+                        if held.is_empty() {
+                            return None;
+                        }
+                        let rest = Bytes::from(std::mem::take(&mut held));
+                        return Some((Ok(rest), (body, held, None, true)));
+                    }
+                }
+            }
+        }
+    })
+    .boxed()
 }
 
 /// A shuffle bucket from the worker at `url` (ADR 0064, 0068), as it
@@ -3257,6 +3341,40 @@ pub fn decode(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn spill_trailers_are_split_off_wherever_chunks_end() {
+        use futures::TryStreamExt;
+        use plimsoll_core::engine::SpillSink;
+        let ipc: Vec<u8> = (0..40u8).chain(END_OF_STREAM).collect();
+        let mut with = ipc.clone();
+        with.extend(spill_trailer(4096));
+        for size in [1, 3, 16, 17, 100] {
+            let chunked = |bytes: &[u8]| {
+                stream::iter(
+                    bytes
+                        .chunks(size)
+                        .map(|c| Ok(Bytes::copy_from_slice(c)))
+                        .collect::<Vec<_>>(),
+                )
+                .boxed()
+            };
+            let sink = SpillSink::default();
+            let out: Vec<Bytes> = split_trailer(chunked(&with), Some(sink.clone()))
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(out.concat(), ipc, "chunks of {size}");
+            assert_eq!(sink.bytes(), 4096);
+            // No trailer (an older worker): the body passes whole.
+            let out: Vec<Bytes> = split_trailer(chunked(&ipc), Some(sink.clone()))
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(out.concat(), ipc);
+            assert_eq!(sink.bytes(), 4096);
+        }
+    }
 
     #[test]
     fn hot_join_buckets_split_on_the_side_that_may() {

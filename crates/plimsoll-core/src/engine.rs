@@ -138,6 +138,11 @@ impl SpillSink {
     pub fn bytes(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
+
+    /// Spill reported from elsewhere: a worker's fragment (ADR 0121).
+    pub fn add(&self, bytes: u64) {
+        self.0.fetch_add(bytes, Ordering::Relaxed);
+    }
 }
 
 impl PartialEq for SpillSink {
@@ -158,6 +163,9 @@ pub struct QueryTag {
     pub traceparent: Option<String>,
     /// When the query's deadline passes on the coordinator.
     pub deadline: Option<Instant>,
+    /// Where workers' spill is added, as their fragments report it at the
+    /// end of their streams (ADR 0121).
+    pub spill: Option<SpillSink>,
 }
 
 /// The caller may not read `table`. Returned (wrapped in
