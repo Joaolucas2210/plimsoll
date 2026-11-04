@@ -87,75 +87,45 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The other coordinators (ADR 0102): found and health-checked as
     // workers are, so replicas join and leave without a restart.
     let peers = match (cfg.coordinators.is_empty(), &cfg.worker_token) {
-        (false, Some(token)) => {
-            let peers = Arc::new(plimsoll_server::peers::Peers(
-                plimsoll_connectors::remote::Workers::new(cfg.coordinators.clone(), token.clone())?,
-            ));
-            let checked = peers.clone();
-            // ADR 0103: the limits are the cluster's; this node's part
-            // follows the live coordinators, itself counted once. ADR
-            // 0104: exactly, through the elected leader, with the parts
-            // as the fallback while it cannot be reached.
-            let shared = (cfg.admission_scope != AdmissionScope::Node).then(|| admission.clone());
-            let gate = (cfg.admission_scope == AdmissionScope::Exact).then(|| {
-                let gate = Arc::new(plimsoll_server::peers::LeaderGate::new(
-                    peers.clone(),
-                    cfg.query_timeout,
-                ));
-                admission.set_gate(gate.clone());
-                // ADR 0106: a node leads until its first round says
-                // otherwise; it starts nothing new until the others could
-                // have reported their running queries.
-                admission.hold(TAKEOVER_HOLD);
-                gate
-            });
-            tokio::spawn(async move {
-                let mut last = (0, None);
-                loop {
-                    checked
-                        .0
-                        .check_health(std::time::Duration::from_secs(2))
-                        .await;
-                    if let Some(admission) = &shared {
-                        let me = admission.registry().first_id();
-                        let now = plimsoll_server::peers::elect(me, &checked.nodes().await);
-                        if now != last {
-                            let (coordinators, leader) = now.clone();
-                            match &gate {
-                                Some(gate) => {
-                                    // A leader holds the whole limits.
-                                    admission.share_with(match leader {
-                                        Some(_) => coordinators,
-                                        None => 1,
-                                    });
-                                    // Taking over (ADR 0106): the
-                                    // followers re-home their queries
-                                    // within their next round.
-                                    if leader.is_none() && last.1.is_some() {
-                                        admission.hold(TAKEOVER_HOLD);
-                                    }
-                                    gate.follow(leader.clone(), admission);
-                                }
-                                None => admission.share_with(coordinators),
-                            }
-                            log::emit(
-                                Level::Info,
-                                "admission_shared",
-                                json!({
-                                    "coordinators": coordinators,
-                                    "leader": gate.as_ref().map(|_| leader.as_deref().unwrap_or("self")),
-                                }),
-                            );
-                            last = now;
-                        }
-                    }
-                    tokio::time::sleep(PEER_ROUND).await;
-                }
-            });
-            Some(peers)
-        }
+        (false, Some(token)) => Some(Arc::new(plimsoll_server::peers::Peers(
+            plimsoll_connectors::remote::Workers::new(cfg.coordinators.clone(), token.clone())?,
+        ))),
         _ => None,
     };
+    // ADR 0103: the limits are the cluster's; this node's part follows the
+    // live coordinators, itself counted once. ADR 0104–0107: exactly,
+    // through the elected leader, with the parts as the fallback while it
+    // cannot be reached.
+    let coordination = peers.as_ref().and_then(|peers| {
+        let gate = (cfg.admission_scope == AdmissionScope::Exact).then(|| {
+            Arc::new(plimsoll_server::peers::LeaderGate::new(
+                peers.clone(),
+                cfg.query_timeout,
+            ))
+        });
+        (cfg.admission_scope != AdmissionScope::Node).then(|| {
+            Arc::new(plimsoll_server::peers::Coordination::new(
+                peers.clone(),
+                admission.clone(),
+                gate,
+            ))
+        })
+    });
+    if let Some(peers) = peers.clone() {
+        let coordination = coordination.clone();
+        tokio::spawn(async move {
+            loop {
+                peers
+                    .0
+                    .check_health(std::time::Duration::from_secs(2))
+                    .await;
+                if let Some(c) = &coordination {
+                    c.round(true).await;
+                }
+                tokio::time::sleep(plimsoll_server::peers::PEER_ROUND).await;
+            }
+        });
+    }
     system::register(
         engine.context(),
         admission.registry().clone(),
@@ -280,6 +250,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .as_deref()
             .map(plimsoll_server::auth::token_digest),
         peers,
+        coordination,
     });
 
     // ADR 0100: the `/metrics` series, pushed to the OTLP endpoint.
@@ -446,13 +417,6 @@ async fn shutdown_signal(state: Arc<AppState>, delay: std::time::Duration) {
     app::drain(&state, delay).await;
     log::emit(Level::Info, "closing_listener", json!({}));
 }
-
-/// Between peer rounds: health checks, membership, election (ADR 0102).
-const PEER_ROUND: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// How long a new leader starts nothing new (ADR 0106): every follower's
-/// next round, its checks (2 s each) and its re-homing fit in two rounds.
-const TAKEOVER_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Where this node's query ids start (ADR 0101): a random multiple of 2^32
 /// below 2^53, so coordinators behind one load balancer hand out ids that

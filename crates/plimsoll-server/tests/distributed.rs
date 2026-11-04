@@ -54,6 +54,7 @@ async fn worker_with(groups: std::collections::HashMap<String, Limits>) -> (Stri
         slow_query: None,
         worker_token: Some(token_digest(TOKEN)),
         peers: None,
+        coordination: None,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());

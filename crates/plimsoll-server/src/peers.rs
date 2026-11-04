@@ -8,10 +8,11 @@
 //! include this node itself (a `dns+` name resolving to every replica).
 //!
 //! They also count each other to share admission limits (ADR 0103), and
-//! with exact limits elect the one that admits for all (ADR 0104).
+//! with exact limits elect the one that admits for all (ADR 0104), which
+//! asks the others to report before it admits anything (ADR 0107).
 
 use std::collections::BTreeMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::http::StatusCode;
@@ -128,7 +129,7 @@ impl Peers {
 /// The live coordinators, `me` and `peers` each counted once, and the
 /// one that admits for all under exact limits (ADR 0104): the lowest id,
 /// as a URL, or `None` when that is `me`.
-pub fn elect(me: QueryId, peers: &[(QueryId, String)]) -> (usize, Option<String>) {
+pub fn elect(me: QueryId, peers: &[(QueryId, String)]) -> Elected {
     let mut ids: Vec<QueryId> = peers.iter().map(|(id, _)| *id).chain([me]).collect();
     ids.sort_unstable();
     ids.dedup();
@@ -136,8 +137,126 @@ pub fn elect(me: QueryId, peers: &[(QueryId, String)]) -> (usize, Option<String>
         .iter()
         .filter(|(id, _)| *id < me)
         .min_by_key(|(id, _)| *id)
-        .map(|(_, url)| url.clone());
+        .cloned();
     (ids.len(), leader)
+}
+
+/// Between peer rounds: health checks, membership, election (ADR 0102).
+pub const PEER_ROUND: Duration = Duration::from_secs(5);
+
+/// The longest a new leader starts nothing new (ADR 0106): every
+/// follower's next round, its checks and its re-homing fit in two rounds.
+/// Ended as soon as every peer has reported (ADR 0107).
+pub const TAKEOVER_HOLD: Duration = Duration::from_secs(10);
+
+/// What [`elect`] found: live coordinators and the leader, `None` when
+/// that is this node.
+type Elected = (usize, Option<(QueryId, String)>);
+
+/// Shared admission among coordinators (ADR 0103–0107): one round elects,
+/// sets this node's part, and under exact limits follows the leader.
+pub struct Coordination {
+    pub peers: Arc<Peers>,
+    admission: Admission,
+    /// `Some` under exact limits (ADR 0104).
+    gate: Option<Arc<LeaderGate>>,
+    /// The last round's outcome; `None` before the first. In it, a `None`
+    /// leader is this node.
+    last: tokio::sync::Mutex<Option<Elected>>,
+}
+
+impl Coordination {
+    /// With `gate`, the limits are exact: this node holds new admissions
+    /// until its first round says whether it leads (ADR 0106).
+    pub fn new(peers: Arc<Peers>, admission: Admission, gate: Option<Arc<LeaderGate>>) -> Self {
+        if let Some(gate) = &gate {
+            admission.set_gate(gate.clone());
+            admission.hold(TAKEOVER_HOLD);
+        }
+        Self {
+            peers,
+            admission,
+            gate,
+            last: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// One round: who is alive, who leads, and what follows from it. When
+    /// this node takes over and `announce` is set, it asks every live peer
+    /// to run its round now, and ends its hold once all of them follow it
+    /// (ADR 0107). Returns the leader's node id as this node sees it.
+    pub async fn round(self: &Arc<Self>, announce: bool) -> QueryId {
+        let me = self.admission.registry().first_id();
+        let alive = self.peers.nodes().await;
+        let (coordinators, leader) = elect(me, &alive);
+        let mut last = self.last.lock().await;
+        if last.as_ref() != Some(&(coordinators, leader.clone())) {
+            let took_over = leader.is_none() && !matches!(*last, Some((_, None)));
+            match &self.gate {
+                Some(gate) => {
+                    // A leader holds the whole limits.
+                    self.admission.share_with(match leader {
+                        Some(_) => coordinators,
+                        None => 1,
+                    });
+                    if took_over {
+                        self.admission.hold(TAKEOVER_HOLD);
+                    }
+                    gate.follow(leader.as_ref().map(|(_, url)| url.clone()), &self.admission)
+                        .await;
+                    // Followers ask the leader; nothing to wait for here.
+                    if leader.is_some() {
+                        self.admission.end_hold();
+                    }
+                    if took_over && announce {
+                        tokio::spawn(self.clone().announce(me, alive));
+                    }
+                }
+                None => self.admission.share_with(coordinators),
+            }
+            log::emit(
+                Level::Info,
+                "admission_shared",
+                json!({
+                    "coordinators": coordinators,
+                    "leader": self.gate.as_ref().map(|_| leader.as_ref().map_or("self", |(_, url)| url.as_str())),
+                }),
+            );
+            *last = Some((coordinators, leader.clone()));
+        }
+        leader.map_or(me, |(id, _)| id)
+    }
+
+    /// Asks every peer that answered this round to run its own (`POST
+    /// /v1/peer/round`), which re-homes its running queries here before it
+    /// answers. The hold ends when all of them name this node.
+    async fn announce(self: Arc<Self>, me: QueryId, alive: Vec<(QueryId, String)>) {
+        let peers = &self.peers;
+        let calls = alive.iter().map(|(_, url)| async move {
+            let r = peers
+                .0
+                .request(reqwest::Method::POST, &format!("{url}/v1/peer/round"))
+                .timeout(TAKEOVER_HOLD)
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?;
+            let body: Value = serde_json::from_slice(&r.bytes().await.ok()?).ok()?;
+            body["leader"].as_u64()
+        });
+        let answers = futures::future::join_all(calls).await;
+        let following = answers.iter().filter(|a| **a == Some(me)).count();
+        if following == answers.len() {
+            self.admission.end_hold();
+        }
+        log::emit(
+            Level::Info,
+            "admission_takeover",
+            json!({ "peers": answers.len(), "following": following,
+                    "hold_ended": following == answers.len() }),
+        );
+    }
 }
 
 /// Exact cluster limits (ADR 0104): admission asked of the leader, whose
@@ -166,7 +285,7 @@ impl LeaderGate {
     /// this node's running queries are re-homed (ADR 0105): adopted by the
     /// new leader, whose counts then include them, and released at the
     /// old one; or, when this node leads, counted here only.
-    pub fn follow(&self, leader: Option<String>, admission: &Admission) {
+    pub async fn follow(&self, leader: Option<String>, admission: &Admission) {
         {
             let mut current = self.leader.write().unwrap_or_else(|e| e.into_inner());
             if *current == leader {
@@ -178,19 +297,14 @@ impl LeaderGate {
         if held.is_empty() {
             return;
         }
-        let gate = Self {
-            peers: self.peers.clone(),
-            leader: RwLock::new(None),
-            hold: self.hold,
-        };
-        tokio::spawn(async move {
-            let mut adopted = 0;
-            for h in &held {
-                let Some(url) = &leader else {
+        let rehome = held.iter().map(|h| {
+            let leader = leader.as_deref();
+            async move {
+                let Some(url) = leader else {
                     h.replace(None);
-                    continue;
+                    return false;
                 };
-                let sent = gate.post(url, &h.user, &h.group, true).await;
+                let sent = self.post(url, &h.user, &h.group, true).await;
                 match sent
                     .map_err(|e| e.to_string())
                     .and_then(|r| match r.status() {
@@ -199,24 +313,32 @@ impl LeaderGate {
                     }) {
                     Ok(permit) => {
                         h.replace(Some(Box::new(permit)));
-                        adopted += 1;
+                        true
                     }
                     // Kept where it was: the old leader, if it is alive,
                     // still counts it.
-                    Err(e) => log::emit(
-                        Level::Warn,
-                        "admission_rehome_failed",
-                        json!({ "leader": url, "error": e }),
-                    ),
+                    Err(e) => {
+                        log::emit(
+                            Level::Warn,
+                            "admission_rehome_failed",
+                            json!({ "leader": url, "error": e }),
+                        );
+                        false
+                    }
                 }
             }
-            log::emit(
-                Level::Info,
-                "admission_rehomed",
-                json!({ "leader": leader.as_deref().unwrap_or("self"),
-                        "queries": held.len(), "adopted": adopted }),
-            );
         });
+        let adopted = futures::future::join_all(rehome)
+            .await
+            .into_iter()
+            .filter(|a| *a)
+            .count();
+        log::emit(
+            Level::Info,
+            "admission_rehomed",
+            json!({ "leader": leader.as_deref().unwrap_or("self"),
+                    "queries": held.len(), "adopted": adopted }),
+        );
     }
 
     /// Asks `url` to admit, or with `adopt` to count a running query. A
@@ -324,7 +446,7 @@ mod tests {
         assert_eq!(elect(5, &peers(&[5, 9])), (2, None));
         assert_eq!(
             elect(5, &peers(&[9, 3, 5, 7])),
-            (4, Some("http://n3".into()))
+            (4, Some((3, "http://n3".into())))
         );
     }
 }

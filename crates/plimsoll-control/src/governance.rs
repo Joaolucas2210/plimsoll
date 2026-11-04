@@ -655,6 +655,21 @@ impl Admission {
         });
     }
 
+    /// Ends a [`Self::hold`] early (ADR 0107): queued queries that fit
+    /// start now.
+    pub fn end_hold(&self) {
+        let promoted = {
+            let mut st = lock(&self.inner.state);
+            if st.hold_until.take().is_none() {
+                return;
+            }
+            promote(&self.inner, &mut st)
+        };
+        for (tx, slot) in promoted {
+            let _ = tx.send(slot);
+        }
+    }
+
     /// Global `(running, queued)`, exported as gauges.
     pub fn load(&self) -> (usize, usize) {
         let st = lock(&self.inner.state);
@@ -977,6 +992,21 @@ mod tests {
             "started when the hold ended"
         );
         assert_eq!(adm.load(), (1, 0));
+        // Ended early: the queued query starts at once.
+        adm.hold(Duration::from_secs(60));
+        let waiting = tokio::spawn({
+            let adm = adm.clone();
+            async move { adm.acquire("w", DEFAULT_GROUP).await.map(|_| ()) }
+        });
+        while adm.load() != (1, 1) {
+            tokio::task::yield_now().await;
+        }
+        adm.end_hold();
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         // No queue: refused while held, as for any full limit.
         let none = admission(lim(4, 0), lim(4, 0), lim(4, 0));
         none.hold(Duration::from_secs(60));

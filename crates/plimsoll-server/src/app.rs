@@ -53,6 +53,8 @@ pub struct AppState {
     pub worker_token: Option<[u8; 32]>,
     /// The other coordinators, for listings and cancels (ADR 0102).
     pub peers: Option<Arc<crate::peers::Peers>>,
+    /// Shared admission among them (ADR 0103–0107).
+    pub coordination: Option<Arc<crate::peers::Coordination>>,
 }
 
 #[derive(Default)]
@@ -87,6 +89,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/fragment", post(fragment))
         .route("/v1/peer/node", get(peer_node))
         .route("/v1/peer/admit", post(peer_admit))
+        .route("/v1/peer/round", post(peer_round))
         .route("/v1/peer/queries", get(peer_queries))
         .route("/v1/peer/queries/{id}", delete(peer_cancel))
         .route("/v1/maintenance/compact", post(compact))
@@ -396,6 +399,19 @@ async fn peer_node(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         return r;
     }
     Json(json!({ "node": st.admission.registry().first_id() })).into_response()
+}
+
+/// `POST /v1/peer/round` (ADR 0107): a new leader asks this node to run
+/// its peer round now, re-homing its running queries before answering,
+/// and to name the leader it follows. Never announces in turn.
+async fn peer_round(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(r) = node_auth(&st, &headers) {
+        return r;
+    }
+    let Some(c) = &st.coordination else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    Json(json!({ "leader": c.round(false).await })).into_response()
 }
 
 /// `POST /v1/peer/admit` (ADR 0104): `{"user", "group"}` admitted by this
@@ -1598,6 +1614,7 @@ mod tests {
             auth: Auth::Disabled,
             tracer: None,
             peers: None,
+            coordination: None,
             slow_query: None,
             worker_token: None,
         })
@@ -2324,7 +2341,7 @@ mod tests {
             a.peers.clone().unwrap(),
             Duration::from_secs(30),
         ));
-        gate.follow(Some(url.clone()), &a.admission);
+        gate.follow(Some(url.clone()), &a.admission).await;
         a.admission.set_gate(gate.clone());
         let slot = a.admission.acquire("ana", DEFAULT_GROUP).await.unwrap();
         assert_eq!((a.admission.load(), b.admission.load()), ((1, 0), (1, 0)));
@@ -2340,11 +2357,11 @@ mod tests {
             }
         };
         // ADR 0105: `a` leads now; its query is counted there only.
-        gate.follow(None, &a.admission);
+        gate.follow(None, &a.admission).await;
         settles((0, 0)).await;
         assert_eq!(a.admission.load(), (1, 0));
         // `b` leads again: it adopts the running query, beyond any limit.
-        gate.follow(Some(url.clone()), &a.admission);
+        gate.follow(Some(url.clone()), &a.admission).await;
         settles((1, 0)).await;
         drop(slot);
         settles((0, 0)).await;
@@ -2353,6 +2370,70 @@ mod tests {
         // The peer endpoints only answer the worker token.
         let (status, _) = call(router(b.clone()), get_req("/v1/peer/queries")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_new_leader_admits_once_every_peer_follows_it() {
+        // ADR 0107: `x` (lower id) leads, `y` follows; both hold at boot
+        // (10 s) and neither should wait that long.
+        const TOKEN: &str = "0123456789abcdef";
+        let listeners = [
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        ];
+        let urls: Vec<String> = listeners
+            .iter()
+            .map(|l| format!("http://{}", l.local_addr().unwrap()))
+            .collect();
+        let mut nodes = Vec::new();
+        for (first, listener) in [1u64 << 32 | 1, 7 << 32 | 1].into_iter().zip(listeners) {
+            let mut st = Arc::into_inner(default_state()).unwrap();
+            st.admission = Admission::new(
+                st.admission.config().clone(),
+                Arc::new(QueryRegistry::new(100).starting_at(first)),
+            );
+            st.worker_token = Some(crate::auth::token_digest(TOKEN));
+            let peers = Arc::new(crate::peers::Peers(
+                plimsoll_connectors::remote::Workers::new(urls.clone(), TOKEN.into()).unwrap(),
+            ));
+            let gate = Arc::new(crate::peers::LeaderGate::new(
+                peers.clone(),
+                Duration::from_secs(30),
+            ));
+            st.coordination = Some(Arc::new(crate::peers::Coordination::new(
+                peers.clone(),
+                st.admission.clone(),
+                Some(gate),
+            )));
+            st.peers = Some(peers);
+            let st = Arc::new(st);
+            tokio::spawn(axum::serve(listener, router(st.clone())).into_future());
+            nodes.push(st);
+        }
+        let (x, y) = (&nodes[0], &nodes[1]);
+        // Both held: nothing starts.
+        let quick = Duration::from_millis(300);
+        assert!(
+            tokio::time::timeout(quick, x.admission.acquire("u", DEFAULT_GROUP))
+                .await
+                .is_err()
+        );
+        // `x` runs its round, takes over and announces to `y` (and itself).
+        let leader = x.coordination.as_ref().unwrap().round(true).await;
+        assert_eq!(leader, 1 << 32 | 1);
+        let since = std::time::Instant::now();
+        let slot = loop {
+            if let Ok(Ok(slot)) =
+                tokio::time::timeout(quick, x.admission.acquire("u", DEFAULT_GROUP)).await
+            {
+                break slot;
+            }
+            assert!(since.elapsed() < Duration::from_secs(5), "x still held");
+        };
+        // `y` follows `x` (no hold of its own) and admits through it.
+        let theirs = y.admission.acquire("v", DEFAULT_GROUP).await.unwrap();
+        assert_eq!(x.admission.load(), (2, 0));
+        drop((slot, theirs));
     }
 
     #[tokio::test]

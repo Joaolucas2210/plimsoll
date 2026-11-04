@@ -80,4 +80,5 @@ coordinator leads until its first round has seen its peers (ADR 0104).
 
 - Leader changes are frequent enough that 10 s pauses hurt: followers
   could report on demand (the new leader asks each peer for its held
-  queries), and the hold would end when all have answered.
+  queries), and the hold would end when all have answered. Resolved by
+  ADR 0107 (`/v1/peer/round`).
