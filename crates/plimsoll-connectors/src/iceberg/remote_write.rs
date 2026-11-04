@@ -72,7 +72,10 @@ pub(super) fn distribute(
     let pass = |mut p: Arc<dyn ExecutionPlan>| {
         while matches!(
             p.name(),
-            "CoalescePartitionsExec" | "RepartitionExec" | "CoalesceBatchesExec"
+            "CoalescePartitionsExec"
+                | "RepartitionExec"
+                | "CoalesceBatchesExec"
+                | "CooperativeExec"
         ) {
             match p.children().first() {
                 Some(c) => p = (*c).clone(),

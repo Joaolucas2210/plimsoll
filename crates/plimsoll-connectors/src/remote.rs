@@ -2005,10 +2005,14 @@ pub fn written_schema() -> SchemaRef {
 
 /// The [`RemoteScanExec`] under `input`, reached through pass-through
 /// nodes only (the optimizer may put a repartition on either side of the
-/// scan's accounting), so its rows are `input`'s rows.
+/// scan's accounting, or, with few partitions, a cooperative-yield
+/// wrapper), so its rows are `input`'s rows.
 pub(crate) fn remote_under(input: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
     let pass = |mut p: Arc<dyn ExecutionPlan>| loop {
-        if !matches!(p.name(), "RepartitionExec" | "CoalesceBatchesExec") {
+        if !matches!(
+            p.name(),
+            "RepartitionExec" | "CoalesceBatchesExec" | "CooperativeExec"
+        ) {
             return Some(p);
         }
         p = p.children().first().map(|c| (*c).clone())?;
@@ -2032,7 +2036,10 @@ fn scan_side(input: &Arc<dyn ExecutionPlan>, config: &ConfigOptions) -> Option<R
         return Some(scan.with_schema(scan.schema.clone()));
     }
     let mut p = input.clone();
-    while matches!(p.name(), "RepartitionExec" | "CoalesceBatchesExec") {
+    while matches!(
+        p.name(),
+        "RepartitionExec" | "CoalesceBatchesExec" | "CooperativeExec"
+    ) {
         p = p.children().first().map(|c| (*c).clone())?;
     }
     let projection = p.as_ref().downcast_ref::<ProjectionExec>()?;
@@ -2083,7 +2090,10 @@ fn join_side(
     let peel = |mut p: Arc<dyn ExecutionPlan>| loop {
         if !matches!(
             p.name(),
-            "RepartitionExec" | "CoalesceBatchesExec" | "CoalescePartitionsExec"
+            "RepartitionExec"
+                | "CoalesceBatchesExec"
+                | "CooperativeExec"
+                | "CoalescePartitionsExec"
         ) {
             return Some(p);
         }
@@ -2420,7 +2430,7 @@ fn shuffle_final(
     let mut partial = agg.input().clone();
     while matches!(
         partial.name(),
-        "RepartitionExec" | "CoalesceBatchesExec" | "CoalescePartitionsExec"
+        "RepartitionExec" | "CoalesceBatchesExec" | "CooperativeExec" | "CoalescePartitionsExec"
     ) {
         let Some(c) = partial.children().first().map(|c| (*c).clone()) else {
             return Ok(None);

@@ -100,6 +100,15 @@ data files kept by pruning (ADR 0054). Two things were missing:
   that broke on ordering were made unordered, or compared with rows in
   any order.
 
+- **Found by CI's interop job**, on a runner with few CPUs. Without a
+  repartition, DataFusion puts a `CooperativeExec` between the scan's
+  accounting and the remote scan. `remote_under` and the other
+  pass-through lists did not know that node, so a probe side under it
+  was never distributed. This bug predates this ADR: the unordered
+  broadcast cases exposed it. `CooperativeExec` only yields to the
+  runtime, and is now a pass-through everywhere. Reproduced locally with
+  `taskset -c 0,1`: the test fails without the fix and passes with it.
+
 ## Revisit when
 
 - Join cardinality matters (joins of joins): read distinct counts from
