@@ -114,6 +114,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(peers) = peers.clone() {
         let coordination = coordination.clone();
         tokio::spawn(async move {
+            let mut pace = plimsoll_server::peers::Pace::default();
             loop {
                 peers
                     .0
@@ -122,7 +123,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(c) = &coordination {
                     c.round(true).await;
                 }
-                tokio::time::sleep(peers.next_round()).await;
+                tokio::time::sleep(pace.next(&peers)).await;
             }
         });
     }

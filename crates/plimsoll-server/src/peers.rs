@@ -33,17 +33,6 @@ const TIMEOUT: Duration = Duration::from_secs(2);
 pub struct Peers(pub Workers);
 
 impl Peers {
-    /// How long until the next round (ADR 0109): sooner while some member
-    /// is unhealthy, since that is when a partition can heal or a peer
-    /// come back, and its running queries must be re-homed.
-    pub fn next_round(&self) -> Duration {
-        if self.0.healthy_urls().len() < self.0.urls().len() {
-            FAST_ROUND
-        } else {
-            PEER_ROUND
-        }
-    }
-
     /// Every peer's queries, unscoped: the caller applies its viewer. A
     /// peer that does not answer is left out and logged, so losing a
     /// coordinator never fails the listing.
@@ -157,8 +146,51 @@ pub fn elect(me: QueryId, peers: &[(QueryId, String)]) -> Elected {
 pub const PEER_ROUND: Duration = Duration::from_secs(5);
 
 /// Between rounds while a peer fails its checks (ADR 0109): when it comes
-/// back, the cluster notices within about a second.
+/// back, the cluster notices within about a second. Doubled while the
+/// same peers stay down, up to [`PEER_ROUND`] (ADR 0110).
 pub const FAST_ROUND: Duration = Duration::from_secs(1);
+
+/// The pace of the peer rounds (ADR 0109, 0110): fast while some member is
+/// down, backing off while the same members stay down, so a short outage
+/// (a restart) is noticed within a second and a long one costs no more
+/// than a healthy cluster.
+#[derive(Debug, Default)]
+pub struct Pace {
+    /// The members down at the last round, sorted.
+    down: Vec<String>,
+    /// Rounds they have been down for.
+    streak: u32,
+}
+
+impl Pace {
+    /// The pause before the next round, after `peers`' health checks.
+    pub fn next(&mut self, peers: &Peers) -> Duration {
+        let healthy = peers.0.healthy_urls();
+        let mut down: Vec<String> = peers
+            .0
+            .urls()
+            .into_iter()
+            .filter(|u| !healthy.contains(u))
+            .collect();
+        down.sort_unstable();
+        self.after(down)
+    }
+
+    fn after(&mut self, down: Vec<String>) -> Duration {
+        if down.is_empty() {
+            *self = Self::default();
+            return PEER_ROUND;
+        }
+        // Someone else went down, or some came back: fast again.
+        if down != self.down {
+            self.down = down;
+            self.streak = 0;
+        }
+        let pause = FAST_ROUND.saturating_mul(1 << self.streak.min(8));
+        self.streak = self.streak.saturating_add(1);
+        pause.min(PEER_ROUND)
+    }
+}
 
 /// The longest a new leader starts nothing new (ADR 0106): every
 /// follower's next round, its checks and its re-homing fit in two rounds.
@@ -525,10 +557,27 @@ mod tests {
             |urls: Vec<String>| Peers(Workers::new(urls, "0123456789abcdef".into()).unwrap());
         let healthy = peers(vec![up_url.clone()]);
         healthy.0.check_health(Duration::from_secs(1)).await;
-        assert_eq!(healthy.next_round(), PEER_ROUND);
+        assert_eq!(Pace::default().next(&healthy), PEER_ROUND);
         let one_down = peers(vec![up_url, down_url]);
         one_down.0.check_health(Duration::from_secs(1)).await;
-        assert_eq!(one_down.next_round(), FAST_ROUND);
+        assert_eq!(Pace::default().next(&one_down), FAST_ROUND);
+    }
+
+    #[test]
+    fn fast_rounds_back_off_while_the_same_peers_stay_down() {
+        let s = |n: u64| Duration::from_secs(n);
+        let down = |urls: &[&str]| urls.iter().map(|u| (*u).to_owned()).collect::<Vec<_>>();
+        let mut pace = Pace::default();
+        let paces: Vec<_> = (0..6).map(|_| pace.after(down(&["a"]))).collect();
+        assert_eq!(paces, [s(1), s(2), s(4), s(5), s(5), s(5)]);
+        // Another goes down too: fast again, then backing off.
+        assert_eq!(pace.after(down(&["a", "b"])), s(1));
+        assert_eq!(pace.after(down(&["a", "b"])), s(2));
+        // One comes back: the rest are watched closely again.
+        assert_eq!(pace.after(down(&["b"])), s(1));
+        // All back: the healthy pace, and a later outage starts fast.
+        assert_eq!(pace.after(down(&[])), s(5));
+        assert_eq!(pace.after(down(&["b"])), s(1));
     }
 
     #[test]

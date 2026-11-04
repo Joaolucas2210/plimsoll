@@ -70,4 +70,4 @@ leader only in a round.
 
 - Large clusters, or peers behind slow links, make per-second checks of
   a missing peer costly: back off (1, 2, 4 s, capped at 5 s) while the
-  same peer stays down.
+  same peer stays down. Resolved by ADR 0110.
