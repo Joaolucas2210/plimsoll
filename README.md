@@ -132,7 +132,7 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_SLOW_QUERY_MS` | unset (off) | Queries at least this long also log a `slow_query` warn line: timings, `reads`, and each planning event (catalog loads; Iceberg files/manifests/deletes/cache hits). Never SQL text (ADR 0057) |
 | `PLIMSOLL_WORKER_TOKEN` | unset | Shared secret (≥ 16 chars, env only) between coordinator and workers; on a worker it enables `POST /v1/fragment` (ADR 0058) |
 | `PLIMSOLL_COORDINATORS` | unset | The other coordinators (URLs or `dns+http(s)://name:port`, may include this node; needs `PLIMSOLL_WORKER_TOKEN`): `system.runtime.queries` lists every coordinator's queries and `DELETE /v1/queries/{id}` reaches them (ADR 0102) |
-| `PLIMSOLL_ADMISSION_SCOPE` | `node` | `cluster`: the admission limits are the cluster's; each coordinator enforces `ceil(limit / live coordinators)`, recounted every 5 s (ADR 0103). `exact`: the live coordinator with the lowest node id admits for all, slots held while its response streams; its peers fall back to `cluster` parts while it is unreachable (ADR 0104), and re-home their running queries to a new leader (ADR 0105), which starts nothing new after taking over or booting until every peer follows it, at most 10 s (ADR 0106, 0107). Both need `PLIMSOLL_COORDINATORS` |
+| `PLIMSOLL_ADMISSION_SCOPE` | `node` | `cluster`: the admission limits are the cluster's; each coordinator enforces `ceil(limit / live coordinators)`, recounted every 5 s (ADR 0103). `exact`: the live coordinator with the lowest node id admits for all, slots held while its response streams; its peers fall back to `cluster` parts while it is unreachable (ADR 0104), and re-home their running queries to a new leader (ADR 0105), which starts nothing new after taking over or booting until every peer follows it, at most 10 s, and again briefly for each peer it sees later (ADR 0106–0108). Both need `PLIMSOLL_COORDINATORS` |
 | `PLIMSOLL_WORKERS` | unset | `http://w1:8080,http://w2:8080`: this node coordinates; Iceberg scans fan out to the workers whose `/readyz` answers (checked every 5 s; none healthy = local scan); tables with vended credentials stay local (ADR 0058, 0059). An entry `dns+http://workers.ns.svc:8080` makes every address that name resolves to (e.g. a Kubernetes headless service) a worker, re-resolved every 5 s so workers join and leave without a restart (ADR 0070). On workers, a `fragments` resource group (`PLIMSOLL_RESOURCE_GROUPS=fragments=8/16/50%`) bounds fragment concurrency and memory |
 | `PLIMSOLL_SPILL_DIR` | unset | Spill directory; unset = no spill, pressure fails the query |
 | `PLIMSOLL_PARQUET_TABLES` | unset | `bronze.trips=/data/trips/,gold.daily=/data/d.parquet` |
@@ -236,7 +236,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 ## Decision records
 
 Index with status, date and the one-line decision of every ADR:
-[docs/adr/README.md](docs/adr/README.md) (0001–0107; template in
+[docs/adr/README.md](docs/adr/README.md) (0001–0108; template in
 [docs/adr/0000-template.md](docs/adr/0000-template.md)).
 
 Roadmap: [ROADMAP.md](ROADMAP.md).

@@ -90,4 +90,4 @@ boot, still cost 10 s of queued queries.
 
 - Peers that miss the electing round matter: the leader could keep
   announcing to newly seen peers, and end the hold only after the next
-  full round with no unknown peers.
+  full round with no unknown peers. Resolved by ADR 0108.

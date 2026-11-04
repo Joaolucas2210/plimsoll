@@ -12,6 +12,7 @@
 //! asks the others to report before it admits anything (ADR 0107).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -163,6 +164,13 @@ pub struct Coordination {
     /// The last round's outcome; `None` before the first. In it, a `None`
     /// leader is this node.
     last: tokio::sync::Mutex<Option<Elected>>,
+    /// While this node leads: the peers it has announced itself to. One
+    /// that appears later (it missed the electing round, a partition
+    /// healed, it booted) is announced to as well (ADR 0108).
+    seen: tokio::sync::Mutex<std::collections::HashSet<QueryId>>,
+    /// Announcements started: only the latest may end the hold, which an
+    /// earlier one's answers do not cover.
+    announcements: std::sync::atomic::AtomicU64,
 }
 
 impl Coordination {
@@ -178,6 +186,8 @@ impl Coordination {
             admission,
             gate,
             last: tokio::sync::Mutex::new(None),
+            seen: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            announcements: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -208,9 +218,6 @@ impl Coordination {
                     if leader.is_some() {
                         self.admission.end_hold();
                     }
-                    if took_over && announce {
-                        tokio::spawn(self.clone().announce(me, alive));
-                    }
                 }
                 None => self.admission.share_with(coordinators),
             }
@@ -223,14 +230,64 @@ impl Coordination {
                 }),
             );
             *last = Some((coordinators, leader.clone()));
+            if took_over {
+                // Everyone is new to a new leader.
+                self.seen.lock().await.clear();
+            }
+        }
+        drop(last);
+        if self.gate.is_some() && announce {
+            self.announce_to_new(me, leader.is_none(), &alive).await;
         }
         leader.map_or(me, |(id, _)| id)
     }
 
-    /// Asks every peer that answered this round to run its own (`POST
-    /// /v1/peer/round`), which re-homes its running queries here before it
-    /// answers. The hold ends when all of them name this node.
-    async fn announce(self: Arc<Self>, me: QueryId, alive: Vec<(QueryId, String)>) {
+    /// Leading: the live peers this node has not announced itself to yet
+    /// are asked to follow it, and new queries wait until they do (ADR
+    /// 0107, 0108). Alone, there is nobody to wait for. Following: nothing
+    /// is announced, and a later lead starts afresh.
+    async fn announce_to_new(
+        self: &Arc<Self>,
+        me: QueryId,
+        leads: bool,
+        alive: &[(QueryId, String)],
+    ) {
+        let mut seen = self.seen.lock().await;
+        if !leads {
+            seen.clear();
+            return;
+        }
+        let new: Vec<(QueryId, String)> = alive
+            .iter()
+            .filter(|(id, _)| *id != me && !seen.contains(id))
+            .cloned()
+            .collect();
+        // Peers that left are forgotten, so they are announced to again
+        // when they come back.
+        *seen = alive
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| *id != me)
+            .collect();
+        drop(seen);
+        if new.is_empty() {
+            // A takeover with no peers to tell (ADR 0106's boot hold).
+            if alive.iter().all(|(id, _)| *id == me) {
+                self.admission.end_hold();
+            }
+            return;
+        }
+        // A peer this leader did not count may hold running queries.
+        self.admission.hold(TAKEOVER_HOLD);
+        let n = self.announcements.fetch_add(1, Ordering::SeqCst) + 1;
+        tokio::spawn(self.clone().announce(me, new, n));
+    }
+
+    /// Asks `peers` to run their round (`POST /v1/peer/round`), which
+    /// re-homes their running queries here before they answer. The hold
+    /// ends when all of them name this node; otherwise at its bound, and
+    /// they are not asked again until they leave and come back.
+    async fn announce(self: Arc<Self>, me: QueryId, alive: Vec<(QueryId, String)>, n: u64) {
         let peers = &self.peers;
         let calls = alive.iter().map(|(_, url)| async move {
             let r = peers
@@ -247,14 +304,14 @@ impl Coordination {
         });
         let answers = futures::future::join_all(calls).await;
         let following = answers.iter().filter(|a| **a == Some(me)).count();
-        if following == answers.len() {
+        let ends = following == answers.len() && self.announcements.load(Ordering::SeqCst) == n;
+        if ends {
             self.admission.end_hold();
         }
         log::emit(
             Level::Info,
             "admission_takeover",
-            json!({ "peers": answers.len(), "following": following,
-                    "hold_ended": following == answers.len() }),
+            json!({ "peers": answers.len(), "following": following, "hold_ended": ends }),
         );
     }
 }

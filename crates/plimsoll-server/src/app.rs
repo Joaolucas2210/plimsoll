@@ -2437,6 +2437,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_peer_seen_late_is_announced_to_and_counted() {
+        // ADR 0108: `x` leads alone; `y`, unseen, runs a query of its own;
+        // when `x` sees `y`, it holds, announces, and counts that query.
+        const TOKEN: &str = "0123456789abcdef";
+        let mut listeners = vec![
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        ];
+        let urls: Vec<String> = listeners
+            .iter()
+            .map(|l| format!("http://{}", l.local_addr().unwrap()))
+            .collect();
+        let node = |first: u64| {
+            let mut st = Arc::into_inner(default_state()).unwrap();
+            st.admission = Admission::new(
+                st.admission.config().clone(),
+                Arc::new(QueryRegistry::new(100).starting_at(first)),
+            );
+            st.worker_token = Some(crate::auth::token_digest(TOKEN));
+            let peers = Arc::new(crate::peers::Peers(
+                plimsoll_connectors::remote::Workers::new(urls.clone(), TOKEN.into()).unwrap(),
+            ));
+            let gate = Arc::new(crate::peers::LeaderGate::new(
+                peers.clone(),
+                Duration::from_secs(30),
+            ));
+            st.coordination = Some(Arc::new(crate::peers::Coordination::new(
+                peers.clone(),
+                st.admission.clone(),
+                Some(gate),
+            )));
+            st.peers = Some(peers);
+            Arc::new(st)
+        };
+        let (x, y) = (node(1 << 32 | 1), node(7 << 32 | 1));
+        let (ly, lx) = (listeners.pop().unwrap(), listeners.pop().unwrap());
+        let round = |n: &Arc<AppState>| n.coordination.clone().unwrap();
+        // Nobody answers yet (bound, not served): `x` leads alone.
+        assert_eq!(round(&x).round(true).await, 1 << 32 | 1);
+        // `y` is served but cannot see `x`: it leads alone and admits.
+        tokio::spawn(axum::serve(ly, router(y.clone())).into_future());
+        assert_eq!(round(&y).round(true).await, 7 << 32 | 1);
+        let theirs = y.admission.acquire("v", DEFAULT_GROUP).await.unwrap();
+        // `x` comes up and sees `y`: announced to, `y` follows and re-homes.
+        tokio::spawn(axum::serve(lx, router(x.clone())).into_future());
+        round(&x).round(true).await;
+        let since = std::time::Instant::now();
+        while x.admission.load() != (1, 0) {
+            assert!(since.elapsed() < Duration::from_secs(5), "not adopted");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The hold ended with `y`'s answer, well before its 10 s bound.
+        let mine = tokio::time::timeout(
+            Duration::from_secs(5),
+            x.admission.acquire("u", DEFAULT_GROUP),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("x still held"))
+        .unwrap();
+        assert_eq!(x.admission.load(), (2, 0));
+        drop((mine, theirs));
+    }
+
+    #[tokio::test]
     async fn owners_and_operators_cancel_queries_others_see_nothing() {
         let mut st = Arc::into_inner(default_state()).unwrap();
         let digest = |t: &str| -> String {
