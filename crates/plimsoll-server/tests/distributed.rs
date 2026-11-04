@@ -282,17 +282,48 @@ async fn distributed_scans_match_local_ones() {
                 assert!(!plan.contains("FilterExec"), "{sql}: {plan}");
             }
         }
-        // A grouped aggregation feeding a join: shuffled only where the
-        // join does not rely on its hash partitioning; same answers.
-        let join = format!(
-            "SELECT a.id, a.c, b.id AS b FROM (SELECT id, count(*) AS c FROM {t} GROUP BY id) a \
-             JOIN {t} b ON a.id = b.id ORDER BY a.id, b.id"
+        // Joins with a grouped aggregation of a remote scan, on its group
+        // keys (ADR 0112): its partial states are one side's maps, merged
+        // by the reducers before they join.
+        for sql in [
+            format!(
+                "SELECT a.id, a.c, b.id AS b FROM (SELECT id, count(*) AS c FROM {t} GROUP BY id) a \
+                 JOIN {t} b ON a.id = b.id ORDER BY a.id, b.id"
+            ),
+            format!(
+                "SELECT a.id, s.total FROM {t} a \
+                 LEFT JOIN (SELECT id, sum(id) AS total FROM {t} GROUP BY id) s ON a.id = s.id \
+                 ORDER BY a.id, s.total"
+            ),
+            format!(
+                "SELECT x.id, x.c, y.m FROM (SELECT id, count(*) AS c FROM {t} GROUP BY id) x \
+                 JOIN (SELECT id, max(id) AS m, min(id) AS n FROM {t} GROUP BY id) y \
+                 ON x.id = y.id ORDER BY x.id"
+            ),
+            // A residual filter over an aggregate (named by position) and
+            // the other side's non-key column. (One over keys only would be
+            // pushed below the join, as a filter over the aggregation, and
+            // keep it as planned.)
+            format!(
+                "SELECT a.id, a.c, b.id AS b FROM (SELECT id, count(*) AS c FROM {t} GROUP BY id) a \
+                 JOIN {t} b ON a.id = b.id AND length(b.{group}) > a.c ORDER BY a.id, b.id"
+            ),
+        ] {
+            joins_match(&sql).await;
+        }
+        // Joined on part of the group keys: its groups would not meet the
+        // other side's rows, so it stays as planned; same answers.
+        let partial_keys = format!(
+            "SELECT a.id, a.c, b.id AS b FROM \
+             (SELECT id, {group}, count(*) AS c FROM {t} GROUP BY id, {group}) a \
+             JOIN {t} b ON a.id = b.id ORDER BY a.id, a.c, b.id"
         );
-        assert_eq!(
-            run(&coordinator, &join).await.0,
-            run(&local, &join).await.0,
-            "{join}"
+        let (got, plan) = run(&coordinator, &partial_keys).await;
+        assert!(
+            !plan.contains("shuffled Inner join"),
+            "{partial_keys}: {plan}"
         );
+        assert_eq!(got, run(&local, &partial_keys).await.0, "{partial_keys}");
         // The local scan's own filtering, checked against a filter it
         // never sees (an aggregate's FILTER clause).
         let (filtered, plan) = run(

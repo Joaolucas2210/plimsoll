@@ -454,6 +454,46 @@ fn broadcast_join(
 
 /// A join's residual filter (ADR 0098) over sides aliased `left.0` and
 /// `right.0`: its SQL names columns `f0…`, each one of a side's columns.
+/// Partial states merged into final values (ADR 0064): counts and sums add
+/// up, min and max compose; group keys then aggregates, as the
+/// aggregation's output.
+fn merged(
+    left: plimsoll_core::datafusion::prelude::DataFrame,
+    spec: &plimsoll_connectors::remote::AggregateSpec,
+) -> Result<plimsoll_core::datafusion::prelude::DataFrame, EngineError> {
+    use plimsoll_core::datafusion::functions_aggregate::expr_fn::{max, min, sum};
+    use plimsoll_core::datafusion::prelude::Expr;
+    let fail = |e: DataFusionError| classify(&e);
+    let columns = left.schema().columns();
+    let column = |i: usize| {
+        columns.get(i).cloned().map(Expr::Column).ok_or_else(|| {
+            EngineError::InvalidQuery("map output narrower than its aggregate".into())
+        })
+    };
+    let k = spec.group_by.len();
+    let groups = (0..k).map(column).collect::<Result<Vec<_>, _>>()?;
+    let merges = spec
+        .aggregates
+        .iter()
+        .enumerate()
+        .map(|(i, (f, _))| {
+            let state = column(k + i)?;
+            Ok(match f.as_str() {
+                "count" | "sum" => sum(state),
+                "min" => min(state),
+                "max" => max(state),
+                other => {
+                    return Err(EngineError::InvalidQuery(format!(
+                        "aggregate {other} is not partial-safe"
+                    )));
+                }
+            }
+            .alias(format!("a{i}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    left.aggregate(groups, merges).map_err(fail)
+}
+
 fn join_filter(
     ctx: &plimsoll_core::datafusion::prelude::SessionContext,
     filter: &plimsoll_connectors::remote::JoinFilter,
@@ -1170,7 +1210,6 @@ impl QueryEngine for CoreEngine {
         tag: Option<Arc<QueryTag>>,
     ) -> Result<Running, EngineError> {
         use plimsoll_core::datafusion::common::{Column, JoinType};
-        use plimsoll_core::datafusion::functions_aggregate::expr_fn::{max, min, sum};
         use plimsoll_core::datafusion::prelude::{Expr, SessionContext};
         let fail = |e: DataFusionError| classify(&e);
         // Join keys by position in each map's columns; group keys lead an
@@ -1207,13 +1246,44 @@ impl QueryEngine for CoreEngine {
                 None,
             ),
             Some(j) => {
+                // A merged aggregation's keys (ADR 0112) are `c{i}`, its
+                // side's column i: picked from the aggregation's output,
+                // whose group keys lead the partial states the maps hash.
+                let by = |names: &[String], picks: &Option<Vec<usize>>| {
+                    let (names, picks) = (names.to_vec(), picks.clone());
+                    let at = positions(&names);
+                    move |f: &Fragment| match &picks {
+                        None => at(f),
+                        Some(picks) => names
+                            .iter()
+                            .map(|k| {
+                                k.strip_prefix('c')
+                                    .and_then(|i| i.parse::<usize>().ok())
+                                    .and_then(|i| picks.get(i).copied())
+                                    .ok_or_else(|| {
+                                        EngineError::InvalidQuery(format!(
+                                            "join key {k} is not a picked column"
+                                        ))
+                                    })
+                            })
+                            .collect(),
+                    }
+                };
                 let (l, r) = futures::future::try_join(
-                    open_side(&r, &r.maps, 0, positions(&j.left_keys), &peers, token, &tag),
+                    open_side(
+                        &r,
+                        &r.maps,
+                        0,
+                        by(&j.left_keys, &j.left_picks),
+                        &peers,
+                        token,
+                        &tag,
+                    ),
                     open_side(
                         &r,
                         &j.right,
                         r.maps.len(),
-                        positions(&j.right_keys),
+                        by(&j.right_keys, &j.right_picks),
                         &peers,
                         token,
                         &tag,
@@ -1230,10 +1300,41 @@ impl QueryEngine for CoreEngine {
         let left = read(left)?;
         let df = match (&r.join, right) {
             (Some(j), Some(right)) => {
+                // An aggregated side is merged first, then its columns
+                // picked as `c0…` (ADR 0112).
+                let side = |df, maps: &[(String, Fragment)], picks: &Option<Vec<usize>>| {
+                    let Some(picks) = picks else { return Ok(df) };
+                    let spec = maps.first().and_then(|(_, f)| f.aggregate.as_ref());
+                    let Some(spec) = spec else {
+                        return Err(EngineError::InvalidQuery(
+                            "a merged join side needs aggregated maps".into(),
+                        ));
+                    };
+                    let merged = merged(df, spec)?;
+                    let columns = merged.schema().columns();
+                    let picked = picks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &c)| {
+                            columns
+                                .get(c)
+                                .cloned()
+                                .map(|c| Expr::Column(c).alias(format!("c{i}")))
+                        })
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| {
+                            EngineError::InvalidQuery("a picked column is out of range".into())
+                        })?;
+                    merged.select(picked).map_err(fail)
+                };
                 // Qualified sides, so equal column names stay apart.
                 let (l, rt) = (
-                    left.alias("l").map_err(fail)?,
-                    read(right)?.alias("r").map_err(fail)?,
+                    side(left, &r.maps, &j.left_picks)?
+                        .alias("l")
+                        .map_err(fail)?,
+                    side(read(right)?, &j.right, &j.right_picks)?
+                        .alias("r")
+                        .map_err(fail)?,
                 );
                 let mut on: Vec<Expr> = j
                     .left_keys
@@ -1260,37 +1361,7 @@ impl QueryEngine for CoreEngine {
                 let Some(spec) = r.maps.first().and_then(|(_, f)| f.aggregate.clone()) else {
                     return Err(EngineError::InvalidQuery("a reduce needs maps".into()));
                 };
-                // Partial states merged: counts and sums add up, min and
-                // max compose. Each merged state is the aggregate's final
-                // value.
-                let columns = left.schema().columns();
-                let column = |i: usize| {
-                    columns.get(i).cloned().map(Expr::Column).ok_or_else(|| {
-                        EngineError::InvalidQuery("map output narrower than its aggregate".into())
-                    })
-                };
-                let k = spec.group_by.len();
-                let groups = (0..k).map(column).collect::<Result<Vec<_>, _>>()?;
-                let merges = spec
-                    .aggregates
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (f, _))| {
-                        let state = column(k + i)?;
-                        Ok(match f.as_str() {
-                            "count" | "sum" => sum(state),
-                            "min" => min(state),
-                            "max" => max(state),
-                            other => {
-                                return Err(EngineError::InvalidQuery(format!(
-                                    "aggregate {other} is not partial-safe"
-                                )));
-                            }
-                        }
-                        .alias(format!("a{i}")))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                left.aggregate(groups, merges).map_err(fail)?
+                merged(left, &spec)?
             }
         };
         // Reduced rows written here (ADR 0092), the columns the coordinator

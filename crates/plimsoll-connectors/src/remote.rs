@@ -443,6 +443,12 @@ pub struct JoinSpec {
     pub projection: Option<Vec<usize>>,
     /// The join's residual filter (ADR 0098).
     pub filter: Option<JoinFilter>,
+    /// A side whose maps are partial aggregates (ADR 0112): the reducer
+    /// merges them, then keeps these columns of the merged output, named
+    /// `c0…`, as the join's side. Keys and filter columns on that side
+    /// use those names.
+    pub left_picks: Option<Vec<usize>>,
+    pub right_picks: Option<Vec<usize>>,
 }
 
 /// A join's non-equi filter as a worker plans it (ADR 0098): portable SQL
@@ -488,6 +494,9 @@ impl JoinFilter {
 fn join_filter(
     join: &datafusion::physical_plan::joins::HashJoinExec,
     config: &ConfigOptions,
+    // Sides whose columns a reducer names by position, `c{i}`: merged
+    // aggregations (ADR 0112).
+    positional: (bool, bool),
 ) -> Option<Option<JoinFilter>> {
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::common::JoinSide;
@@ -498,12 +507,20 @@ fn join_filter(
     let (ls, rs) = (join.left().schema(), join.right().schema());
     let mut columns = Vec::new();
     for c in filter.column_indices() {
-        let (left, schema) = match c.side {
-            JoinSide::Left => (true, &ls),
-            JoinSide::Right => (false, &rs),
+        let (left, schema, by_position) = match c.side {
+            JoinSide::Left => (true, &ls, positional.0),
+            JoinSide::Right => (false, &rs, positional.1),
             JoinSide::None => return None,
         };
-        columns.push((left, schema.fields().get(c.index)?.name().clone()));
+        let name = schema.fields().get(c.index)?.name().clone();
+        columns.push((
+            left,
+            if by_position {
+                format!("c{}", c.index)
+            } else {
+                name
+            },
+        ));
     }
     let named = Arc::new(Schema::new(
         filter
@@ -596,6 +613,8 @@ impl Reduce {
                 "right_keys": j.right_keys,
                 "projection": j.projection,
                 "filter": j.filter.as_ref().map(JoinFilter::to_json),
+                "left_picks": j.left_picks,
+                "right_picks": j.right_picks,
             })),
         }})
     }
@@ -615,6 +634,8 @@ impl Reduce {
                 right_keys: names(&j["right_keys"], "reduce.join.right_keys")?,
                 projection: projection(&j["projection"], "reduce.join.projection")?,
                 filter: JoinFilter::from_json(&j["filter"])?,
+                left_picks: projection(&j["left_picks"], "reduce.join.left_picks")?,
+                right_picks: projection(&j["right_picks"], "reduce.join.right_picks")?,
             }),
         };
         if join.is_none() && maps.iter().any(|(_, f)| f.aggregate.is_none()) {
@@ -2045,6 +2066,61 @@ fn scan_side(input: &Arc<dyn ExecutionPlan>, config: &ConfigOptions) -> Option<R
     Some(side)
 }
 
+/// A join side the workers produce for a shuffled join: a remote scan
+/// ([`scan_side`], `None`), or a grouped aggregation of one (ADR 0112):
+/// its partial aggregates are the side's maps, and `Some(picks)` are the
+/// side's columns by position in the aggregation's output, which reducers
+/// merge before joining.
+fn join_side(
+    input: &Arc<dyn ExecutionPlan>,
+    config: &ConfigOptions,
+) -> Option<(RemoteScanExec, Option<Vec<usize>>)> {
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion::physical_plan::projection::ProjectionExec;
+    if let Some(scan) = scan_side(input, config) {
+        return Some((scan, None));
+    }
+    let peel = |mut p: Arc<dyn ExecutionPlan>| loop {
+        if !matches!(
+            p.name(),
+            "RepartitionExec" | "CoalesceBatchesExec" | "CoalescePartitionsExec"
+        ) {
+            return Some(p);
+        }
+        p = p.children().first().map(|c| (*c).clone())?;
+    };
+    let mut p = peel(input.clone())?;
+    // Column picks and renames over the aggregation, nothing computed.
+    let mut picks = None;
+    if let Some(projection) = p.as_ref().downcast_ref::<ProjectionExec>() {
+        picks = Some(
+            projection
+                .expr()
+                .iter()
+                .map(|e| e.expr.as_ref().downcast_ref::<Column>().map(Column::index))
+                .collect::<Option<Vec<_>>>()?,
+        );
+        p = peel(projection.input().clone())?;
+    }
+    let agg = p.as_ref().downcast_ref::<AggregateExec>()?;
+    if !matches!(
+        agg.mode(),
+        AggregateMode::Final | AggregateMode::FinalPartitioned
+    ) || agg.group_expr().expr().is_empty()
+    {
+        return None;
+    }
+    let partial = peel(agg.input().clone())?;
+    let remote = partial_remote(&partial, config).ok()??;
+    // One state per aggregate (count/sum/min/max): merged, the state is
+    // the final value (as for ADR 0064's shuffles).
+    if partial.schema().fields().len() != agg.schema().fields().len() {
+        return None;
+    }
+    let width = agg.schema().fields().len();
+    Some((remote, Some(picks.unwrap_or_else(|| (0..width).collect()))))
+}
+
 /// Replaces a grouped final aggregation over a pushable partial one with
 /// a shuffle between the workers (ADR 0064), when nothing above depends
 /// on its partitioning (`free`). Recurses into the children otherwise.
@@ -2109,26 +2185,29 @@ fn shuffle_join(
     use datafusion::physical_expr::expressions::Column;
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
     let join = node.as_ref().downcast_ref::<HashJoinExec>()?;
-    // The worker runs the same join: its filter as SQL (ADR 0098), no mark
-    // join, no null-equal keys.
-    let filter = join_filter(join, config)?;
     if *join.partition_mode() != PartitionMode::Partitioned
         || join.null_equality() != NullEquality::NullEqualsNothing
         || matches!(join.join_type(), JoinType::LeftMark | JoinType::RightMark)
     {
         return None;
     }
-    let (left, right) = (
-        scan_side(join.left(), config)?,
-        scan_side(join.right(), config)?,
+    let ((left, left_picks), (right, right_picks)) = (
+        join_side(join.left(), config)?,
+        join_side(join.right(), config)?,
     );
     let (left, right) = (&left, &right);
-    let plain = |s: &RemoteScanExec| {
-        !s.fragments.is_empty() && s.fragments.iter().all(|a| a.fragment.aggregate.is_none())
+    let usable = |s: &RemoteScanExec, picks: &Option<Vec<usize>>| {
+        !s.fragments.is_empty()
+            && s.fragments
+                .iter()
+                .all(|a| a.fragment.aggregate.is_some() == picks.is_some())
     };
-    if !plain(left) || !plain(right) || left.urls.is_empty() {
+    if !usable(left, &left_picks) || !usable(right, &right_picks) || left.urls.is_empty() {
         return None;
     }
+    // The worker runs the same join: its filter as SQL (ADR 0098), no mark
+    // join, no null-equal keys.
+    let filter = join_filter(join, config, (left_picks.is_some(), right_picks.is_some()))?;
     let (ls, rs) = (join.left().schema(), join.right().schema());
     let (mut left_keys, mut right_keys) = (Vec::new(), Vec::new());
     for (a, b) in join.on() {
@@ -2137,8 +2216,36 @@ fn shuffle_join(
         if ls.field(a.index()).data_type() != rs.field(b.index()).data_type() {
             return None;
         }
-        left_keys.push(a.name().to_owned());
-        right_keys.push(b.name().to_owned());
+        let name = |c: &Column, picks: &Option<Vec<usize>>| match picks {
+            Some(_) => format!("c{}", c.index()),
+            None => c.name().to_owned(),
+        };
+        left_keys.push(name(a, &left_picks));
+        right_keys.push(name(b, &right_picks));
+    }
+    // An aggregated side's maps hash its group keys (ADR 0112): the join's
+    // keys must be exactly those, or matching rows would not meet.
+    let groups_are_keys = |s: &RemoteScanExec, picks: &Option<Vec<usize>>, left: bool| {
+        let Some(picks) = picks else { return true };
+        let groups = s
+            .fragments
+            .first()
+            .and_then(|a| a.fragment.aggregate.as_ref())
+            .map_or(0, |g| g.group_by.len());
+        let mut keyed: Vec<usize> = join
+            .on()
+            .iter()
+            .filter_map(|(a, b)| {
+                let c = if left { a } else { b };
+                let c = c.as_ref().downcast_ref::<Column>()?;
+                picks.get(c.index()).copied()
+            })
+            .collect();
+        keyed.sort_unstable();
+        keyed == (0..groups).collect::<Vec<_>>()
+    };
+    if !groups_are_keys(left, &left_picks, true) || !groups_are_keys(right, &right_picks, false) {
+        return None;
     }
     let spec = JoinSpec {
         join_type: join.join_type().to_string(),
@@ -2147,6 +2254,8 @@ fn shuffle_join(
         right_keys,
         projection: join.projection.as_ref().map(|p| p.to_vec()),
         filter,
+        left_picks,
+        right_picks,
     };
     let (shuffle, partitions, maps) = (shuffle_id(), left.urls.len(), left.maps());
     let reduces = left
@@ -2203,7 +2312,7 @@ fn broadcast_join(
         JoinType::Left | JoinType::Full | JoinType::LeftSemi | JoinType::LeftAnti
     );
     // A filter travels as SQL (ADR 0098), or the join stays.
-    let Some(filter) = join_filter(join, config) else {
+    let Some(filter) = join_filter(join, config, (false, false)) else {
         return Ok(None);
     };
     if *join.partition_mode() != PartitionMode::CollectLeft
@@ -2783,6 +2892,8 @@ mod tests {
                     sql: "f0 <> f1".into(),
                     columns: vec![(true, "id".into()), (false, "re\"gion".into())],
                 }),
+                left_picks: Some(vec![0, 2]),
+                right_picks: None,
             }),
             ..r.clone()
         };
