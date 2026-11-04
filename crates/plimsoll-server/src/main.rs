@@ -124,7 +124,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         Some(_) => coordinators,
                                         None => 1,
                                     });
-                                    gate.follow(leader.clone());
+                                    gate.follow(leader.clone(), admission);
                                 }
                                 None => admission.share_with(coordinators),
                             }

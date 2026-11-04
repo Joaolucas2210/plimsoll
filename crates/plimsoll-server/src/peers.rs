@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use plimsoll_connectors::remote::Workers;
-use plimsoll_control::governance::{AdmissionError, Gate, Permit, QueryId, QueryInfo};
+use plimsoll_control::governance::{Admission, AdmissionError, Gate, Permit, QueryId, QueryInfo};
 use serde_json::{Value, json};
 
 use crate::log::{self, Level};
@@ -162,9 +162,82 @@ impl LeaderGate {
         }
     }
 
-    /// The leader from now on, as [`elect`] found it.
-    pub fn follow(&self, leader: Option<String>) {
-        *self.leader.write().unwrap_or_else(|e| e.into_inner()) = leader;
+    /// The leader from now on, as [`elect`] found it. When it changes,
+    /// this node's running queries are re-homed (ADR 0105): adopted by the
+    /// new leader, whose counts then include them, and released at the
+    /// old one; or, when this node leads, counted here only.
+    pub fn follow(&self, leader: Option<String>, admission: &Admission) {
+        {
+            let mut current = self.leader.write().unwrap_or_else(|e| e.into_inner());
+            if *current == leader {
+                return;
+            }
+            current.clone_from(&leader);
+        }
+        let held = admission.held();
+        if held.is_empty() {
+            return;
+        }
+        let gate = Self {
+            peers: self.peers.clone(),
+            leader: RwLock::new(None),
+            hold: self.hold,
+        };
+        tokio::spawn(async move {
+            let mut adopted = 0;
+            for h in &held {
+                let Some(url) = &leader else {
+                    h.replace(None);
+                    continue;
+                };
+                let sent = gate.post(url, &h.user, &h.group, true).await;
+                match sent
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| match r.status() {
+                        reqwest::StatusCode::OK => Ok(r),
+                        status => Err(format!("HTTP {}", status.as_u16())),
+                    }) {
+                    Ok(permit) => {
+                        h.replace(Some(Box::new(permit)));
+                        adopted += 1;
+                    }
+                    // Kept where it was: the old leader, if it is alive,
+                    // still counts it.
+                    Err(e) => log::emit(
+                        Level::Warn,
+                        "admission_rehome_failed",
+                        json!({ "leader": url, "error": e }),
+                    ),
+                }
+            }
+            log::emit(
+                Level::Info,
+                "admission_rehomed",
+                json!({ "leader": leader.as_deref().unwrap_or("self"),
+                        "queries": held.len(), "adopted": adopted }),
+            );
+        });
+    }
+
+    /// Asks `url` to admit, or with `adopt` to count a running query. A
+    /// 200's body holds the slot for as long as it is kept.
+    async fn post(
+        &self,
+        url: &str,
+        user: &str,
+        group: &str,
+        adopt: bool,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        // No overall timeout: the wait is the leader's queue, bounded by
+        // the caller's deadline, and the body lasts as long as the query.
+        self.peers
+            .0
+            .request(reqwest::Method::POST, &format!("{url}/v1/peer/admit"))
+            .header("content-type", "application/json")
+            .header("x-plimsoll-deadline-ms", self.hold.as_millis().to_string())
+            .body(json!({ "user": user, "group": group, "adopt": adopt }).to_string())
+            .send()
+            .await
     }
 }
 
@@ -179,18 +252,7 @@ impl Gate for LeaderGate {
         let Some(url) = leader else {
             return Ok(None);
         };
-        // No overall timeout: the wait is the leader's queue, bounded by
-        // the caller's deadline, and the body lasts as long as the query.
-        let sent = self
-            .peers
-            .0
-            .request(reqwest::Method::POST, &format!("{url}/v1/peer/admit"))
-            .header("content-type", "application/json")
-            .header("x-plimsoll-deadline-ms", self.hold.as_millis().to_string())
-            .body(json!({ "user": user, "group": group }).to_string())
-            .send()
-            .await;
-        let failure = match sent {
+        let failure = match self.post(&url, user, group, false).await {
             Ok(r) if r.status() == reqwest::StatusCode::OK => return Ok(Some(Box::new(r))),
             Ok(r) if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
                 let body = r.bytes().await.unwrap_or_default();

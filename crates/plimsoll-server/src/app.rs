@@ -418,6 +418,8 @@ async fn peer_admit(
     if !st.admission.config().has_group(group) {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    // ADR 0105: a query a previous leader admitted, already running.
+    let adopt = request["adopt"].as_bool().unwrap_or(false);
     let hold = headers
         .get("x-plimsoll-deadline-ms")
         .and_then(|v| v.to_str().ok())
@@ -425,7 +427,13 @@ async fn peer_admit(
         .map_or(st.query_timeout, |ms| {
             Duration::from_millis(ms).min(st.query_timeout)
         });
-    let slot = match tokio::time::timeout(hold, st.admission.acquire_here(user, group)).await {
+    let admitted = async {
+        match adopt {
+            true => Ok(st.admission.adopt(user, group)),
+            false => st.admission.acquire_here(user, group).await,
+        }
+    };
+    let slot = match tokio::time::timeout(hold, admitted).await {
         Ok(Ok(slot)) => slot,
         Ok(Err(e)) => return (StatusCode::TOO_MANY_REQUESTS, Json(e)).into_response(),
         Err(_) => return StatusCode::GATEWAY_TIMEOUT.into_response(),
@@ -2316,16 +2324,30 @@ mod tests {
             a.peers.clone().unwrap(),
             Duration::from_secs(30),
         ));
-        gate.follow(Some(url.clone()));
-        a.admission.set_gate(gate);
+        gate.follow(Some(url.clone()), &a.admission);
+        a.admission.set_gate(gate.clone());
         let slot = a.admission.acquire("ana", DEFAULT_GROUP).await.unwrap();
         assert_eq!((a.admission.load(), b.admission.load()), ((1, 0), (1, 0)));
+        let settles = async |want: (usize, usize)| {
+            let since = std::time::Instant::now();
+            while b.admission.load() != want {
+                assert!(
+                    since.elapsed() < Duration::from_secs(10),
+                    "b stuck at {:?}",
+                    b.admission.load()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        // ADR 0105: `a` leads now; its query is counted there only.
+        gate.follow(None, &a.admission);
+        settles((0, 0)).await;
+        assert_eq!(a.admission.load(), (1, 0));
+        // `b` leads again: it adopts the running query, beyond any limit.
+        gate.follow(Some(url.clone()), &a.admission);
+        settles((1, 0)).await;
         drop(slot);
-        let released = std::time::Instant::now();
-        while b.admission.load() != (0, 0) {
-            assert!(released.elapsed() < Duration::from_secs(10), "slot leaked");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        settles((0, 0)).await;
         assert_eq!(a.admission.load(), (0, 0));
 
         // The peer endpoints only answer the worker token.

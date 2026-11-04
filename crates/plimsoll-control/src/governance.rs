@@ -435,6 +435,33 @@ struct Inner {
     state: Mutex<State>,
     /// Where admission is decided when not here (ADR 0104).
     gate: std::sync::OnceLock<Arc<dyn Gate>>,
+    /// This node's own running queries while a gate is set: re-homed when
+    /// the leader changes (ADR 0105).
+    held: Mutex<Vec<std::sync::Weak<Held>>>,
+}
+
+/// One of this node's own running queries under a [`Gate`] (ADR 0105):
+/// where its slot is held changes with the leader.
+pub struct Held {
+    pub user: String,
+    pub group: String,
+    /// `None`: counted here only (this node leads, or the leader could not
+    /// be reached when it was admitted).
+    permit: Mutex<Option<Permit>>,
+}
+
+impl Held {
+    /// Holds the slot with `permit` from now on; the previous one, if any,
+    /// is dropped, which releases it where it was.
+    pub fn replace(&self, permit: Option<Permit>) {
+        let old = std::mem::replace(&mut *lock(&self.permit), permit);
+        drop(old);
+    }
+
+    /// Whether a leader holds its slot.
+    pub fn is_remote(&self) -> bool {
+        lock(&self.permit).is_some()
+    }
 }
 
 /// What a [`Gate`] grants: the slot is held where it was granted until
@@ -464,7 +491,7 @@ pub struct AdmissionSlot {
     user: String,
     group: String,
     /// Granted by a [`Gate`]: released there when dropped.
-    _permit: Option<Permit>,
+    held: Option<Arc<Held>>,
 }
 
 impl Drop for AdmissionSlot {
@@ -502,11 +529,22 @@ fn promote(
             inner: Arc::clone(inner),
             user: w.user,
             group: w.group,
-            _permit: None,
+            held: None,
         };
         out.push((w.tx, slot));
     }
     out
+}
+
+impl AdmissionSlot {
+    fn held_by(mut self, permit: Option<Permit>) -> Self {
+        self.held = Some(Arc::new(Held {
+            user: self.user.clone(),
+            group: self.group.clone(),
+            permit: Mutex::new(permit),
+        }));
+        self
+    }
 }
 
 /// A query counted as queued while a [`Gate`] decides; uncounted when
@@ -563,6 +601,7 @@ impl Admission {
                 cfg,
                 state: Mutex::new(State::default()),
                 gate: std::sync::OnceLock::new(),
+                held: Mutex::new(Vec::new()),
             }),
             registry,
         }
@@ -615,17 +654,49 @@ impl Admission {
             lock(&self.inner.state).update(user, group, |c| c.queued += 1);
             let permit = gate.admit(user, group).await;
             drop(waiting);
-            if let Some(permit) = permit? {
-                lock(&self.inner.state).update(user, group, |c| c.running += 1);
-                return Ok(AdmissionSlot {
-                    inner: Arc::clone(&self.inner),
-                    user: user.to_owned(),
-                    group: group.to_owned(),
-                    _permit: Some(permit),
-                });
+            let slot = match permit? {
+                Some(permit) => {
+                    lock(&self.inner.state).update(user, group, |c| c.running += 1);
+                    AdmissionSlot {
+                        inner: Arc::clone(&self.inner),
+                        user: user.to_owned(),
+                        group: group.to_owned(),
+                        held: None,
+                    }
+                    .held_by(Some(permit))
+                }
+                None => self.acquire_here(user, group).await?.held_by(None),
+            };
+            // Tracked, so a new leader is told about it.
+            if let Some(held) = &slot.held {
+                let mut all = lock(&self.inner.held);
+                all.retain(|h| h.strong_count() > 0);
+                all.push(Arc::downgrade(held));
             }
+            return Ok(slot);
         }
         self.acquire_here(user, group).await
+    }
+
+    /// This node's own running queries under a gate (ADR 0105).
+    pub fn held(&self) -> Vec<Arc<Held>> {
+        lock(&self.inner.held)
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect()
+    }
+
+    /// Counts a query that already runs, admitted by a previous leader,
+    /// whatever the limits (ADR 0105): new queries wait until the counts
+    /// are back under them.
+    pub fn adopt(&self, user: &str, group: &str) -> AdmissionSlot {
+        lock(&self.inner.state).update(user, group, |c| c.running += 1);
+        AdmissionSlot {
+            inner: Arc::clone(&self.inner),
+            user: user.to_owned(),
+            group: group.to_owned(),
+            held: None,
+        }
     }
 
     /// [`Self::acquire`] by this node's own counters, never through the
@@ -643,7 +714,7 @@ impl Admission {
                     inner: Arc::clone(&self.inner),
                     user: user.to_owned(),
                     group: group.to_owned(),
-                    _permit: None,
+                    held: None,
                 });
             }
             st.queue_check(&self.inner.cfg, user, group)?;
@@ -813,6 +884,46 @@ mod tests {
                 limit: 2
             }
         );
+    }
+
+    #[tokio::test]
+    async fn own_queries_are_tracked_for_a_new_leader() {
+        // A gate with no leader: admitted here, tracked all the same.
+        struct NoLeader;
+        #[async_trait::async_trait]
+        impl Gate for NoLeader {
+            async fn admit(&self, _: &str, _: &str) -> Result<Option<Permit>, AdmissionError> {
+                Ok(None)
+            }
+        }
+        let adm = admission(lim(1, 0), lim(1, 0), lim(1, 0));
+        assert!(adm.held().is_empty());
+        adm.set_gate(Arc::new(NoLeader));
+        let slot = adm.acquire("ana", DEFAULT_GROUP).await.unwrap();
+        let held = adm.held();
+        assert_eq!(held.len(), 1);
+        assert_eq!((held[0].user.as_str(), held[0].is_remote()), ("ana", false));
+        // Re-homed: the new permit is held, the old one released.
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct Flag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        held[0].replace(Some(Box::new(Flag(dropped.clone()))));
+        assert!(held[0].is_remote());
+        held[0].replace(None);
+        assert!(dropped.load(Ordering::SeqCst));
+        drop(held);
+        drop(slot);
+        assert!(adm.held().is_empty(), "gone with its query");
+        // A leader adopts a running query beyond its limits; new ones wait.
+        let leader = admission(lim(1, 0), lim(1, 0), lim(1, 0));
+        let _mine = leader.acquire("bob", DEFAULT_GROUP).await.unwrap();
+        let _adopted = leader.adopt("ana", DEFAULT_GROUP);
+        assert_eq!(leader.load(), (2, 0));
+        assert!(leader.acquire("carl", DEFAULT_GROUP).await.is_err());
     }
 
     #[tokio::test]
