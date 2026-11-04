@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Non-equi (nested-loop) joins against a small side broadcast to the workers, with gathered left/full/semi/anti variants and the broadcast limit's fallback (ADR 0115)
 - [x] Distinct counts from the metadata of statistics files (Puffin `ndv`), and row estimates net of position deletes, so joins on repeated keys are sized (ADR 0114)
 - [x] Column statistics from manifests (bounds, null counts, inexact) and the scan's own filter selectivity, so filtered sides are sized for broadcast or shuffle (ADR 0113)
 - [x] Joins between a remote scan and a grouped aggregation of one, on its group keys: partial states are one side's maps, merged and joined in the same reducers (ADR 0112)
@@ -147,9 +148,10 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Non-equi joins against a small side** — a nested-loop join whose
-build side is small (`ON a.ts BETWEEN b.start AND b.end`) broadcast to
-the workers like a hash join's build side (ADR 0066).
+**Broadcast build sides cached per snapshot** — a collected side that
+reads only Iceberg tables at pinned snapshots is the same rows every
+time: keep its Arrow IPC (under the memory ceiling) and send it again
+instead of collecting it again (ADR 0066, 0038).
 
 ## Missing
 
@@ -164,8 +166,8 @@ the workers like a hash join's build side (ADR 0066).
   `CREATE OR REPLACE TABLE … AS SELECT`.
 
 **Distribution**
-- Non-equi (nested loop) joins against a small side; caching broadcast
-  build sides per snapshot (ADR 0066); join sides under projections
+- Caching broadcast build sides per snapshot (above); range-partitioned
+  joins of two large sides (ADR 0115); join sides under projections
   that also prune columns (ADR 0111).
 - Joins with a subquery (ADR 0065); with an aggregation under `HAVING`
   or joined on part of its group keys (ADR 0112).

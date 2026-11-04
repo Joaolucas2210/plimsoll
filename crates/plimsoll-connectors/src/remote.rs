@@ -492,7 +492,8 @@ impl JoinFilter {
 /// The join's filter for workers (ADR 0098): `Some(None)` without one,
 /// `None` when it does not travel exactly as SQL.
 fn join_filter(
-    join: &datafusion::physical_plan::joins::HashJoinExec,
+    filter: Option<&datafusion::physical_plan::joins::utils::JoinFilter>,
+    (ls, rs): (SchemaRef, SchemaRef),
     config: &ConfigOptions,
     // Sides whose columns a reducer names by position, `c{i}`: merged
     // aggregations (ADR 0112).
@@ -501,10 +502,9 @@ fn join_filter(
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::common::JoinSide;
     use datafusion::physical_expr::expressions::Column;
-    let Some(filter) = join.filter() else {
+    let Some(filter) = filter else {
         return Some(None);
     };
-    let (ls, rs) = (join.left().schema(), join.right().schema());
     let mut columns = Vec::new();
     for c in filter.column_indices() {
         let (left, schema, by_position) = match c.side {
@@ -2217,7 +2217,12 @@ fn shuffle_join(
     }
     // The worker runs the same join: its filter as SQL (ADR 0098), no mark
     // join, no null-equal keys.
-    let filter = join_filter(join, config, (left_picks.is_some(), right_picks.is_some()))?;
+    let filter = join_filter(
+        join.filter(),
+        (join.left().schema(), join.right().schema()),
+        config,
+        (left_picks.is_some(), right_picks.is_some()),
+    )?;
     let (ls, rs) = (join.left().schema(), join.right().schema());
     let (mut left_keys, mut right_keys) = (Vec::new(), Vec::new());
     for (a, b) in join.on() {
@@ -2299,44 +2304,74 @@ fn shuffle_join(
     )))
 }
 
-/// A `CollectLeft` equi-join whose probe side (right) is a plain remote
-/// scan, as a broadcast (ADR 0066): only join types driven by the probe
-/// side, whose output per probe row does not depend on other probe rows
-/// (inner, right, right semi, right anti). A left or full join would emit
-/// unmatched build rows once per worker.
+/// A join that collects its left side whose probe side (right) is a plain
+/// remote scan, as a broadcast (ADR 0066): a `CollectLeft` equi-join, or a
+/// nested-loop join, which always collects its left side and joins on its
+/// filter alone (ADR 0115). Join types driven by the probe side (inner,
+/// right, right semi, right anti) run on the workers as planned; left,
+/// full, left semi and anti ones gather the build rows' matches (ADR
+/// 0097).
 fn broadcast_join(
     node: &Arc<dyn ExecutionPlan>,
     config: &ConfigOptions,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     use datafusion::common::{JoinType, NullEquality};
     use datafusion::physical_expr::expressions::Column;
-    use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
-    let Some(join) = node.as_ref().downcast_ref::<HashJoinExec>() else {
-        return Ok(None);
-    };
+    use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec, PartitionMode};
+    // The join's pieces, whichever it is: an equi-join has keys.
+    let (left, right, join_type, filter, projection, on) =
+        if let Some(join) = node.as_ref().downcast_ref::<HashJoinExec>() {
+            // NOT IN's null-aware anti join is not one the workers run.
+            if *join.partition_mode() != PartitionMode::CollectLeft
+                || join.null_equality() != NullEquality::NullEqualsNothing
+                || join.null_aware
+            {
+                return Ok(None);
+            }
+            (
+                join.left(),
+                join.right(),
+                *join.join_type(),
+                join.filter(),
+                join.projection.as_ref().map(|p| p.to_vec()),
+                join.on(),
+            )
+        } else if let Some(join) = node.as_ref().downcast_ref::<NestedLoopJoinExec>() {
+            (
+                join.left(),
+                join.right(),
+                *join.join_type(),
+                join.filter(),
+                join.projection().as_ref().map(|p| p.to_vec()),
+                &[][..],
+            )
+        } else {
+            return Ok(None);
+        };
     // Left, full, left semi and anti joins need every fragment's matches
     // to know a build row's fate: the coordinator gathers them (ADR 0097).
-    // NOT IN's null-aware anti join is not one of them.
     let gathered = matches!(
-        join.join_type(),
+        join_type,
         JoinType::Left | JoinType::Full | JoinType::LeftSemi | JoinType::LeftAnti
     );
-    // A filter travels as SQL (ADR 0098), or the join stays.
-    let Some(filter) = join_filter(join, config, (false, false)) else {
-        return Ok(None);
-    };
-    if *join.partition_mode() != PartitionMode::CollectLeft
-        || join.null_equality() != NullEquality::NullEqualsNothing
-        || join.null_aware
-        || !(gathered
-            || matches!(
-                join.join_type(),
-                JoinType::Inner | JoinType::Right | JoinType::RightSemi | JoinType::RightAnti
-            ))
+    if !(gathered
+        || matches!(
+            join_type,
+            JoinType::Inner | JoinType::Right | JoinType::RightSemi | JoinType::RightAnti
+        ))
     {
         return Ok(None);
     }
-    let Some(probe) = scan_side(join.right(), config) else {
+    // A filter travels as SQL (ADR 0098), or the join stays.
+    let Some(filter) = join_filter(
+        filter,
+        (left.schema(), right.schema()),
+        config,
+        (false, false),
+    ) else {
+        return Ok(None);
+    };
+    let Some(probe) = scan_side(right, config) else {
         return Ok(None);
     };
     let probe = &probe;
@@ -2351,9 +2386,9 @@ fn broadcast_join(
     {
         return Ok(None);
     }
-    let (ls, rs) = (join.left().schema(), join.right().schema());
+    let (ls, rs) = (left.schema(), right.schema());
     let (mut build_keys, mut probe_keys) = (Vec::new(), Vec::new());
-    for (a, b) in join.on() {
+    for (a, b) in on {
         let (Some(a), Some(b)) = (
             a.as_ref().downcast_ref::<Column>(),
             b.as_ref().downcast_ref::<Column>(),
@@ -2367,21 +2402,21 @@ fn broadcast_join(
         probe_keys.push(b.name().to_owned());
     }
     let spec = Broadcast {
-        join_type: join.join_type().to_string(),
+        join_type: join_type.to_string(),
         build_keys,
         probe_keys,
-        projection: join.projection.as_ref().map(|p| p.to_vec()),
+        projection: projection.clone(),
         matched: gathered,
         filter,
     };
     // The build side is collected whole, so nothing in it depends on
     // its partitioning: it may shuffle too.
-    let build = shuffle(join.left().clone(), true, config)?;
+    let build = shuffle(left.clone(), true, config)?;
     if gathered {
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
         let index = Field::new("__b_row", DataType::UInt64, true);
-        let returned = if matches!(join.join_type(), JoinType::Left | JoinType::Full) {
-            let mut fields: Vec<_> = join.schema().fields().iter().cloned().collect();
+        let returned = if matches!(join_type, JoinType::Left | JoinType::Full) {
+            let mut fields: Vec<_> = node.schema().fields().iter().cloned().collect();
             fields.push(Arc::new(index));
             Schema::new(fields)
         } else {
@@ -2393,21 +2428,21 @@ fn broadcast_join(
             Arc::new(RemoteGatheredJoinExec::new(
                 build,
                 probe,
-                *join.join_type(),
-                join.schema(),
-                join.right().schema(),
-                join.projection.as_ref().map(|p| p.to_vec()),
+                join_type,
+                node.schema(),
+                right.schema(),
+                projection,
                 node.clone(),
             )),
         ))));
     }
-    let probe = Arc::new(probe.broadcast(spec, join.schema()));
+    let probe = Arc::new(probe.broadcast(spec, node.schema()));
     Ok(Some(Arc::new(AccountedExec::new(
         "RemoteBroadcast",
         Arc::new(RemoteBroadcastExec::new(
             build,
             probe,
-            join.join_type().to_string(),
+            join_type.to_string(),
             node.clone(),
         )),
     ))))

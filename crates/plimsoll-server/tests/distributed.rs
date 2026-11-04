@@ -512,6 +512,29 @@ async fn distributed_scans_match_local_ones() {
                 ),
                 Some(true),
             ),
+            // Non-equi joins (ADR 0115): nested loops whose collected side
+            // is broadcast, the filter shipped as for equi-joins.
+            (
+                format!(
+                    "SELECT a.id, b.id AS b FROM {t} a \
+                     JOIN (SELECT id FROM {t} WHERE id < 5) b ON a.id > b.id + 40"
+                ),
+                Some(true),
+            ),
+            (
+                format!(
+                    "SELECT a.id, b.id AS b FROM (SELECT id FROM {t} WHERE id < 6) a \
+                     LEFT JOIN {t} b ON b.id BETWEEN a.id + 1 AND a.id + 2"
+                ),
+                Some(true),
+            ),
+            (
+                format!(
+                    "SELECT a.id FROM (SELECT id FROM {t} WHERE id < 8) a WHERE NOT EXISTS \
+                     (SELECT 1 FROM {t} b WHERE b.id > a.id + 40)"
+                ),
+                Some(true),
+            ),
             // A join that keeps no column (`count(*)` over `EXISTS`): the
             // workers' rows carry only their count.
             (
@@ -595,6 +618,11 @@ async fn distributed_scans_match_local_ones() {
             format!(
                 "SELECT count(*), sum(a.id), count(b.id) FROM (SELECT id FROM {t} WHERE id < 8) a \
                  LEFT JOIN (SELECT id FROM {t} WHERE id % 2 = 0) b ON a.id = b.id"
+            ),
+            // A nested loop's collected side over the limit (ADR 0115).
+            format!(
+                "SELECT count(*), sum(a.id) FROM {t} a \
+                 JOIN (SELECT id FROM {t} WHERE id < 5) b ON a.id > b.id + 40"
             ),
         ] {
             let (got, plan) = run(&capped, &sql).await;
