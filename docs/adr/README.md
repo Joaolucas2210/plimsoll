@@ -131,6 +131,8 @@ are allowed in place.
 | [0121](0121-workers-spill-on-the-coordinator.md) | Workers' spill summed on the coordinator | Accepted | 2026-11-04 | Asked by `x-plimsoll-trailer: spill`, a fragment ends its IPC stream with `PLMSPILL` + u64 (its plan's spill, a map's once-only credit, a reduce's maps'); `split_trailer` takes it off into the query's `SpillSink` (via `QueryTag`), held bytes released before errors so retries are unchanged | 0037, 0072, 0118, 0120 |
 | [0122](0122-broadcast-rows-written-on-workers.md) | Broadcast-join rows written on workers | Accepted | 2026-11-04 | `distribute` takes a `RemoteBroadcastExec`: probe fragments join, pick the table's columns and write; over the broadcast limit the coordinator joins and writes with the same `write_files`; one commit either way | 0066, 0091, 0092, 0099, 0115 |
 | [0123](0123-container-image-and-quickstart.md) | Container image and quickstart | Accepted | 2026-11-04 | One two-stage image (release build, slim non-root runtime) for every role; `compose.yaml` runs the reference REST catalog, a coordinator and two workers on a warehouse volume, tokens required from the environment | 0015, 0021, 0058, 0077 |
+| [0124](0124-flight-sql.md) | Arrow Flight SQL front door | Accepted | 2026-11-04 | `PLIMSOLL_FLIGHT_BIND`: a tonic Flight SQL service that posts each statement to the node's own `/v1/sql` router in process and re-frames its Arrow IPC as Flight data; handles are the SQL; schema announced via `LIMIT 0`; Basic `user:token` handshake | 0021, 0035, 0037, 0099 |
+| [0125](0125-releases-from-a-tag.md) | Releases from a tag | Accepted | 2026-11-04 | `v*` tags only: tag = workspace version and a CHANGELOG section, or nothing builds; one image build pushed to ghcr.io, the binary copied out of it with a checksum, a GitHub release with the changelog section | 0011, 0123, 0124 |
 
 ## Reading order
 
@@ -140,7 +142,7 @@ are allowed in place.
 - Federation: 0005 → 0006.
 - Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074 → 0091 → 0092 → 0093 → 0094 → 0097 → 0098 → 0099 → 0101 → 0102 → 0111 → 0112 → 0115 → 0116 → 0117.
 - Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084 → 0085 → 0086 → 0087 → 0088 → 0089 → 0090 → 0091 → 0092 → 0093 → 0094 → 0095 → 0096 → 0122.
-- Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057 → 0100 → 0118 → 0119 → 0120 → 0121 → 0123.
+- Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057 → 0100 → 0118 → 0119 → 0120 → 0121 → 0123 → 0124 → 0125.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046 → 0103 → 0104 → 0105 → 0106 → 0107 → 0108 → 0109 → 0110.
 
 ## Conventions

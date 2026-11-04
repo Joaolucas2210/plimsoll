@@ -74,7 +74,8 @@ services:
     environment:
       <<: *env
       PLIMSOLL_WORKERS: http://worker-1:8080,http://worker-2:8080
-    ports: ["127.0.0.1:8080:8080"]
+      PLIMSOLL_FLIGHT_BIND: 0.0.0.0:32010
+    ports: ["127.0.0.1:8080:8080", "127.0.0.1:32010:32010"]
 
 volumes:
   warehouse:

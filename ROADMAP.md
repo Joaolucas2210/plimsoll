@@ -48,6 +48,8 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Releases from a `v*` tag: version and changelog checked, image on ghcr.io, checksummed binary, GitHub release (ADR 0125)
+- [x] Arrow Flight SQL front door: statements, prepared statements, catalog listings, handshake with the HTTP API's tokens, run through `/v1/sql` (ADR 0124)
 - [x] Container image (one for every role) and a Compose quickstart: REST catalog, coordinator, two workers (ADR 0123)
 - [x] Broadcast-join rows written on the workers (`INSERT … SELECT`, CTAS), the coordinator writing them only over the broadcast limit (ADR 0122)
 - [x] Workers' spill on the coordinator: fragments end their stream with a spill trailer when asked, maps credit theirs once, reduces pass their maps' on (ADR 0121)
@@ -156,9 +158,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Flight SQL endpoint** — a standard client protocol, so JDBC/ADBC
-drivers and BI tools connect without the HTTP API (MVP, after the
-container image and quickstart of ADR 0123).
+**Published benchmark** — TPC-H at a fixed scale on one node and on a
+coordinator with workers, numbers and the script to reproduce them in
+the repository (the MVP's last item).
 
 ## Missing
 
@@ -193,7 +195,8 @@ container image and quickstart of ADR 0123).
 - Spilling hash-join build sides (DataFusion upstream, ADR 0068).
 
 **Security and operations**
-- MVP release: Flight SQL (above), a release job (tag, binaries, the
-  image on a registry), a changelog, a published benchmark.
+- MVP release: a published benchmark (above); arm64 images and signed
+  releases (ADR 0125). Flight SQL: bound parameters, `include_schema` table
+  listings, `DoPut` ingestion, certificate reload (ADR 0124).
 - Shuffle map spans (ADR 0120); per-kind fragment latencies (ADR
   0119); failed fragments' spill on the coordinator (ADR 0121).

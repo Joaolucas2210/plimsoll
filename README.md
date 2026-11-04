@@ -97,9 +97,27 @@ sql "SELECT city, count(*) AS trips, sum(fare) AS fares FROM bronze.trips GROUP 
 docker compose down -v   # -v also drops the warehouse
 ```
 
+Any Arrow Flight SQL client connects on port 32010 (ADR 0124), with
+`ana` as the username and the token as the password: ADBC
+(`pip install adbc-driver-flightsql pyarrow`), the Flight SQL JDBC
+driver, DBeaver, or anything built on them.
+
+```python
+import adbc_driver_flightsql.dbapi as flightsql
+conn = flightsql.connect("grpc://localhost:32010",
+                         db_kwargs={"username": "ana", "password": TOKEN})
+cur = conn.cursor()
+cur.execute("SELECT city, count(*) FROM bronze.trips GROUP BY city")
+print(cur.fetch_arrow_table())
+```
+
 `ana` may create, write and drop tables in `bronze`, `silver` and `gold`.
 The same image runs any role; in production, point it at S3 (`AWS_*`)
 and a real catalog (`PLIMSOLL_CATALOG_*`), with TLS.
+
+Releases: `ghcr.io/joaolucas2210/plimsoll:<tag>` and checksummed Linux
+binaries on GitHub releases, from `v*` tags; see [CHANGELOG.md](CHANGELOG.md)
+(ADR 0125).
 
 ## Running
 
@@ -141,6 +159,7 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_AUTH_COLUMN_DENY` | unset | `ana=gold.users.email\|gold.users.ssn`: columns a user may not read, checked on what each scan reads after optimization, filters and subqueries included; `403 forbidden` (ADR 0044) |
 | `PLIMSOLL_AUTH_ROW_FILTERS` | unset | `{"ana": {"gold.orders": "region = 'eu'"}}`: a SQL predicate every row a user reads from a table must satisfy, applied to every scan (joins, subqueries, time travel); the table's `$` metadata tables are denied to that user (ADR 0045) |
 | `PLIMSOLL_AUTH` | `required` | `disabled` = no authentication, `user` trusted from the body (development only) |
+| `PLIMSOLL_FLIGHT_BIND` | unset (off) | Arrow Flight SQL listener (e.g. `0.0.0.0:32010`): statements, prepared statements (without parameters), catalog/schema/table listings and server info, authenticated by bearer token or a `user:token` handshake, run through `/v1/sql` with the same grants, admission and logs; TLS with `PLIMSOLL_TLS_*` (read at boot) (ADR 0124) |
 | `PLIMSOLL_MEMORY_LIMIT_BYTES` | `1073741824` | Memory ceiling (the load line) |
 | `PLIMSOLL_MAX_RUNNING` | `8` | Max concurrently running queries |
 | `PLIMSOLL_MAX_QUEUED` | `64` | Max queued queries (0 = reject when busy) |
@@ -264,7 +283,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 ## Decision records
 
 Index with status, date and the one-line decision of every ADR:
-[docs/adr/README.md](docs/adr/README.md) (0001–0123; template in
+[docs/adr/README.md](docs/adr/README.md) (0001–0125; template in
 [docs/adr/0000-template.md](docs/adr/0000-template.md)).
 
 Roadmap: [ROADMAP.md](ROADMAP.md).

@@ -15,5 +15,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=build /usr/local/bin/plimsoll-server /usr/local/bin/
 USER plimsoll
 ENV PLIMSOLL_BIND=0.0.0.0:8080
-EXPOSE 8080
+EXPOSE 8080 32010
 ENTRYPOINT ["plimsoll-server"]

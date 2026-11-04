@@ -6,6 +6,7 @@ pub mod app;
 pub mod auth;
 pub mod config;
 pub mod engine;
+pub mod flight;
 pub mod lakehouse;
 pub mod log;
 pub mod metrics;

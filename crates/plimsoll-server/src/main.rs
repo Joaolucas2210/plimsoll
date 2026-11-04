@@ -273,6 +273,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
+    let flight = match cfg.flight_bind {
+        Some(addr) => Some(tokio::net::TcpListener::bind(addr).await?),
+        None => None,
+    };
     // Loaded before listening: a bad certificate fails the boot (ADR 0099).
     let tls = cfg
         .tls
@@ -291,6 +295,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "workers": cfg.workers,
             "worker": cfg.worker_token.is_some(),
             "tls": tls.is_some(),
+            "flight": flight.as_ref().and_then(|l| l.local_addr().ok()).map(|a| a.to_string()),
         }),
     );
     if cfg.auth == Auth::Disabled {
@@ -310,6 +315,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     state.ready.store(true, Ordering::Relaxed);
 
     let router = app::router(state.clone());
+    // ADR 0124: Flight SQL in front of the same router, closed with it.
+    let flight_stop = Arc::new(tokio::sync::Notify::new());
+    let flight = flight.map(|listener| {
+        let gateway = plimsoll_server::flight::Gateway::new(router.clone(), cfg.auth.clone());
+        let (tls, stop) = (cfg.tls.clone(), flight_stop.clone());
+        tokio::spawn(async move {
+            let stopped = async move { stop.notified().await };
+            if let Err(e) =
+                plimsoll_server::flight::serve(gateway, listener, tls.as_ref(), stopped).await
+            {
+                log::emit(Level::Error, "flight_failed", json!({ "error": e }));
+            }
+        })
+    });
     let shutdown = shutdown_signal(state.clone(), cfg.drain_delay);
     match tls {
         Some(acceptor) => {
@@ -323,6 +342,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .with_graceful_shutdown(shutdown)
                 .await?;
         }
+    }
+    if let Some(flight) = flight {
+        flight_stop.notify_one();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), flight).await;
     }
     // Spans of the last queries: flushed, but never allowed to hold the exit.
     if let (Some(tracer), Some(exporter)) = (&state.tracer, exporter) {

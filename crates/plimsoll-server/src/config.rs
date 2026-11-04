@@ -21,6 +21,8 @@ pub struct ConfigError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub bind: SocketAddr,
+    /// Arrow Flight SQL listener; unset = off (ADR 0124).
+    pub flight_bind: Option<SocketAddr>,
     /// Ceiling for the compute plane's memory pool (CeilingPool).
     pub memory_limit_bytes: u64,
     pub admission: AdmissionConfig,
@@ -86,6 +88,9 @@ impl Config {
             "127.0.0.1:8080".parse().ok(),
             "expected host:port",
         )?;
+        let flight_bind = lookup("PLIMSOLL_FLIGHT_BIND")
+            .map(|_| parse(&lookup, "PLIMSOLL_FLIGHT_BIND", None, "expected host:port"))
+            .transpose()?;
         let memory_limit_bytes = positive(&lookup, "PLIMSOLL_MEMORY_LIMIT_BYTES", 1 << 30)?;
         let max_running = positive(&lookup, "PLIMSOLL_MAX_RUNNING", 8)?;
         let max_queued: usize = parse(
@@ -231,6 +236,7 @@ impl Config {
         let otlp = otlp(&lookup)?;
         Ok(Self {
             bind,
+            flight_bind,
             memory_limit_bytes,
             admission,
             query_timeout: Duration::from_millis(timeout_ms),
@@ -514,6 +520,7 @@ mod tests {
     fn defaults_are_valid() {
         let c = cfg(&[]).unwrap();
         assert_eq!(c.bind.port(), 8080);
+        assert_eq!(c.flight_bind, None);
         assert_eq!(c.admission.global.max_running, 8);
         assert_eq!(c.query_timeout, Duration::from_secs(30));
     }
@@ -525,6 +532,14 @@ mod tests {
             "PLIMSOLL_MAX_RUNNING"
         );
         assert!(cfg(&[("PLIMSOLL_BIND", "nope")]).is_err());
+        assert!(cfg(&[("PLIMSOLL_FLIGHT_BIND", "nope")]).is_err());
+        assert_eq!(
+            cfg(&[("PLIMSOLL_FLIGHT_BIND", "0.0.0.0:32010")])
+                .unwrap()
+                .flight_bind
+                .map(|a| a.port()),
+            Some(32010)
+        );
         assert!(cfg(&[("PLIMSOLL_MEMORY_LIMIT_BYTES", "-1")]).is_err());
         assert!(cfg(&[("PLIMSOLL_QUERY_TIMEOUT_MS", "abc")]).is_err());
         assert_eq!(
