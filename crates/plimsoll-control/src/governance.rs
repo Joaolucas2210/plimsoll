@@ -19,7 +19,7 @@ use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Notify, oneshot};
 
@@ -366,6 +366,9 @@ struct State {
     /// Coordinators the configured limits are shared by (ADR 0103): this
     /// node enforces its part of each. 0 or 1: the limits are its own.
     share: usize,
+    /// No new query starts before this (ADR 0106): a new leader waits for
+    /// the running queries to be reported. Adoptions are not held.
+    hold_until: Option<Instant>,
 }
 
 impl State {
@@ -384,7 +387,8 @@ impl State {
     }
 
     fn can_run(&self, cfg: &AdmissionConfig, user: &str, group: &str) -> bool {
-        self.global.running < self.part(cfg.global.max_running)
+        self.hold_until.is_none_or(|t| Instant::now() >= t)
+            && self.global.running < self.part(cfg.global.max_running)
             && self.group(group).running < self.part(cfg.group_limits(group).max_running)
             && self.user(user).running < self.part(cfg.per_user.max_running)
     }
@@ -627,6 +631,28 @@ impl Admission {
         for (tx, slot) in promoted {
             let _ = tx.send(slot);
         }
+    }
+
+    /// Starts no new query for `d` (ADR 0106): they queue, within the
+    /// queue limits, and start when it ends. Adoptions still count.
+    pub fn hold(&self, d: Duration) {
+        let until = Instant::now() + d;
+        lock(&self.inner.state).hold_until = Some(until);
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            tokio::time::sleep_until(until.into()).await;
+            let promoted = {
+                let mut st = lock(&inner.state);
+                // A later hold extends it, and promotes when it ends.
+                if st.hold_until.is_some_and(|t| t <= Instant::now()) {
+                    st.hold_until = None;
+                }
+                promote(&inner, &mut st)
+            };
+            for (tx, slot) in promoted {
+                let _ = tx.send(slot);
+            }
+        });
     }
 
     /// Global `(running, queued)`, exported as gauges.
@@ -924,6 +950,37 @@ mod tests {
         let _adopted = leader.adopt("ana", DEFAULT_GROUP);
         assert_eq!(leader.load(), (2, 0));
         assert!(leader.acquire("carl", DEFAULT_GROUP).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_hold_queues_new_queries_but_not_adoptions() {
+        let adm = admission(lim(4, 4), lim(4, 4), lim(4, 4));
+        let t0 = Instant::now();
+        adm.hold(Duration::from_millis(200));
+        let held = tokio::spawn({
+            let adm = adm.clone();
+            async move {
+                adm.acquire("u", DEFAULT_GROUP)
+                    .await
+                    .map(|_| Instant::now())
+            }
+        });
+        while adm.load() != (0, 1) {
+            tokio::task::yield_now().await;
+        }
+        // Running queries reported by followers are counted at once.
+        let _adopted = adm.adopt("v", DEFAULT_GROUP);
+        assert_eq!(adm.load(), (1, 1));
+        let admitted_at = held.await.unwrap().unwrap();
+        assert!(
+            admitted_at - t0 >= Duration::from_millis(200),
+            "started when the hold ended"
+        );
+        assert_eq!(adm.load(), (1, 0));
+        // No queue: refused while held, as for any full limit.
+        let none = admission(lim(4, 0), lim(4, 0), lim(4, 0));
+        none.hold(Duration::from_secs(60));
+        assert!(none.acquire("u", DEFAULT_GROUP).await.is_err());
     }
 
     #[tokio::test]

@@ -103,6 +103,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     cfg.query_timeout,
                 ));
                 admission.set_gate(gate.clone());
+                // ADR 0106: a node leads until its first round says
+                // otherwise; it starts nothing new until the others could
+                // have reported their running queries.
+                admission.hold(TAKEOVER_HOLD);
                 gate
             });
             tokio::spawn(async move {
@@ -124,6 +128,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         Some(_) => coordinators,
                                         None => 1,
                                     });
+                                    // Taking over (ADR 0106): the
+                                    // followers re-home their queries
+                                    // within their next round.
+                                    if leader.is_none() && last.1.is_some() {
+                                        admission.hold(TAKEOVER_HOLD);
+                                    }
                                     gate.follow(leader.clone(), admission);
                                 }
                                 None => admission.share_with(coordinators),
@@ -139,7 +149,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             last = now;
                         }
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::time::sleep(PEER_ROUND).await;
                 }
             });
             Some(peers)
@@ -436,6 +446,13 @@ async fn shutdown_signal(state: Arc<AppState>, delay: std::time::Duration) {
     app::drain(&state, delay).await;
     log::emit(Level::Info, "closing_listener", json!({}));
 }
+
+/// Between peer rounds: health checks, membership, election (ADR 0102).
+const PEER_ROUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a new leader starts nothing new (ADR 0106): every follower's
+/// next round, its checks (2 s each) and its re-homing fit in two rounds.
+const TAKEOVER_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Where this node's query ids start (ADR 0101): a random multiple of 2^32
 /// below 2^53, so coordinators behind one load balancer hand out ids that
