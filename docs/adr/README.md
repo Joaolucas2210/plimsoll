@@ -127,6 +127,7 @@ are allowed in place.
 | [0117](0117-hot-join-buckets.md) | Hot join buckets split across reducers | Accepted | 2026-11-04 | A size round asks every map its buckets' bytes (same hash keys as reducers); a bucket over `PLIMSOLL_SKEW_BYTES` and 4× its side's median splits by map groups into parts on successive reducers, the other side's bucket read by each (`readers`); only a side whose rows appear once in the output splits | 0065, 0067, 0072, 0111, 0112 |
 | [0118](0118-per-query-spill.md) | Per-query spill attribution | Accepted | 2026-11-04 | A query's plan spill (every node) in its `query` log line and `system.runtime.queries.spilled_bytes`; failed queries through a `SpillSink` their stream adds to when dropped; each worker `fragment` line adds its own | 0003, 0022, 0069, 0071, 0102 |
 | [0119](0119-fragment-counters.md) | Fragments served, by kind, in /metrics | Accepted | 2026-11-04 | `FragmentCounts`, counted where the `fragment` line is written: `plimsoll_fragments_total{kind,outcome}`, rows and bytes per kind; refused requests never ran and are not counted; pushed over OTLP with the rest | 0019, 0059, 0069, 0100, 0118 |
+| [0120](0120-shuffle-maps-by-query.md) | Shuffle maps attributed to queries | Accepted | 2026-11-04 | `fragment` passes the request's query id to the map: `shuffle_spill` names it, one `shuffle_map` line per map run (buckets, on disk, spill), and the map's operator spill now counts in the node's total | 0059, 0064, 0069, 0118 |
 
 ## Reading order
 
@@ -136,7 +137,7 @@ are allowed in place.
 - Federation: 0005 → 0006.
 - Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074 → 0091 → 0092 → 0093 → 0094 → 0097 → 0098 → 0099 → 0101 → 0102 → 0111 → 0112 → 0115 → 0116 → 0117.
 - Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084 → 0085 → 0086 → 0087 → 0088 → 0089 → 0090 → 0091 → 0092 → 0093 → 0094 → 0095 → 0096.
-- Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057 → 0100 → 0118 → 0119.
+- Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057 → 0100 → 0118 → 0119 → 0120.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046 → 0103 → 0104 → 0105 → 0106 → 0107 → 0108 → 0109 → 0110.
 
 ## Conventions

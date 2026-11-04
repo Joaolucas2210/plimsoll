@@ -660,7 +660,11 @@ async fn fragment(
         plan: None,
     };
     let run = match task {
-        Task::Scan(f) => st.engine.fragment(f, build, deadline.into_std()).await,
+        Task::Scan(f) => {
+            st.engine
+                .fragment(f, build, deadline.into_std(), query_id)
+                .await
+        }
         Task::Release(shuffle) => st.engine.release(&shuffle).await,
         Task::Reduce(r) => {
             // Peers see the query as this worker saw it.

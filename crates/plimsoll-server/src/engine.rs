@@ -154,11 +154,14 @@ pub trait QueryEngine: Send + Sync {
     /// A worker's scan fragment (ADR 0058), as a stream. Default: not a
     /// worker.
     /// `build` is the build side sent with a broadcast join (ADR 0066).
+    /// `query_id` names the coordinator's query, for what a shuffle map
+    /// logs once for all its reducers (ADR 0120).
     async fn fragment(
         &self,
         _fragment: Fragment,
         _build: Option<Build>,
         _deadline: Instant,
+        _query_id: Option<u64>,
     ) -> Result<Running, EngineError> {
         Err(EngineError::Unsupported("scan fragments".into()))
     }
@@ -858,6 +861,7 @@ impl CoreEngine {
         df: plimsoll_core::datafusion::prelude::DataFrame,
         bucket: Bucket,
         deadline: Instant,
+        query_id: Option<u64>,
     ) -> Result<SendableRecordBatchStream, EngineError> {
         use plimsoll_core::datafusion::physical_expr::expressions::Column;
         use plimsoll_core::datafusion::physical_plan::memory::MemoryStream;
@@ -933,10 +937,13 @@ impl CoreEngine {
                     })
                     .collect::<Result<Vec<_>, String>>()?;
                 let parts = futures::future::try_join_all(parts).await?;
-                // Spilled buckets count as spill, and say so (ADR 0069).
+                // Spilled buckets count as spill, and say so (ADR 0069),
+                // naming the query the map ran for (ADR 0120).
+                let mut spilled = 0;
                 for (index, part) in parts.iter().enumerate() {
                     if let Some(Kept::Disk(file)) = part {
                         let bytes = file.size().unwrap_or(0);
+                        spilled += bytes;
                         self.0.record_spill(bytes);
                         crate::log::emit(
                             crate::log::Level::Info,
@@ -944,12 +951,31 @@ impl CoreEngine {
                             serde_json::json!({
                                 "shuffle": shuffle,
                                 "map": map,
+                                "query_id": query_id,
                                 "bucket": index,
                                 "bytes": bytes,
                             }),
                         );
                     }
                 }
+                // The map's own operators spill too (a partial aggregate
+                // over memory): counted in the node's total like any plan's
+                // (ADR 0120), which they were not.
+                let operators = plimsoll_core::memory::spilled_bytes(&plan) as u64;
+                self.0.record_spill(operators);
+                // One line per map run, whichever reducer started it.
+                crate::log::emit(
+                    crate::log::Level::Info,
+                    "shuffle_map",
+                    serde_json::json!({
+                        "shuffle": shuffle,
+                        "map": map,
+                        "query_id": query_id,
+                        "buckets": parts.iter().filter(|p| p.is_some()).count(),
+                        "on_disk": parts.iter().filter(|p| matches!(p, Some(Kept::Disk(_)))).count(),
+                        "spilled_bytes": spilled + operators,
+                    }),
+                );
                 Ok(Arc::new(std::sync::Mutex::new(ShuffleMap {
                     schema,
                     fetched: vec![0; parts.len()],
@@ -1058,6 +1084,7 @@ impl QueryEngine for CoreEngine {
         f: Fragment,
         build: Option<Build>,
         deadline: Instant,
+        query_id: Option<u64>,
     ) -> Result<Running, EngineError> {
         let fail = |e: DataFusionError| classify(&e);
         // A straggler of a query that already ended (ADR 0074).
@@ -1189,7 +1216,7 @@ impl QueryEngine for CoreEngine {
         }
         match f.bucket {
             Some(bucket) => self
-                .map_bucket(df, bucket, deadline)
+                .map_bucket(df, bucket, deadline, query_id)
                 .await
                 .map(Running::from),
             None => run(df).await,
@@ -1771,13 +1798,13 @@ mod tests {
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         for id in ["rel-a", "rel-a~m1r0"] {
-            let Err(e) = e.fragment(fragment(id), None, deadline).await else {
+            let Err(e) = e.fragment(fragment(id), None, deadline, None).await else {
                 panic!("{id} should be refused");
             };
             assert!(e.to_string().contains("was released"), "{e}");
         }
         // ...while another shuffle goes on to open its table.
-        let Err(e) = e.fragment(fragment("rel-ab"), None, deadline).await else {
+        let Err(e) = e.fragment(fragment("rel-ab"), None, deadline, None).await else {
             panic!("no such table");
         };
         assert!(!e.to_string().contains("was released"), "{e}");
