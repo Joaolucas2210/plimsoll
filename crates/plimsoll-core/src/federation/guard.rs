@@ -155,10 +155,10 @@ impl TableProvider for FederationFilterGuard {
             let mut cols = p.clone();
             for e in &recheck {
                 for c in e.column_refs() {
-                    if let Ok(i) = schema.index_of(&c.name) {
-                        if !cols.contains(&i) {
-                            cols.push(i);
-                        }
+                    if let Ok(i) = schema.index_of(&c.name)
+                        && !cols.contains(&i)
+                    {
+                        cols.push(i);
                     }
                 }
             }

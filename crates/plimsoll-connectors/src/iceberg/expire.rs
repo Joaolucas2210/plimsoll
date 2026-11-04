@@ -68,10 +68,10 @@ pub(super) fn expired(meta: &Json, opts: ExpireOptions) -> Vec<i64> {
         .flatten()
         .filter_map(|(_, r)| Some((r["snapshot-id"].as_i64()?, r["type"] != "tag")))
         .collect();
-    if refs.is_empty() {
-        if let Some(current) = meta["current-snapshot-id"].as_i64().filter(|id| *id >= 0) {
-            refs.push((current, true));
-        }
+    if refs.is_empty()
+        && let Some(current) = meta["current-snapshot-id"].as_i64().filter(|id| *id >= 0)
+    {
+        refs.push((current, true));
     }
     let mut keep = HashSet::new();
     for (head, branch) in refs {

@@ -27,10 +27,11 @@ pub async fn preevaluate_scalar_subqueries(
     plan.apply(|node| {
         node.apply_expressions(|e| {
             e.apply(|e| {
-                if let Expr::ScalarSubquery(sq) = e {
-                    if sq.outer_ref_columns.is_empty() && !found.contains(sq) {
-                        found.push(sq.clone());
-                    }
+                if let Expr::ScalarSubquery(sq) = e
+                    && sq.outer_ref_columns.is_empty()
+                    && !found.contains(sq)
+                {
+                    found.push(sq.clone());
                 }
                 Ok(TreeNodeRecursion::Continue)
             })

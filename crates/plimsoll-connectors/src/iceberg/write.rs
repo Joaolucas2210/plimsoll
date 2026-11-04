@@ -690,10 +690,9 @@ impl IcebergSink {
                     stats.update(column, *prim);
                 }
                 if file.writer.in_progress_size() + file.writer.bytes_written() >= TARGET_FILE_BYTES
+                    && let Some(file) = open.remove(&key)
                 {
-                    if let Some(file) = open.remove(&key) {
-                        written.push(self.finish(file, key, run, written.len(), &env).await?);
-                    }
+                    written.push(self.finish(file, key, run, written.len(), &env).await?);
                 }
             }
             let buffered = open.values().map(|f| f.writer.in_progress_size()).sum();
@@ -890,16 +889,16 @@ impl IcebergSink {
             // Deletes and rewrites name files of the snapshot they were
             // planned on: only appends may slip in between (their rows are
             // newer and untouched).
-            if change != Change::Append && parent != self.base {
-                if let Some(op) = operations_since(&meta, parent, self.base)
+            if change != Change::Append
+                && parent != self.base
+                && let Some(op) = operations_since(&meta, parent, self.base)
                     .into_iter()
                     .find(|op| op != "append")
-                {
-                    return Err(failed(format!(
-                        "a concurrent `{op}` changed the table's data meanwhile; nothing was \
+            {
+                return Err(failed(format!(
+                    "a concurrent `{op}` changed the table's data meanwhile; nothing was \
                          committed, run it again"
-                    )));
-                }
+                )));
             }
             let sequence = meta["last-sequence-number"].as_i64().unwrap_or(0) + 1;
             let parent_list = match parent {
@@ -1931,12 +1930,12 @@ fn manifest_entry_schema(layout: &Layout) -> String {
         ]}, "field-id": 2},
     ]});
     // v3 (ADR 0095): row lineage, and where a deletion vector's blob sits.
-    if layout.version >= 3 {
-        if let Some(fields) = schema["fields"][4]["type"]["fields"].as_array_mut() {
-            fields.push(json!({"name": "first_row_id", "type": ["null", "long"], "default": null, "field-id": 142}));
-            fields.push(json!({"name": "content_offset", "type": ["null", "long"], "default": null, "field-id": 144}));
-            fields.push(json!({"name": "content_size_in_bytes", "type": ["null", "long"], "default": null, "field-id": 145}));
-        }
+    if layout.version >= 3
+        && let Some(fields) = schema["fields"][4]["type"]["fields"].as_array_mut()
+    {
+        fields.push(json!({"name": "first_row_id", "type": ["null", "long"], "default": null, "field-id": 142}));
+        fields.push(json!({"name": "content_offset", "type": ["null", "long"], "default": null, "field-id": 144}));
+        fields.push(json!({"name": "content_size_in_bytes", "type": ["null", "long"], "default": null, "field-id": 145}));
     }
     schema.to_string()
 }
@@ -2468,10 +2467,10 @@ fn rewrite_manifest(
                     .unwrap_or(0);
                 let id = *next;
                 *next += rows;
-                if let Avro::Record(fields) = &mut entry {
-                    if let Some((_, f)) = fields.iter_mut().find(|(n, _)| n == "data_file") {
-                        set(f, "first_row_id", Avro::Long(id));
-                    }
+                if let Avro::Record(fields) = &mut entry
+                    && let Some((_, f)) = fields.iter_mut().find(|(n, _)| n == "data_file")
+                {
+                    set(f, "first_row_id", Avro::Long(id));
                 }
             }
         }

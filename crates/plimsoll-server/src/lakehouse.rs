@@ -291,37 +291,37 @@ impl SchemaProvider for CatalogSchema {
         // `table$snapshots|history|refs` (ADR 0030): built from the metadata
         // just loaded, so it is as fresh as a data read. Other suffixes mean
         // `$` is part of the name.
-        if let Some((base, kind)) = name.rsplit_once('$') {
-            if let Some(loaded) = self.load(base).await? {
-                if let Some(batch) = iceberg::meta::table(&loaded.1.metadata, kind) {
-                    let batch = batch?;
-                    let mem = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
-                    return Ok(Some(Arc::new(mem)));
-                }
-                // `$files` / `$manifests` read manifests (ADR 0032).
-                if matches!(kind, "files" | "manifests" | "partitions") {
-                    let metadata = loaded.1.metadata.clone();
-                    let connector = self.connector(name, loaded, &metadata)?;
-                    if let Some(t) = connector.metadata_table(kind) {
-                        return t.map(Some);
-                    }
+        if let Some((base, kind)) = name.rsplit_once('$')
+            && let Some(loaded) = self.load(base).await?
+        {
+            if let Some(batch) = iceberg::meta::table(&loaded.1.metadata, kind) {
+                let batch = batch?;
+                let mem = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+                return Ok(Some(Arc::new(mem)));
+            }
+            // `$files` / `$manifests` read manifests (ADR 0032).
+            if matches!(kind, "files" | "manifests" | "partitions") {
+                let metadata = loaded.1.metadata.clone();
+                let connector = self.connector(name, loaded, &metadata)?;
+                if let Some(t) = connector.metadata_table(kind) {
+                    return t.map(Some);
                 }
             }
         }
         // `table@spec`: a snapshot id, an instant, or a branch/tag of `table`
         // (ADR 0028/0029). Anything else means `@` is part of the name.
-        if let Some((base, spec)) = name.rsplit_once('@') {
-            if let Some(loaded) = self.load(base).await? {
-                let pinned = match AsOf::parse(spec) {
-                    Some(as_of) => Some(iceberg::at(&loaded.1.metadata, as_of)),
-                    None => iceberg::ref_snapshot(&loaded.1.metadata, spec)
-                        .map(|id| iceberg::at(&loaded.1.metadata, AsOf::Snapshot(id))),
-                };
-                if let Some(pinned) = pinned {
-                    let metadata = pinned
-                        .map_err(|m| DataFusionError::Plan(format!("{}@{spec}: {m}", loaded.0)))?;
-                    return self.provider(name, loaded, &metadata).map(Some);
-                }
+        if let Some((base, spec)) = name.rsplit_once('@')
+            && let Some(loaded) = self.load(base).await?
+        {
+            let pinned = match AsOf::parse(spec) {
+                Some(as_of) => Some(iceberg::at(&loaded.1.metadata, as_of)),
+                None => iceberg::ref_snapshot(&loaded.1.metadata, spec)
+                    .map(|id| iceberg::at(&loaded.1.metadata, AsOf::Snapshot(id))),
+            };
+            if let Some(pinned) = pinned {
+                let metadata = pinned
+                    .map_err(|m| DataFusionError::Plan(format!("{}@{spec}: {m}", loaded.0)))?;
+                return self.provider(name, loaded, &metadata).map(Some);
             }
         }
         match self.load(name).await? {
@@ -525,13 +525,13 @@ pub async fn refresh(
         if out.namespaces.contains(&name) {
             continue;
         }
-        if let Some(schema) = default.schema(&name) {
-            if let Some(schema) = schema.downcast_ref::<CatalogSchema>() {
-                let mut current = schema.names.write().unwrap_or_else(PoisonError::into_inner);
-                if !current.is_empty() {
-                    current.clear();
-                    out.changed.push(name);
-                }
+        if let Some(schema) = default.schema(&name)
+            && let Some(schema) = schema.downcast_ref::<CatalogSchema>()
+        {
+            let mut current = schema.names.write().unwrap_or_else(PoisonError::into_inner);
+            if !current.is_empty() {
+                current.clear();
+                out.changed.push(name);
             }
         }
     }

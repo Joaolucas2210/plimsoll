@@ -625,11 +625,11 @@ impl ColumnBounds {
 
     fn statistics(&self, ty: &DataType) -> ColumnStatistics {
         let mut c = ColumnStatistics::new_unknown();
-        if let (true, Some(lo), Some(hi)) = (self.bounded, &self.lo, &self.hi) {
-            if let (Some(lo), Some(hi)) = (self.prim.scalar(lo, ty), self.prim.scalar(hi, ty)) {
-                c.min_value = Precision::Inexact(lo);
-                c.max_value = Precision::Inexact(hi);
-            }
+        if let (true, Some(lo), Some(hi)) = (self.bounded, &self.lo, &self.hi)
+            && let (Some(lo), Some(hi)) = (self.prim.scalar(lo, ty), self.prim.scalar(hi, ty))
+        {
+            c.min_value = Precision::Inexact(lo);
+            c.max_value = Precision::Inexact(hi);
         }
         if let Some(n) = self.nulls.and_then(|n| usize::try_from(n).ok()) {
             c.null_count = Precision::Inexact(n);
@@ -908,12 +908,11 @@ impl IcebergTable {
             // Delete manifests prune like data manifests: a position delete
             // shares its data file's partition, so if no data file there can
             // match, neither can its deletes.
-            if !pruner.is_empty() {
-                if let Some(spec) = self.specs.get(&spec_id) {
-                    if !pruner.may_match_manifest(spec, &summaries(&manifest)) {
-                        continue;
-                    }
-                }
+            if !pruner.is_empty()
+                && let Some(spec) = self.specs.get(&spec_id)
+                && !pruner.may_match_manifest(spec, &summaries(&manifest))
+            {
+                continue;
             }
             stats.manifests_read += 1;
             manifests.push((
@@ -1596,10 +1595,10 @@ impl TableProvider for IcebergTable {
                     let mut p = p.clone();
                     for (f, _) in &rows {
                         for c in f.column_refs() {
-                            if let Ok(i) = self.schema.index_of(&c.name) {
-                                if !p.contains(&i) {
-                                    p.push(i);
-                                }
+                            if let Ok(i) = self.schema.index_of(&c.name)
+                                && !p.contains(&i)
+                            {
+                                p.push(i);
                             }
                         }
                     }
@@ -1630,10 +1629,10 @@ impl TableProvider for IcebergTable {
                         let mut p = p.clone();
                         for &i in eq {
                             for f in &sets[i].key {
-                                if let Ok(k) = self.schema.index_of(f.name()) {
-                                    if !p.contains(&k) {
-                                        p.push(k);
-                                    }
+                                if let Ok(k) = self.schema.index_of(f.name())
+                                    && !p.contains(&k)
+                                {
+                                    p.push(k);
                                 }
                             }
                         }
@@ -1755,10 +1754,10 @@ impl TableProvider for IcebergTable {
                 *c = b.statistics(field.data_type());
             }
             // Distinct values (ADR 0114): DataFusion sizes joins from them.
-            if let Some(&n) = self.distinct.get(field.name()) {
-                if let Ok(n) = usize::try_from(n) {
-                    c.distinct_count = Precision::Inexact(n);
-                }
+            if let Some(&n) = self.distinct.get(field.name())
+                && let Ok(n) = usize::try_from(n)
+            {
+                c.distinct_count = Precision::Inexact(n);
             }
         }
         // The filters this scan applies itself (exact pushdown, ADR 0055,
@@ -2230,10 +2229,10 @@ async fn resolve_metadata(location: &str, state: &dyn Session) -> Result<String,
             .map_err(|e| DataFusionError::External(Box::new(e)))?
             .location
             .to_string();
-        if let Some(version) = metadata_version(&path) {
-            if newest.as_ref().is_none_or(|(v, _)| *v < version) {
-                newest = Some((version, path));
-            }
+        if let Some(version) = metadata_version(&path)
+            && newest.as_ref().is_none_or(|(v, _)| *v < version)
+        {
+            newest = Some((version, path));
         }
     }
     let (_, newest) = newest.ok_or_else(|| invalid(&dir, "no *.metadata.json found"))?;

@@ -336,10 +336,10 @@ pub fn alter_updates(
         // one that does not apply to the column, is refused here rather
         // than at the next INSERT.
         let mut probe = meta.clone();
-        if existing.is_none() {
-            if let Some(all) = probe["partition-specs"].as_array_mut() {
-                all.push(json!({"spec-id": id, "fields": spec_fields}));
-            }
+        if existing.is_none()
+            && let Some(all) = probe["partition-specs"].as_array_mut()
+        {
+            all.push(json!({"spec-id": id, "fields": spec_fields}));
         }
         super::write::Layout::of_spec(&probe, id).map_err(DataFusionError::Plan)?;
         requirements

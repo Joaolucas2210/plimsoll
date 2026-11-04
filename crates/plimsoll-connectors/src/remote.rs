@@ -1609,13 +1609,13 @@ impl ExecutionPlan for RemoteBroadcastExec {
             let built = shipped
                 .get_or_init(|| async move {
                     let fail = |e: DataFusionError| e.to_string();
-                    if let Some((bytes, memory)) = key.as_deref().and_then(|k| cache.get(k)) {
-                        if bytes.len() <= limit {
-                            return Ok(Built::Shipped {
-                                bytes,
-                                _memory: memory,
-                            });
-                        }
+                    if let Some((bytes, memory)) = key.as_deref().and_then(|k| cache.get(k))
+                        && bytes.len() <= limit
+                    {
+                        return Ok(Built::Shipped {
+                            bytes,
+                            _memory: memory,
+                        });
                     }
                     let schema = build.schema();
                     let batches = datafusion::physical_plan::collect(build, ctx.clone())

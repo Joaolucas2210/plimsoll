@@ -575,10 +575,9 @@ fn murmur3_32(data: &[u8]) -> u32 {
     const C2: u32 = 0x1b87_3593;
     let mix = |k: u32| k.wrapping_mul(C1).rotate_left(15).wrapping_mul(C2);
     let mut h = 0u32;
-    let chunks = data.chunks_exact(4);
-    let tail = chunks.remainder();
+    let (chunks, tail) = data.as_chunks::<4>();
     for c in chunks {
-        h ^= mix(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        h ^= mix(u32::from_le_bytes(*c));
         h = h.rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64);
     }
     if !tail.is_empty() {

@@ -588,10 +588,10 @@ struct QueuedGuard<'a> {
 impl Drop for QueuedGuard<'_> {
     fn drop(&mut self) {
         let mut st = lock(&self.inner.state);
-        if let Some(pos) = st.queue.iter().position(|w| w.id == self.id) {
-            if let Some(w) = st.queue.remove(pos) {
-                st.update(&w.user, &w.group, |c| c.queued -= 1);
-            }
+        if let Some(pos) = st.queue.iter().position(|w| w.id == self.id)
+            && let Some(w) = st.queue.remove(pos)
+        {
+            st.update(&w.user, &w.group, |c| c.queued -= 1);
         }
         // Not found: already promoted; the slot sits in the channel and is
         // released when the receiver drops.
