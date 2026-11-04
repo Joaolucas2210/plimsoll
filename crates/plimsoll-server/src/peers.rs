@@ -33,6 +33,17 @@ const TIMEOUT: Duration = Duration::from_secs(2);
 pub struct Peers(pub Workers);
 
 impl Peers {
+    /// How long until the next round (ADR 0109): sooner while some member
+    /// is unhealthy, since that is when a partition can heal or a peer
+    /// come back, and its running queries must be re-homed.
+    pub fn next_round(&self) -> Duration {
+        if self.0.healthy_urls().len() < self.0.urls().len() {
+            FAST_ROUND
+        } else {
+            PEER_ROUND
+        }
+    }
+
     /// Every peer's queries, unscoped: the caller applies its viewer. A
     /// peer that does not answer is left out and logged, so losing a
     /// coordinator never fails the listing.
@@ -144,6 +155,10 @@ pub fn elect(me: QueryId, peers: &[(QueryId, String)]) -> Elected {
 
 /// Between peer rounds: health checks, membership, election (ADR 0102).
 pub const PEER_ROUND: Duration = Duration::from_secs(5);
+
+/// Between rounds while a peer fails its checks (ADR 0109): when it comes
+/// back, the cluster notices within about a second.
+pub const FAST_ROUND: Duration = Duration::from_secs(1);
 
 /// The longest a new leader starts nothing new (ADR 0106): every
 /// follower's next round, its checks and its re-homing fit in two rounds.
@@ -489,6 +504,31 @@ mod tests {
         let all = merge(vec![q(5, "a"), q(9, "b")], vec![q(5, "a"), q(7, "c")]);
         let ids: Vec<_> = all.iter().map(|q| q.id).collect();
         assert_eq!(ids, [5, 7, 9]);
+    }
+
+    #[tokio::test]
+    async fn rounds_are_faster_while_a_peer_is_down() {
+        let up = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_url = format!("http://{}", up.local_addr().unwrap());
+        tokio::spawn(
+            axum::serve(
+                up,
+                axum::Router::new().route("/readyz", axum::routing::get(|| async { "ok" })),
+            )
+            .into_future(),
+        );
+        // A port nobody listens on: refused at once.
+        let down = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let down_url = format!("http://{}", down.local_addr().unwrap());
+        drop(down);
+        let peers =
+            |urls: Vec<String>| Peers(Workers::new(urls, "0123456789abcdef".into()).unwrap());
+        let healthy = peers(vec![up_url.clone()]);
+        healthy.0.check_health(Duration::from_secs(1)).await;
+        assert_eq!(healthy.next_round(), PEER_ROUND);
+        let one_down = peers(vec![up_url, down_url]);
+        one_down.0.check_health(Duration::from_secs(1)).await;
+        assert_eq!(one_down.next_round(), FAST_ROUND);
     }
 
     #[test]

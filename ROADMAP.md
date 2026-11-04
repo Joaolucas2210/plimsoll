@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Peer rounds every 1 s instead of 5 s while a coordinator is down, so a returning one is counted within a second (ADR 0109)
 - [x] A leader announces itself to peers it sees after the election (late, healed, booted) and holds until they follow (ADR 0108)
 - [x] The takeover hold ends when every live peer has run its round and follows the new leader (`/v1/peer/round`), 10 s at most (ADR 0107)
 - [x] A new leader holds new admissions for two peer rounds (10 s) after taking over or booting, while adoptions are counted (ADR 0106)
@@ -166,7 +167,7 @@ aggregation keys, so shuffled and broadcast joins take them too.
 - Cheaper recovery: one re-run of a lost map serving every reducer;
   more than one retry per step (ADR 0072).
 - Postgres (federated) scans stay on the coordinator.
-- Faster peer rounds while a configured peer is unreachable (ADR 0108); SRV-based discovery; TLS to workers discovered
+- Back off the fast rounds while the same peer stays down (ADR 0109); SRV-based discovery; TLS to workers discovered
   by IP (ADR 0070).
 
 **Planning and performance**

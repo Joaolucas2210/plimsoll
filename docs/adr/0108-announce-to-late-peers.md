@@ -96,4 +96,4 @@ the limit.
 - The detection window matters: rounds could run more often while a
   configured peer is unreachable, since that is when a partition can
   heal. A push from the joining node would not help, because it only
-  learns it can reach the leader in a round too.
+  learns it can reach the leader in a round too. Resolved by ADR 0109.

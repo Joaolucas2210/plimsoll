@@ -122,7 +122,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(c) = &coordination {
                     c.round(true).await;
                 }
-                tokio::time::sleep(plimsoll_server::peers::PEER_ROUND).await;
+                tokio::time::sleep(peers.next_round()).await;
             }
         });
     }
