@@ -124,6 +124,7 @@ are allowed in place.
 | [0114](0114-distinct-counts-from-statistics-files.md) | Distinct counts from statistics files, and live row counts | Accepted | 2026-11-04 | `ndv` of single-field blobs in the metadata's `statistics` (pinned snapshot or nearest ancestor) as inexact distinct counts; files with position deletes count their live rows; the Spark fixture computes table stats | 0014, 0054, 0113 |
 | [0115](0115-non-equi-joins-on-workers.md) | Non-equi joins against a small side on workers | Accepted | 2026-11-04 | `broadcast_join` takes a `NestedLoopJoinExec` (collected left side, filter only) like a `CollectLeft` hash join: probe-driven types on the workers, left/full/semi/anti gathered, over the limit joined locally; the worker's keyless broadcast join is a nested loop | 0066, 0097, 0098, 0099, 0111 |
 | [0116](0116-broadcast-build-cache.md) | Broadcast build sides cached per snapshot | Accepted | 2026-11-04 | Per-coordinator LRU of encoded build sides keyed by the build plan (pinned scans by id, other nodes by display and fields), only when every source is pinned; entries share the broadcast's reservation; `PLIMSOLL_BROADCAST_CACHE_BYTES` (off by default) | 0038, 0066, 0099, 0115 |
+| [0117](0117-hot-join-buckets.md) | Hot join buckets split across reducers | Accepted | 2026-11-04 | A size round asks every map its buckets' bytes (same hash keys as reducers); a bucket over `PLIMSOLL_SKEW_BYTES` and 4× its side's median splits by map groups into parts on successive reducers, the other side's bucket read by each (`readers`); only a side whose rows appear once in the output splits | 0065, 0067, 0072, 0111, 0112 |
 
 ## Reading order
 
@@ -131,7 +132,7 @@ are allowed in place.
 - Shape of the system: 0001, 0002, 0004.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042 → 0113 → 0114.
 - Federation: 0005 → 0006.
-- Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074 → 0091 → 0092 → 0093 → 0094 → 0097 → 0098 → 0099 → 0101 → 0102 → 0111 → 0112 → 0115 → 0116.
+- Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074 → 0091 → 0092 → 0093 → 0094 → 0097 → 0098 → 0099 → 0101 → 0102 → 0111 → 0112 → 0115 → 0116 → 0117.
 - Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084 → 0085 → 0086 → 0087 → 0088 → 0089 → 0090 → 0091 → 0092 → 0093 → 0094 → 0095 → 0096.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057 → 0100.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046 → 0103 → 0104 → 0105 → 0106 → 0107 → 0108 → 0109 → 0110.

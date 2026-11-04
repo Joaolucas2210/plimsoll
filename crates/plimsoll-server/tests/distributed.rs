@@ -668,6 +668,45 @@ async fn distributed_scans_match_local_ones() {
         assert_eq!(cache.build_cache_hits(), hits, "{sql}");
     }
     collect_left(false);
+    // Hot join buckets (ADR 0117): a constant key sends every row to one
+    // bucket, which a coordinator splitting anything over one byte splits
+    // across reducers; same answers, for every join type, split or not.
+    let skew = Workers::new(urls.clone(), TOKEN.into())
+        .unwrap()
+        .with_skew(1);
+    let skewed = Engine::new(
+        Arc::new(CeilingPool::new(256 << 20, 8 << 20).unwrap()),
+        None,
+    )
+    .unwrap();
+    coordinate(&skewed, skew.clone());
+    {
+        let state = skewed.context().state_ref();
+        let mut state = state.write();
+        let optimizer = &mut state.config_mut().options_mut().optimizer;
+        optimizer.hash_join_single_partition_threshold = 0;
+        optimizer.hash_join_single_partition_threshold_rows = 0;
+    }
+    IcebergConnector::try_new(t.clone(), location, &skewed.context().state())
+        .await
+        .unwrap()
+        .register(skewed.context())
+        .unwrap();
+    for (kind, splits) in [
+        ("JOIN", true),
+        ("LEFT JOIN", true),
+        ("RIGHT JOIN", true),
+        ("FULL JOIN", false),
+    ] {
+        let before = skew.skew_splits();
+        let sql = format!(
+            "SELECT count(*), sum(a.id), sum(b.id) FROM {t} a {kind} {t} b ON a.id % 1 = b.id % 1"
+        );
+        let (got, plan) = run(&skewed, &sql).await;
+        assert!(plan.contains("shuffled"), "{sql}: {plan}");
+        assert_eq!(got, run(&local, &sql).await.0, "{sql}");
+        assert_eq!(skew.skew_splits() > before, splits, "{sql}");
+    }
     // Grouped by the join key: the final aggregation may rely on the
     // join's partitioning, so the join must then stay as planned.
     let (a, _) = &tables[0];

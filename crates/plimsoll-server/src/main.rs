@@ -137,7 +137,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let workers = Arc::new(
             plimsoll_connectors::remote::Workers::new(cfg.workers.clone(), token.clone())?
                 .with_broadcast_limit(cfg.broadcast_max_bytes)
-                .with_build_cache(cfg.broadcast_cache_bytes),
+                .with_build_cache(cfg.broadcast_cache_bytes)
+                .with_skew(cfg.skew_bytes),
         );
         {
             // count/sum/min/max partials computed on workers (ADR 0061),

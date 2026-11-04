@@ -72,7 +72,15 @@ pub struct Workers {
     broadcast_limit: usize,
     /// Build sides already collected, by what they read (ADR 0116).
     builds: Arc<BuildCache>,
+    /// A join bucket over this many bytes, and four times its side's
+    /// median bucket, is split across reducers (ADR 0117). 0: never.
+    skew_bytes: u64,
+    /// How many hot buckets were split (ADR 0117).
+    splits: Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// The default [`Workers::with_skew`]: 64 MiB.
+pub const DEFAULT_SKEW_BYTES: u64 = 64 << 20;
 
 /// Collected broadcast build sides, as the Arrow IPC sent to workers, by
 /// [`build_key`] (ADR 0116): a build side reading only Iceberg tables at
@@ -217,7 +225,21 @@ impl Workers {
             members: Arc::new(std::sync::RwLock::new(members)),
             broadcast_limit: DEFAULT_BROADCAST_LIMIT,
             builds: Arc::default(),
+            skew_bytes: DEFAULT_SKEW_BYTES,
+            splits: Arc::default(),
         })
+    }
+
+    /// Splits join buckets over `bytes` (and four times their side's
+    /// median) across reducers (ADR 0117). 0 never splits.
+    pub fn with_skew(mut self, bytes: u64) -> Self {
+        self.skew_bytes = bytes;
+        self
+    }
+
+    /// How many hot join buckets were split (ADR 0117).
+    pub fn skew_splits(&self) -> u64 {
+        self.splits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Keeps up to `bytes` of collected build sides that read pinned
@@ -515,6 +537,23 @@ pub struct Bucket {
     /// Keep only bucket `index`, dropping the rest as the map runs: a map
     /// re-run for one reducer (ADR 0072).
     pub only: bool,
+    /// How many reduces read this bucket (ADR 0117): the other side of a
+    /// split hot bucket is read by each of its parts. 1 normally.
+    pub readers: usize,
+    /// Run the map, take nothing, and return each bucket's size in bytes
+    /// (one `bytes` row per bucket), so the coordinator can find hot ones
+    /// (ADR 0117).
+    pub sizes: bool,
+}
+
+/// A hot join bucket's part (ADR 0117): this reduce reads, on the split
+/// side, only `maps` (positions among that side's maps), and the other
+/// side's bucket, which `readers` parts read in all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Split {
+    pub left: bool,
+    pub maps: Vec<usize>,
+    pub readers: usize,
 }
 
 /// A shuffle reduce (ADR 0064, 0065): fetch bucket `partition` (of
@@ -535,6 +574,8 @@ pub struct Reduce {
     /// Write the reduced rows as data files and return the files written
     /// (ADR 0092).
     pub write: Option<WriteTo>,
+    /// One part of a hot join bucket (ADR 0117).
+    pub split: Option<Split>,
 }
 
 /// An equi-join of two shuffled sides, on columns of their fragments.
@@ -555,6 +596,36 @@ pub struct JoinSpec {
     /// use those names.
     pub left_picks: Option<Vec<usize>>,
     pub right_picks: Option<Vec<usize>>,
+}
+
+impl JoinSpec {
+    /// The columns a side's maps hash, by position in their output: its
+    /// keys among the fragment's columns, then its computed ones (ADR
+    /// 0065, 0111); for a merged aggregation, the picked group columns its
+    /// `c{i}` keys name (ADR 0112). The reducers and the coordinator's size
+    /// round (ADR 0117) must hash alike.
+    pub fn hash_keys(&self, left: bool, f: &Fragment) -> Result<Vec<usize>, String> {
+        let (names, picks) = match left {
+            true => (&self.left_keys, &self.left_picks),
+            false => (&self.right_keys, &self.right_picks),
+        };
+        names
+            .iter()
+            .map(|k| match picks {
+                Some(picks) => k
+                    .strip_prefix('c')
+                    .and_then(|i| i.parse::<usize>().ok())
+                    .and_then(|i| picks.get(i).copied())
+                    .ok_or_else(|| format!("join key {k} is not a picked column")),
+                None => f
+                    .columns
+                    .iter()
+                    .chain(f.computed.iter().map(|(n, _)| n))
+                    .position(|c| c == k)
+                    .ok_or_else(|| format!("join key {k} is not a map column")),
+            })
+            .collect()
+    }
 }
 
 /// A join's non-equi filter as a worker plans it (ADR 0098): portable SQL
@@ -711,6 +782,9 @@ impl Reduce {
             "partitions": self.partitions,
             "only": self.only,
             "write": self.write.as_ref().map(WriteTo::to_json),
+            "split": self.split.as_ref().map(|s| json!({
+                "left": s.left, "maps": s.maps, "readers": s.readers,
+            })),
             "maps": maps_json(&self.maps),
             "join": self.join.as_ref().map(|j| json!({
                 "join_type": j.join_type,
@@ -763,6 +837,16 @@ impl Reduce {
             join,
             only: r["only"].as_bool().unwrap_or(false),
             write: WriteTo::from_json(&r["write"])?,
+            split: match &r["split"] {
+                Json::Null => None,
+                s => Some(Split {
+                    left: s["left"]
+                        .as_bool()
+                        .ok_or("`reduce.split.left` is a boolean")?,
+                    maps: projection(&s["maps"], "reduce.split.maps")?.unwrap_or_default(),
+                    readers: count(&s["readers"], "reduce.split.readers")?,
+                }),
+            },
         })
     }
 }
@@ -817,6 +901,7 @@ impl Fragment {
             "filters": self.filters,
             "bucket": self.bucket.as_ref().map(|b| json!({
                 "shuffle": b.shuffle, "map": b.map, "partitions": b.partitions, "index": b.index, "keys": b.keys, "only": b.only,
+                "readers": b.readers, "sizes": b.sizes,
             })),
             "broadcast": self.broadcast.as_ref().map(|b| json!({
                 "join_type": b.join_type,
@@ -959,6 +1044,12 @@ impl Fragment {
                             .map(|k| count(k, "bucket.keys[]"))
                             .collect::<Result<_, _>>()?,
                         only: b["only"].as_bool().unwrap_or(false),
+                        readers: b["readers"]
+                            .as_u64()
+                            .and_then(|n| usize::try_from(n).ok())
+                            .unwrap_or(1)
+                            .max(1),
+                        sizes: b["sizes"].as_bool().unwrap_or(false),
                     })
                 }
             },
@@ -1113,6 +1204,7 @@ impl RemoteScanExec {
                         join: None,
                         only: false,
                         write: None,
+                        split: None,
                     },
                 )
             })
@@ -1817,6 +1909,9 @@ pub struct RemoteReduceExec {
     /// Set once a partition runs: only then do workers hold maps to
     /// release when this plan is dropped (ADR 0073).
     executed: AtomicBool,
+    /// Per bucket of a join, its split when hot (ADR 0117): decided once,
+    /// from every map's bucket sizes, by the first partition to run.
+    split_plan: Arc<tokio::sync::OnceCell<Vec<BucketSplit>>>,
 }
 
 impl RemoteReduceExec {
@@ -1859,8 +1954,165 @@ impl RemoteReduceExec {
             kind,
             properties,
             executed: AtomicBool::new(false),
+            split_plan: Arc::default(),
         }
     }
+
+    /// A reduce's targets: its worker, then, should that fail before its
+    /// first batch, the next reducer's worker with a fresh shuffle for
+    /// this one bucket (ADR 0072).
+    fn targets(&self, partition: usize, reduce: &Reduce, url: &str) -> Vec<(String, Bytes)> {
+        let mut targets = vec![(url.to_owned(), Bytes::from(reduce.to_json().to_string()))];
+        let n = self.reduces.len();
+        if let Some((other, _)) = self
+            .reduces
+            .get((partition + 1) % n)
+            .filter(|(u, _)| u != url)
+        {
+            let retry = Reduce {
+                shuffle: format!("{}~r{partition}", reduce.shuffle),
+                only: true,
+                ..reduce.clone()
+            };
+            targets.push((other.clone(), Bytes::from(retry.to_json().to_string())));
+        }
+        targets
+    }
+}
+
+/// Every map's bucket sizes, per side of a join's shuffle (ADR 0117): each
+/// map runs (as its reducers would have it run, the same keys hashed) and
+/// reports its buckets' bytes, handing nothing out.
+async fn bucket_sizes(
+    workers: Arc<Workers>,
+    reduce: &Reduce,
+    tag: Option<Arc<QueryTag>>,
+) -> Result<(Vec<Vec<u64>>, Vec<Vec<u64>>)> {
+    use datafusion::arrow::array::AsArray;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, UInt64Type};
+    use futures::TryStreamExt;
+    let Some(join) = &reduce.join else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "bytes",
+        DataType::UInt64,
+        false,
+    )]));
+    let side = |maps: &[(String, Fragment)], offset: usize, left: bool| {
+        maps.iter()
+            .enumerate()
+            .map(|(i, (url, f))| {
+                let mut f = f.clone();
+                let keys = join.hash_keys(left, &f);
+                let (workers, tag, schema) = (workers.clone(), tag.clone(), schema.clone());
+                let url = url.clone();
+                async move {
+                    f.bucket = Some(Bucket {
+                        shuffle: reduce.shuffle.clone(),
+                        map: offset + i,
+                        partitions: reduce.partitions,
+                        index: 0,
+                        keys: keys.map_err(DataFusionError::Execution)?,
+                        only: false,
+                        readers: 1,
+                        sizes: true,
+                    });
+                    let body = Bytes::from(f.to_json().to_string());
+                    let batches: Vec<RecordBatch> =
+                        with_retry(workers, vec![(url, body)], tag, schema)
+                            .try_collect()
+                            .await?;
+                    Ok::<_, DataFusionError>(
+                        batches
+                            .iter()
+                            .flat_map(|b| {
+                                b.column(0).as_primitive::<UInt64Type>().values().to_vec()
+                            })
+                            .collect::<Vec<u64>>(),
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    futures::future::try_join(
+        futures::future::try_join_all(side(&reduce.maps, 0, true)),
+        futures::future::try_join_all(side(&join.right, reduce.maps.len(), false)),
+    )
+    .await
+}
+
+/// A join bucket's split (ADR 0117): the side split, and its maps in
+/// groups; `None` to run the bucket whole.
+type BucketSplit = Option<(bool, Vec<Vec<usize>>)>;
+
+/// Which join buckets to split, and how (ADR 0117): per bucket, `None`, or
+/// the side to split and its maps in groups, one reduce per group, the
+/// other side's bucket read by each. A bucket is hot when its side's maps
+/// hold over `min` bytes of it and four times that side's (lower) median
+/// bucket. Only a side whose rows each appear at most once in the output
+/// may be split: the left of an inner, left, left semi or anti join, the
+/// right of an inner, right, right semi or anti one. The other side's
+/// unmatched rows would come out once per part. Groups balance bytes,
+/// largest maps first, over at most `reducers` parts.
+fn plan_splits(
+    left: &[Vec<u64>],
+    right: &[Vec<u64>],
+    join_type: datafusion::common::JoinType,
+    min: u64,
+    reducers: usize,
+) -> Vec<BucketSplit> {
+    use datafusion::common::JoinType;
+    let buckets = left.iter().chain(right).map(Vec::len).max().unwrap_or(0);
+    let at = |side: &[Vec<u64>], m: usize, j: usize| side[m].get(j).copied().unwrap_or(0);
+    let totals = |side: &[Vec<u64>]| -> Vec<u64> {
+        (0..buckets)
+            .map(|j| (0..side.len()).map(|m| at(side, m, j)).sum())
+            .collect()
+    };
+    let (lt, rt) = (totals(left), totals(right));
+    let hot = |t: &[u64], j: usize| {
+        let mut sorted = t.to_vec();
+        sorted.sort_unstable();
+        let median = sorted
+            .get(sorted.len().saturating_sub(1) / 2)
+            .copied()
+            .unwrap_or(0);
+        t[j] > min && t[j] > median.saturating_mul(4)
+    };
+    let left_ok = matches!(
+        join_type,
+        JoinType::Inner | JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti
+    );
+    let right_ok = matches!(
+        join_type,
+        JoinType::Inner | JoinType::Right | JoinType::RightSemi | JoinType::RightAnti
+    );
+    (0..buckets)
+        .map(|j| {
+            let (is_left, side) = if left_ok && hot(&lt, j) {
+                (true, left)
+            } else if right_ok && hot(&rt, j) {
+                (false, right)
+            } else {
+                return None;
+            };
+            let mut order: Vec<usize> = (0..side.len()).filter(|&m| at(side, m, j) > 0).collect();
+            let parts = reducers.min(order.len());
+            if parts < 2 {
+                return None;
+            }
+            order.sort_by_key(|&m| std::cmp::Reverse(at(side, m, j)));
+            let mut groups: Vec<(u64, Vec<usize>)> = vec![(0, Vec::new()); parts];
+            for m in order {
+                if let Some(g) = groups.iter_mut().min_by_key(|(load, _)| *load) {
+                    g.0 += at(side, m, j);
+                    g.1.push(m);
+                }
+            }
+            Some((is_left, groups.into_iter().map(|(_, g)| g).collect()))
+        })
+        .collect()
 }
 
 /// The query is over (finished, failed or cancelled): every worker that
@@ -1976,24 +2228,61 @@ impl ExecutionPlan for RemoteReduceExec {
         // A lost reducer took its buckets with it: the retry, on the next
         // reducer's worker, is a fresh shuffle for this one bucket (ADR
         // 0072), so it never asks for a bucket already handed out.
-        let mut targets = vec![(url.clone(), Bytes::from(reduce.to_json().to_string()))];
-        let n = self.reduces.len();
-        if let Some((other, _)) = self
-            .reduces
-            .get((partition + 1) % n)
-            .filter(|(u, _)| u != url)
-        {
-            let retry = Reduce {
-                shuffle: format!("{}~r{partition}", reduce.shuffle),
-                only: true,
-                ..reduce.clone()
+        let targets = self.targets(partition, reduce, url);
+        let join_type = reduce
+            .join
+            .as_ref()
+            .and_then(|j| j.join_type.parse::<datafusion::common::JoinType>().ok());
+        let workers = self.workers.clone();
+        let Some(join_type) = join_type.filter(|_| workers.skew_bytes > 0) else {
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                with_retry(workers, targets, tag, schema),
+            )));
+        };
+        // Hot buckets (ADR 0117): sized once, split into parts that run on
+        // successive reducers' workers and stream as this partition.
+        let (cell, template) = (self.split_plan.clone(), self.reduces[0].1.clone());
+        let urls: Vec<String> = self.reduces.iter().map(|(u, _)| u.clone()).collect();
+        let reduce = reduce.clone();
+        let out = schema.clone();
+        let body = stream::once(async move {
+            let plan = cell
+                .get_or_init(|| async {
+                    // Unsized (a map's worker failing, say), nothing splits:
+                    // the reduces then run, and retry, as planned.
+                    match bucket_sizes(workers.clone(), &template, tag.clone()).await {
+                        Ok((left, right)) => {
+                            plan_splits(&left, &right, join_type, workers.skew_bytes, urls.len())
+                        }
+                        Err(_) => Vec::new(),
+                    }
+                })
+                .await;
+            let Some((left, groups)) = plan.get(partition).cloned().flatten() else {
+                return with_retry(workers, targets, tag, out);
             };
-            targets.push((other.clone(), Bytes::from(retry.to_json().to_string())));
-        }
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema.clone(),
-            with_retry(self.workers.clone(), targets, tag, schema),
-        )))
+            workers.splits.fetch_add(1, Ordering::Relaxed);
+            let readers = groups.len();
+            let parts = groups.into_iter().enumerate().map(|(i, maps)| {
+                let part = Reduce {
+                    split: Some(Split {
+                        left,
+                        maps,
+                        readers,
+                    }),
+                    ..reduce.clone()
+                };
+                // ponytail: a part is not retried elsewhere; its maps would
+                // run again for it alone, which the split does not plan.
+                let url = urls[(partition + i) % urls.len()].clone();
+                let body = Bytes::from(part.to_json().to_string());
+                with_retry(workers.clone(), vec![(url, body)], tag.clone(), out.clone())
+            });
+            stream::select_all(parts).boxed()
+        })
+        .flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, body)))
     }
 }
 
@@ -2411,6 +2700,7 @@ fn shuffle_join(
                     join: Some(spec.clone()),
                     only: false,
                     write: None,
+                    split: None,
                 },
             )
         })
@@ -2969,6 +3259,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hot_join_buckets_split_on_the_side_that_may() {
+        use datafusion::common::JoinType;
+        // Two buckets per map; bucket 0 of the left side is hot.
+        let left = vec![vec![900, 10], vec![700, 10], vec![100, 10]];
+        let right = vec![vec![50, 40], vec![50, 40]];
+        let plan = plan_splits(&left, &right, JoinType::Inner, 100, 2);
+        // Split in two parts, largest map first, balancing bytes.
+        assert_eq!(plan, vec![Some((true, vec![vec![0], vec![1, 2]])), None]);
+        // A left join may split its left side; a right join may not,
+        // and its right side is not hot.
+        assert_eq!(plan_splits(&left, &right, JoinType::Left, 100, 2), plan);
+        assert_eq!(
+            plan_splits(&left, &right, JoinType::Right, 100, 2),
+            vec![None, None]
+        );
+        // Under the minimum, or with one reducer, nothing splits.
+        assert_eq!(
+            plan_splits(&left, &right, JoinType::Inner, 5000, 2),
+            vec![None, None]
+        );
+        assert_eq!(
+            plan_splits(&left, &right, JoinType::Inner, 100, 1),
+            vec![None, None]
+        );
+        // A hot right side of a right join splits there.
+        let plan = plan_splits(&right, &left, JoinType::Right, 100, 3);
+        assert_eq!(
+            plan,
+            vec![Some((false, vec![vec![0], vec![1], vec![2]])), None]
+        );
+        // A full join splits neither side.
+        assert_eq!(
+            plan_splits(&left, &right, JoinType::Full, 100, 2),
+            vec![None, None]
+        );
+    }
+
+    #[test]
     fn fragments_round_trip_as_json() {
         let f = Fragment {
             metadata_location: "s3://b/t/metadata/v3.metadata.json".into(),
@@ -2987,6 +3315,8 @@ mod tests {
                 index: 0,
                 keys: vec![0],
                 only: true,
+                readers: 3,
+                sizes: true,
             }),
             broadcast: Some(Broadcast {
                 join_type: "RightSemi".into(),
@@ -3044,6 +3374,11 @@ mod tests {
             join: None,
             only: true,
             write: None,
+            split: Some(Split {
+                left: true,
+                maps: vec![1],
+                readers: 2,
+            }),
         };
         assert_eq!(
             Task::from_json(&r.to_json()).unwrap(),

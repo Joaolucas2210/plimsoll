@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Hot join buckets split across reducers, after a size round over the maps; only the side whose rows appear once in the output splits (ADR 0117)
 - [x] Broadcast build sides of pinned snapshots cached and sent again (`PLIMSOLL_BROADCAST_CACHE_BYTES`), keyed by the build plan (ADR 0116)
 - [x] Non-equi (nested-loop) joins against a small side broadcast to the workers, with gathered left/full/semi/anti variants and the broadcast limit's fallback (ADR 0115)
 - [x] Distinct counts from the metadata of statistics files (Puffin `ndv`), and row estimates net of position deletes, so joins on repeated keys are sized (ADR 0114)
@@ -149,9 +150,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Skewed shuffles** — spill the largest bucket first and split hot
-join buckets across reducers, so one heavy key does not hold a whole
-shuffle back (ADR 0067).
+**Per-query spill attribution** — the spill bytes each query caused,
+on the coordinator and its workers' fragments, in the query log and
+`system.runtime.queries` (ADR 0069).
 
 ## Missing
 
@@ -181,9 +182,10 @@ shuffle back (ADR 0067).
   maintenance (ADR 0114);
   ordered joins kept local once a filtered side becomes the build side; skip the shuffle for few-group
   aggregations (ADR 0064/0066).
-- Skew (above).
+- Skew in aggregation shuffles, and retried parts of split buckets (ADR
+  0117).
 - Spilling hash-join build sides (DataFusion upstream, ADR 0068).
 
 **Security and operations**
-- Shuffle-map operator spans; per-kind fragment
-  counters; per-query spill attribution (ADR 0069/0071).
+- Per-query spill attribution (above); shuffle-map operator spans;
+  per-kind fragment counters (ADR 0069/0071).

@@ -69,6 +69,9 @@ pub struct Config {
     /// `PLIMSOLL_BROADCAST_CACHE_BYTES`: collected build sides of pinned
     /// snapshots kept for reuse; 0 (the default) keeps none (ADR 0116).
     pub broadcast_cache_bytes: usize,
+    /// `PLIMSOLL_SKEW_BYTES`: a join bucket over this (and four times its
+    /// side's median) is split across reducers; 0 never (ADR 0117).
+    pub skew_bytes: u64,
 }
 
 impl Config {
@@ -148,6 +151,12 @@ impl Config {
             &lookup,
             "PLIMSOLL_BROADCAST_CACHE_BYTES",
             Some(0),
+            "expected a non-negative integer (bytes)",
+        )?;
+        let skew_bytes: u64 = parse(
+            &lookup,
+            "PLIMSOLL_SKEW_BYTES",
+            Some(plimsoll_connectors::remote::DEFAULT_SKEW_BYTES),
             "expected a non-negative integer (bytes)",
         )?;
 
@@ -251,6 +260,7 @@ impl Config {
             tls_ca,
             broadcast_max_bytes,
             broadcast_cache_bytes,
+            skew_bytes,
         })
     }
 }
@@ -615,6 +625,8 @@ mod tests {
         assert_eq!(c.tls, None);
         assert_eq!(c.broadcast_max_bytes, 64 << 20);
         assert_eq!(c.broadcast_cache_bytes, 0);
+        assert_eq!(c.skew_bytes, 64 << 20);
+        assert_eq!(cfg(&[("PLIMSOLL_SKEW_BYTES", "0")]).unwrap().skew_bytes, 0);
         let c = cfg(&[("PLIMSOLL_BROADCAST_CACHE_BYTES", "33554432")]).unwrap();
         assert_eq!(c.broadcast_cache_bytes, 32 << 20);
         assert!(cfg(&[("PLIMSOLL_BROADCAST_CACHE_BYTES", "lots")]).is_err());

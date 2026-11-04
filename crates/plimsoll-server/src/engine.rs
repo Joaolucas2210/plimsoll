@@ -611,9 +611,18 @@ async fn open_side(
     token: &str,
     tag: &Option<Arc<QueryTag>>,
 ) -> Result<Arc<StreamingTable>, EngineError> {
+    // A hot bucket's part (ADR 0117): on the split side, only its maps;
+    // the other side's bucket, read by every part.
+    let left = offset == 0;
+    let (part, readers) = match &r.split {
+        Some(s) if s.left == left => (Some(&s.maps), 1),
+        Some(s) => (None, s.readers),
+        None => (None, 1),
+    };
     let opens = maps
         .iter()
         .enumerate()
+        .filter(|(i, _)| part.is_none_or(|maps| maps.contains(i)))
         .map(|(i, (url, f))| {
             let map = offset + i;
             let mut f = f.clone();
@@ -624,6 +633,8 @@ async fn open_side(
                 index: r.partition,
                 keys: keys(&f)?,
                 only: r.only,
+                readers,
+                sizes: false,
             };
             let retry = Bucket {
                 shuffle: format!("{}~m{map}r{}", r.shuffle, r.partition),
@@ -767,11 +778,15 @@ struct ShuffleMap {
     schema: plimsoll_core::datafusion::arrow::datatypes::SchemaRef,
     /// `None` once fetched.
     buckets: Vec<Option<Kept>>,
+    /// Times each bucket was fetched: a bucket several reduces read (ADR
+    /// 0117) is handed out until the last one takes it.
+    fetched: Vec<usize>,
     /// The in-memory buckets.
     memory: Arc<std::sync::Mutex<Reservation>>,
 }
 
 /// Where a shuffle bucket waits to be fetched (ADR 0067).
+#[derive(Clone)]
 enum Kept {
     Memory(Vec<RecordBatch>),
     /// Arrow IPC in a spill file, deleted when dropped.
@@ -931,6 +946,7 @@ impl CoreEngine {
                 }
                 Ok(Arc::new(std::sync::Mutex::new(ShuffleMap {
                     schema,
+                    fetched: vec![0; parts.len()],
                     buckets: parts,
                     memory,
                 })))
@@ -938,6 +954,36 @@ impl CoreEngine {
             .await
             .clone()
             .map_err(EngineError::Internal)?;
+        // The coordinator's size round (ADR 0117): every bucket's bytes,
+        // nothing handed out.
+        if bucket.sizes {
+            use plimsoll_core::datafusion::arrow::array::UInt64Array;
+            use plimsoll_core::datafusion::arrow::datatypes::{DataType, Field, Schema};
+            let m = map.lock().unwrap_or_else(|e| e.into_inner());
+            let sizes: Vec<u64> = m
+                .buckets
+                .iter()
+                .map(|b| match b {
+                    Some(Kept::Memory(batches)) => batches
+                        .iter()
+                        .map(|b| b.get_array_memory_size() as u64)
+                        .sum(),
+                    Some(Kept::Disk(file)) => file.size().unwrap_or(0),
+                    None => 0,
+                })
+                .collect();
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "bytes",
+                DataType::UInt64,
+                false,
+            )]));
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(UInt64Array::from(sizes))])
+                    .map_err(|e| classify(&e.into()))?;
+            return Ok(Box::pin(
+                MemoryStream::try_new(vec![batch], schema, None).map_err(|e| classify(&e))?,
+            ));
+        }
         let (schema, batches, done) = {
             let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
             if m.buckets.len() != partitions {
@@ -947,19 +993,30 @@ impl CoreEngine {
                     m.buckets.len()
                 )));
             }
-            let kept = m.buckets.get_mut(bucket.index).and_then(Option::take);
-            if let Some(Kept::Memory(batches)) = &kept {
-                let size = batches.iter().map(RecordBatch::get_array_memory_size).sum();
-                m.memory
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .shrink(size);
+            // Handed out to each of its readers (ADR 0117), taken by the
+            // last: only then is its memory released.
+            let fetched = m.fetched.get_mut(bucket.index).map_or(1, |n| {
+                *n += 1;
+                *n
+            });
+            if fetched < bucket.readers {
+                let kept = m.buckets.get(bucket.index).cloned().flatten();
+                (m.schema.clone(), kept, false)
+            } else {
+                let kept = m.buckets.get_mut(bucket.index).and_then(Option::take);
+                if let Some(Kept::Memory(batches)) = &kept {
+                    let size = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+                    m.memory
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .shrink(size);
+                }
+                (
+                    m.schema.clone(),
+                    kept,
+                    m.buckets.iter().all(Option::is_none),
+                )
             }
-            (
-                m.schema.clone(),
-                kept,
-                m.buckets.iter().all(Option::is_none),
-            )
         };
         if done {
             lock().remove(&key);
@@ -1212,23 +1269,6 @@ impl QueryEngine for CoreEngine {
         use plimsoll_core::datafusion::common::{Column, JoinType};
         use plimsoll_core::datafusion::prelude::{Expr, SessionContext};
         let fail = |e: DataFusionError| classify(&e);
-        // Join keys by position in each map's columns; group keys lead an
-        // aggregated map's output.
-        let positions = |names: &[String]| {
-            let names = names.to_vec();
-            move |f: &Fragment| {
-                names
-                    .iter()
-                    .map(|k| {
-                        // Computed keys follow the columns (ADR 0111).
-                        let mut output = f.columns.iter().chain(f.computed.iter().map(|(n, _)| n));
-                        output.position(|c| c == k).ok_or_else(|| {
-                            EngineError::InvalidQuery(format!("join key {k} is not a map column"))
-                        })
-                    })
-                    .collect()
-            }
-        };
         let groups =
             |f: &Fragment| Ok((0..f.aggregate.as_ref().map_or(0, |a| a.group_by.len())).collect());
         // Every worker holding a map: where a lost map may run again.
@@ -1246,48 +1286,14 @@ impl QueryEngine for CoreEngine {
                 None,
             ),
             Some(j) => {
-                // A merged aggregation's keys (ADR 0112) are `c{i}`, its
-                // side's column i: picked from the aggregation's output,
-                // whose group keys lead the partial states the maps hash.
-                let by = |names: &[String], picks: &Option<Vec<usize>>| {
-                    let (names, picks) = (names.to_vec(), picks.clone());
-                    let at = positions(&names);
-                    move |f: &Fragment| match &picks {
-                        None => at(f),
-                        Some(picks) => names
-                            .iter()
-                            .map(|k| {
-                                k.strip_prefix('c')
-                                    .and_then(|i| i.parse::<usize>().ok())
-                                    .and_then(|i| picks.get(i).copied())
-                                    .ok_or_else(|| {
-                                        EngineError::InvalidQuery(format!(
-                                            "join key {k} is not a picked column"
-                                        ))
-                                    })
-                            })
-                            .collect(),
-                    }
+                // Each side's hashed columns: its keys among the map's
+                // columns, or a merged aggregation's picks (ADR 0112).
+                let by = |left: bool| {
+                    move |f: &Fragment| j.hash_keys(left, f).map_err(EngineError::InvalidQuery)
                 };
                 let (l, r) = futures::future::try_join(
-                    open_side(
-                        &r,
-                        &r.maps,
-                        0,
-                        by(&j.left_keys, &j.left_picks),
-                        &peers,
-                        token,
-                        &tag,
-                    ),
-                    open_side(
-                        &r,
-                        &j.right,
-                        r.maps.len(),
-                        by(&j.right_keys, &j.right_picks),
-                        &peers,
-                        token,
-                        &tag,
-                    ),
+                    open_side(&r, &r.maps, 0, by(true), &peers, token, &tag),
+                    open_side(&r, &j.right, r.maps.len(), by(false), &peers, token, &tag),
                 )
                 .await?;
                 (l, Some(r))
@@ -1745,6 +1751,8 @@ mod tests {
                 index: 0,
                 keys: vec![0],
                 only: false,
+                readers: 1,
+                sizes: false,
             }),
             broadcast: None,
             write: None,
