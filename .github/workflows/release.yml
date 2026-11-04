@@ -58,6 +58,14 @@ jobs:
             gcc-aarch64-linux-gnu libc6-dev-arm64-cross
           rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 
+      # Compiled dependencies, per target (ADR 0134). Saved only from
+      # `main` (the dry run): GitHub scopes caches by ref, and a tag can read
+      # the default branch's but not another tag's.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       # One build per platform: the archives and the image hold the same
       # bytes.
       - name: build
