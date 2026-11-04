@@ -48,6 +48,8 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] `MERGE` sources above the broadcast limit merge on the coordinator instead of failing on workers' body limit (ADR 0130)
+- [x] Flight SQL `GetTables` with column schemas (from `information_schema.columns`) and batched parameter updates (ADR 0129)
 - [x] TPC-H on the quickstart's cluster over Iceberg, 22/22; fixed on the way: environment tables in new schemas, fragment bodies above 2 MiB (read after auth, up to the broadcast limit), shuffle maps released while a scalar subquery still read them (ADR 0128)
 - [x] Bound parameters in Flight SQL prepared statements: stateless handles carry them, `?` numbered as `$n` (ADR 0127)
 - [x] TPC-H benchmark: generator and oracle from DuckDB, 22/22 checked, SF1 2.4 s and SF10 32 s on one node under 4 GiB (ADR 0126)
@@ -168,7 +170,9 @@ correctness.
 ## Missing
 
 **Lakehouse writes**
-- A shuffled `MERGE` for sources larger than a node, and a spilled source; gathered joins'
+- A shuffled `MERGE` (source and target bucketed by key) for sources
+  above the broadcast limit, which now merge on the coordinator (ADR
+  0130), and a spilled source; gathered joins'
   rows written on workers (ADR 0122).
 - Several deletion vectors per Puffin file; v3 compaction of files with
   equality deletes; decimal partition values; vectorized partition
@@ -200,7 +204,7 @@ correctness.
 **Security and operations**
 - Benchmarks: SF10+ on separate hosts (ADR 0128); full result
   comparison (ADR 0126). Releases: arm64 images and signed
-  releases (ADR 0125). Flight SQL: `include_schema` table listings, batched
-  executes, a parameter schema (ADR 0127), `DoPut` ingestion, certificate reload (ADR 0124).
+  releases (ADR 0125). Flight SQL: a parameter schema (ADR 0127), batches as one
+  commit (ADR 0129), `DoPut` ingestion, certificate reload (ADR 0124).
 - Shuffle map spans (ADR 0120); per-kind fragment latencies (ADR
   0119); failed fragments' spill on the coordinator (ADR 0121).

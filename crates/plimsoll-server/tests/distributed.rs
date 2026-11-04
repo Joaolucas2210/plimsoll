@@ -1181,11 +1181,18 @@ async fn writes_on_workers_through_the_rest_catalog() {
     plimsoll_server::lakehouse::register(capped.context(), catalog.clone())
         .await
         .unwrap();
+    let capped_workers = [
+        worker_with(Default::default()).await,
+        worker_with(Default::default()).await,
+    ];
     coordinate(
         &capped,
-        Workers::new(vec![worker().await, worker().await], TOKEN.into())
-            .unwrap()
-            .with_broadcast_limit(1),
+        Workers::new(
+            capped_workers.iter().map(|(url, _)| url.clone()).collect(),
+            TOKEN.into(),
+        )
+        .unwrap()
+        .with_broadcast_limit(1),
     );
     {
         let state = capped.context().state_ref();
@@ -1281,8 +1288,12 @@ async fn writes_on_workers_through_the_rest_catalog() {
     plimsoll_server::lakehouse::register(local.context(), catalog.clone())
         .await
         .unwrap();
-    let (m1, m2) = (format!("{src}_m1"), format!("{src}_m2"));
-    for t in [&m1, &m2] {
+    let (m1, m2, m3) = (
+        format!("{src}_m1"),
+        format!("{src}_m2"),
+        format!("{src}_m3"),
+    );
+    for t in [&m1, &m2, &m3] {
         text(&format!(
             "CREATE TABLE {t} PARTITION BY (region) AS SELECT id, region, v FROM {src}"
         ))
@@ -1319,7 +1330,23 @@ async fn writes_on_workers_through_the_rest_catalog() {
         inserted.contains("| 16 |"),
         "ids 50..200 step 50, of 4 inserts: {inserted}"
     );
-    for t in [src, dst, c1, c2, m1, m2] {
+    // A source above the broadcast limit is not attached to every
+    // fragment: the merge runs here, with the same result (ADR 0130).
+    let capped_out = pretty_format_batches(&capped.sql(&merge(&m3)).await.unwrap().batches)
+        .unwrap()
+        .to_string();
+    assert_eq!(capped_out, single);
+    // Its target files were never sent out with the source.
+    for (_, st) in &capped_workers {
+        assert!(!st.fragments.snapshot().contains_key("merge"));
+    }
+    let differ = text(&format!(
+        "SELECT count(*) AS n FROM {m3} a FULL JOIN {m2} b ON a.id = b.id \
+         WHERE a.id IS NULL OR b.id IS NULL OR a.v <> b.v OR a.region <> b.region"
+    ))
+    .await;
+    assert!(differ.contains("| 0 |"), "{differ}");
+    for t in [src, dst, c1, c2, m1, m2, m3] {
         text(&format!("DROP TABLE {t} PURGE")).await;
     }
 }

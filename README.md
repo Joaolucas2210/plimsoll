@@ -165,7 +165,7 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_AUTH_COLUMN_DENY` | unset | `ana=gold.users.email\|gold.users.ssn`: columns a user may not read, checked on what each scan reads after optimization, filters and subqueries included; `403 forbidden` (ADR 0044) |
 | `PLIMSOLL_AUTH_ROW_FILTERS` | unset | `{"ana": {"gold.orders": "region = 'eu'"}}`: a SQL predicate every row a user reads from a table must satisfy, applied to every scan (joins, subqueries, time travel); the table's `$` metadata tables are denied to that user (ADR 0045) |
 | `PLIMSOLL_AUTH` | `required` | `disabled` = no authentication, `user` trusted from the body (development only) |
-| `PLIMSOLL_FLIGHT_BIND` | unset (off) | Arrow Flight SQL listener (e.g. `0.0.0.0:32010`): statements, prepared statements (with `?` or `$n` parameters, ADR 0127), catalog/schema/table listings and server info, authenticated by bearer token or a `user:token` handshake, run through `/v1/sql` with the same grants, admission and logs; TLS with `PLIMSOLL_TLS_*` (read at boot) (ADR 0124) |
+| `PLIMSOLL_FLIGHT_BIND` | unset (off) | Arrow Flight SQL listener (e.g. `0.0.0.0:32010`): statements, prepared statements (with `?` or `$n` parameters, batched updates; ADR 0127, 0129), catalog/schema/table listings (with column schemas) and server info, authenticated by bearer token or a `user:token` handshake, run through `/v1/sql` with the same grants, admission and logs; TLS with `PLIMSOLL_TLS_*` (read at boot) (ADR 0124) |
 | `PLIMSOLL_MEMORY_LIMIT_BYTES` | `1073741824` | Memory ceiling (the load line) |
 | `PLIMSOLL_MAX_RUNNING` | `8` | Max concurrently running queries |
 | `PLIMSOLL_MAX_QUEUED` | `64` | Max queued queries (0 = reject when busy) |
@@ -199,7 +199,7 @@ Configuration is environment-only; invalid values abort startup.
 | `PLIMSOLL_MAINTENANCE_INTERVAL_MS` | `0` (off) | Between scheduled maintenance passes: tables with `plimsoll.maintenance.enabled = 'true'` are compacted, have snapshots expired (Iceberg's `history.expire.*` properties) and, with `plimsoll.maintenance.remove-orphans`, orphan files removed; queued under admission as `plimsoll-maintenance`; run it on one coordinator (ADR 0086); with several coordinators, each table is claimed per interval by one of them (a lease object in the table's location, ADR 0101) |
 | `PLIMSOLL_TLS_CERT` / `PLIMSOLL_TLS_KEY` | unset | PEM certificate chain and key: the node serves TLS (1.2/1.3) on its listener (API, metrics, worker fragments); the files are reloaded when they change on disk; both or neither (ADR 0099) |
 | `PLIMSOLL_TLS_CA` | unset | PEM bundle trusted (besides system roots) for `https://` workers, e.g. a private CA (ADR 0099) |
-| `PLIMSOLL_BROADCAST_MAX_BYTES` | `67108864` | Largest build side a broadcast join sends to workers (Arrow IPC bytes); a larger one is joined on the coordinator; `0` = no broadcasts (ADR 0099). Workers read fragment bodies up to it plus 16 MiB, once authenticated: set it alike on every node (ADR 0128) |
+| `PLIMSOLL_BROADCAST_MAX_BYTES` | `67108864` | Largest build side a broadcast join sends to workers (Arrow IPC bytes); a larger one is joined on the coordinator; `0` = no broadcasts (ADR 0099). Workers read fragment bodies up to it plus 16 MiB, once authenticated: set it alike on every node (ADR 0128). A `MERGE` source above it merges on the coordinator (ADR 0130) |
 | `PLIMSOLL_BROADCAST_CACHE_BYTES` | `0` (off) | Collected broadcast build sides that read only pinned Iceberg snapshots kept (under the memory ceiling) and sent again instead of collected again; least recently used first out (ADR 0116) |
 | `PLIMSOLL_SKEW_BYTES` | `67108864` | A shuffled join's bucket over this many bytes (and four times its side's median) is split across reducers, its other side read by each part; `0` never splits (ADR 0117) |
 
@@ -289,7 +289,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 ## Decision records
 
 Index with status, date and the one-line decision of every ADR:
-[docs/adr/README.md](docs/adr/README.md) (0001–0128; template in
+[docs/adr/README.md](docs/adr/README.md) (0001–0130; template in
 [docs/adr/0000-template.md](docs/adr/0000-template.md)).
 
 Roadmap: [ROADMAP.md](ROADMAP.md).

@@ -1295,6 +1295,11 @@ impl RemoteScanExec {
             .unwrap_or_default()
     }
 
+    /// The largest attachment its fragments may carry (ADR 0099).
+    pub(crate) fn broadcast_limit(&self) -> usize {
+        self.workers.broadcast_limit
+    }
+
     /// Fragments, i.e. shuffle partitions when shuffled.
     pub fn fragment_count(&self) -> usize {
         self.fragments.len()

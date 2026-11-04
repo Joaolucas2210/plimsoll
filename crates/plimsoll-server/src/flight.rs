@@ -51,6 +51,8 @@ use crate::tls::TlsFiles;
 
 type Batches = Pin<Box<dyn Stream<Item = Result<RecordBatch, FlightError>> + Send>>;
 type DataStream = <Gateway as FlightService>::DoGetStream;
+/// Per (catalog, schema, table): its columns' name, type and nullability.
+type Columns = std::collections::HashMap<(String, String, String), Vec<(String, String, bool)>>;
 
 /// The Flight SQL service: `/v1/sql` behind gRPC.
 #[derive(Clone)]
@@ -214,6 +216,30 @@ impl Gateway {
         Ok(Response::new(encode(schema, batches)))
     }
 
+    /// `information_schema.columns` as the caller sees it, per table, in
+    /// column order.
+    async fn columns(&self, md: &MetadataMap) -> Result<Columns, Status> {
+        let rows = self
+            .rows(
+                md,
+                "SELECT table_catalog, table_schema, table_name, column_name, data_type, \
+                 is_nullable FROM information_schema.columns \
+                 ORDER BY table_catalog, table_schema, table_name, ordinal_position",
+                &[],
+            )
+            .await?;
+        let mut out = Columns::new();
+        for r in rows {
+            let text = |i: usize| r.get(i).and_then(Value::as_str).unwrap_or("").to_owned();
+            out.entry((text(0), text(1), text(2))).or_default().push((
+                text(3),
+                text(4),
+                text(5) == "YES",
+            ));
+        }
+        Ok(out)
+    }
+
     /// `information_schema.tables` as the caller sees it.
     async fn tables(&self, md: &MetadataMap) -> Result<Vec<[String; 4]>, Status> {
         let rows = self
@@ -312,6 +338,10 @@ struct Prepared {
     sql: String,
     #[serde(default)]
     params: Vec<Value>,
+    /// A batch of several parameter rows (JDBC's `executeBatch`): an
+    /// update runs once per row (ADR 0129).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rows: Vec<Vec<Value>>,
 }
 
 impl Prepared {
@@ -374,35 +404,47 @@ fn numbered(sql: &str) -> String {
     out
 }
 
-/// The one row of a bound parameter batch, as `/v1/sql` takes them (ADR
+/// The rows of a bound parameter batch, as `/v1/sql` takes them (ADR
 /// 0043): JSON scalars, cast there to what each placeholder needs.
-fn bound(batches: &[RecordBatch]) -> Result<Vec<Value>, Status> {
+fn bound(batches: &[RecordBatch]) -> Result<Vec<Vec<Value>>, Status> {
     use plimsoll_core::datafusion::common::ScalarValue;
-    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-    let Some(batch) = batches.iter().find(|b| b.num_rows() > 0) else {
-        return Ok(Vec::new());
-    };
-    if rows > 1 {
-        return Err(Status::unimplemented(
-            "one parameter row per execution (no batched executes yet)",
-        ));
+    let mut rows = Vec::new();
+    for batch in batches {
+        for i in 0..batch.num_rows() {
+            let row = batch
+                .columns()
+                .iter()
+                .map(|col| {
+                    let v = ScalarValue::try_from_array(col, i)
+                        .map_err(|e| Status::invalid_argument(e.to_string()))?;
+                    Ok(match &v {
+                        v if v.is_null() => Value::Null,
+                        ScalarValue::Boolean(Some(b)) => Value::Bool(*b),
+                        v if v.data_type().is_numeric() => serde_json::from_str(&v.to_string())
+                            .unwrap_or_else(|_| json!(v.to_string())),
+                        v => json!(v.to_string()),
+                    })
+                })
+                .collect::<Result<Vec<_>, Status>>()?;
+            rows.push(row);
+        }
     }
-    batch
-        .columns()
+    Ok(rows)
+}
+
+/// Columns as `information_schema.columns` lists them, as Arrow fields;
+/// `None` when a type does not read back (the table is then planned).
+fn fields(columns: &[(String, String, bool)]) -> Option<Schema> {
+    use plimsoll_core::datafusion::arrow::datatypes::{DataType, Field};
+    columns
         .iter()
-        .map(|col| {
-            let v = ScalarValue::try_from_array(col, 0)
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            Ok(match &v {
-                v if v.is_null() => Value::Null,
-                ScalarValue::Boolean(Some(b)) => Value::Bool(*b),
-                v if v.data_type().is_numeric() => {
-                    serde_json::from_str(&v.to_string()).unwrap_or_else(|_| json!(v.to_string()))
-                }
-                v => json!(v.to_string()),
-            })
+        .map(|(name, ty, nullable)| {
+            ty.parse::<DataType>()
+                .ok()
+                .map(|t| Field::new(name, t, *nullable))
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()
+        .map(Schema::new)
 }
 
 /// A `FlightInfo` whose one endpoint's ticket is `command`.
@@ -520,6 +562,7 @@ impl FlightSqlService for Gateway {
         let prepared = Prepared {
             sql: numbered(&query.query),
             params: Vec::new(),
+            rows: Vec::new(),
         };
         let schema = self.schema(request.metadata(), &prepared.sql, &[]).await?;
         let IpcMessage(dataset_schema) = SchemaAsIpc::new(&schema, &IpcWriteOptions::default())
@@ -547,7 +590,14 @@ impl FlightSqlService for Gateway {
         .try_collect()
         .await
         .map_err(Status::from)?;
-        prepared.params = bound(&batches)?;
+        // One row binds the statement; several are a batch, for updates.
+        let mut rows = bound(&batches)?;
+        if rows.len() == 1 {
+            prepared.params = rows.pop().unwrap_or_default();
+        } else {
+            prepared.params = Vec::new();
+            prepared.rows = rows;
+        }
         Ok(DoPutPreparedStatementResult {
             prepared_statement_handle: Some(prepared.encode()?.into()),
         })
@@ -568,6 +618,11 @@ impl FlightSqlService for Gateway {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let p = Prepared::decode(&query.prepared_statement_handle)?;
+        if !p.rows.is_empty() {
+            return Err(Status::invalid_argument(
+                "a query takes one parameter row; batches are for updates",
+            ));
+        }
         let schema = self.schema(request.metadata(), &p.sql, &p.params).await?;
         info(&schema, query, request.into_inner())
     }
@@ -587,7 +642,16 @@ impl FlightSqlService for Gateway {
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
         let p = Prepared::decode(&query.prepared_statement_handle)?;
-        self.update(request.metadata(), &p.sql, &p.params).await
+        if p.rows.is_empty() {
+            return self.update(request.metadata(), &p.sql, &p.params).await;
+        }
+        // ponytail: one statement per row, in order, each its own commit
+        // (no transactions); a `VALUES` join would make it one.
+        let mut total = 0;
+        for row in &p.rows {
+            total += self.update(request.metadata(), &p.sql, row).await?;
+        }
+        Ok(total)
     }
 
     async fn get_flight_info_sql_info(
@@ -665,17 +729,39 @@ impl FlightSqlService for Gateway {
         info(&schema, query, request.into_inner())
     }
 
-    /// ponytail: `include_schema` gets empty table schemas; plan each
-    /// table's `LIMIT 0` if a client needs them from here.
+    /// With `include_schema`, each table's columns come from one
+    /// `information_schema.columns` read, as the caller sees them (ADR
+    /// 0129).
     async fn do_get_tables(
         &self,
         query: CommandGetTables,
         request: Request<Ticket>,
     ) -> Result<Response<DataStream>, Status> {
+        let md = request.metadata();
+        let columns = if query.include_schema {
+            self.columns(md).await?
+        } else {
+            Default::default()
+        };
         let mut b = query.into_builder();
         let empty = Schema::empty();
-        for [catalog, schema, table, kind] in self.tables(request.metadata()).await? {
-            b.append(catalog, schema, table, kind, &empty)
+        for [catalog, schema, table, kind] in self.tables(md).await? {
+            let key = (catalog.clone(), schema.clone(), table.clone());
+            let planned;
+            let fields = match columns.get(&key).map(|c| fields(c)) {
+                Some(Some(f)) => {
+                    planned = f;
+                    &planned
+                }
+                // A type that does not read back: plan the table instead.
+                Some(None) => {
+                    let sql = format!("SELECT * FROM \"{catalog}\".\"{schema}\".\"{table}\"");
+                    planned = self.schema(md, &sql, &[]).await?.as_ref().clone();
+                    &planned
+                }
+                None => &empty,
+            };
+            b.append(catalog, schema, table, kind, fields)
                 .map_err(Status::from)?;
         }
         one(b.build())
@@ -959,6 +1045,19 @@ mod tests {
         let one =
             RecordBatch::try_from_iter([("0", Arc::new(I64::from(vec![1])) as ArrayRef)]).unwrap();
         two.set_parameters(one).unwrap();
+        // A batch of rows is JDBC's executeBatch: one run per row, counts
+        // summed; a query takes one row only.
+        let mut batch = client.prepare("SELECT ? + 1".into(), None).await.unwrap();
+        let rows =
+            RecordBatch::try_from_iter([("0", Arc::new(I64::from(vec![1, 2, 3])) as ArrayRef)])
+                .unwrap();
+        batch.set_parameters(rows.clone()).unwrap();
+        assert_eq!(batch.execute_update().await.unwrap(), 2 + 3 + 4);
+        batch.set_parameters(rows).unwrap();
+        assert_eq!(
+            code(batch.execute().await.unwrap_err()),
+            tonic::Code::InvalidArgument
+        );
         let info = two.execute().await.unwrap();
         assert_eq!(
             code(fetch(&mut client, info).await.unwrap_err()),
@@ -1001,6 +1100,32 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(tables.value(0), "trips");
+
+        // With their columns, as `information_schema` types them.
+        let info = client
+            .get_tables(CommandGetTables {
+                table_name_filter_pattern: Some("trips".into()),
+                include_schema: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let batches = fetch(&mut client, info).await.unwrap();
+        let ipc = batches[0]
+            .column_by_name("table_schema")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<plimsoll_core::datafusion::arrow::array::BinaryArray>()
+            .unwrap()
+            .value(0)
+            .to_vec();
+        let schema = Schema::try_from(IpcMessage(ipc.into())).unwrap();
+        let described: Vec<String> = schema
+            .fields()
+            .iter()
+            .map(|f| format!("{}:{}", f.name(), f.data_type()))
+            .collect();
+        assert_eq!(described, ["column1:Int64", "column2:Utf8"]);
 
         let info = client.get_catalogs().await.unwrap();
         let catalogs = fetch(&mut client, info).await.unwrap();

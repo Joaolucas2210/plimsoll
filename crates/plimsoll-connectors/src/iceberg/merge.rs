@@ -197,7 +197,9 @@ impl ExecutionPlan for IcebergMergeExec {
         );
         let run = async move {
             let changed = match remote {
-                Some(remote) => run_remote(&sink, &remote, source, &merge, &context).await?,
+                Some(remote) => {
+                    run_remote(&sink, &targets, &remote, source, &merge, &context).await?
+                }
                 None => run(&sink, &targets, source, &merge, &context).await?,
             };
             Ok(RecordBatch::try_new(
@@ -352,6 +354,18 @@ async fn run(
     let source = concat_batches(&source_schema, &batches)?;
     drop(batches);
     memory.try_grow(source.get_array_memory_size())?;
+    local(sink, targets, source, merge, context, memory).await
+}
+
+/// The three steps here, over a collected source.
+async fn local(
+    sink: &IcebergSink,
+    targets: &[Target],
+    source: RecordBatch,
+    merge: &Merge,
+    context: &Arc<TaskContext>,
+    memory: datafusion::execution::memory_pool::MemoryReservation,
+) -> Result<u64> {
     let index = Index::new(merge, source)?;
     let mut probed = probe(sink, targets, &index, merge, context).await?;
     probed.changed += not_matched(
@@ -377,6 +391,7 @@ async fn run(
 /// commits as one `overwrite`.
 async fn run_remote(
     sink: &IcebergSink,
+    targets: &[Target],
     remote: &RemoteScanExec,
     source: Arc<dyn ExecutionPlan>,
     merge: &Merge,
@@ -396,6 +411,13 @@ async fn run_remote(
             datafusion::arrow::ipc::writer::StreamWriter::try_new(&mut ipc, &source_schema)?;
         writer.write(&source)?;
         writer.finish()?;
+    }
+    // Attached to every fragment: never more than a broadcast build side
+    // (ADR 0099), which is also what workers read (ADR 0128). A larger
+    // source merges here (ADR 0130).
+    if ipc.len() > remote.broadcast_limit() {
+        drop(ipc);
+        return local(sink, targets, source, merge, context, memory).await;
     }
     memory.try_grow(ipc.len())?;
     let ipc = bytes::Bytes::from(ipc);
