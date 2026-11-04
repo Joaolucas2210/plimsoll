@@ -122,8 +122,8 @@ them, see [ADR 0126](docs/adr/0126-tpch-benchmark.md),
 [ADR 0128](docs/adr/0128-tpch-on-a-cluster.md) and `scripts/tpch_bench.py`.
 
 Releases: `ghcr.io/joaolucas2210/plimsoll:<tag>` and checksummed Linux
-binaries on GitHub releases, from `v*` tags; see [CHANGELOG.md](CHANGELOG.md)
-(ADR 0125).
+binaries on GitHub releases, from `v*` tags, signed with Sigstore (keyless)
+and with an SBOM; see [CHANGELOG.md](CHANGELOG.md) (ADR 0125, 0131).
 
 ## Running
 
@@ -289,7 +289,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 ## Decision records
 
 Index with status, date and the one-line decision of every ADR:
-[docs/adr/README.md](docs/adr/README.md) (0001–0130; template in
+[docs/adr/README.md](docs/adr/README.md) (0001–0131; template in
 [docs/adr/0000-template.md](docs/adr/0000-template.md)).
 
 Roadmap: [ROADMAP.md](ROADMAP.md).

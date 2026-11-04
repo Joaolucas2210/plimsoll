@@ -10,6 +10,7 @@ on:
 permissions:
   contents: write # the GitHub release
   packages: write # the image on ghcr.io
+  id-token: write # keyless signatures (ADR 0131)
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,6 +30,8 @@ jobs:
           grep -qx "version = \"$version\"" Cargo.toml || { echo "Cargo.toml is not $version" >&2; exit 1; }
           awk -v v="$version" '$0 ~ "^## \\[" v "\\]" {f=1; next} /^## \[/ {f=0} f' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
           test -s "$RUNNER_TEMP/notes.md" || { echo "CHANGELOG.md has no [$version] section" >&2; exit 1; }
+          # Registries take lowercase names only (the owner has capitals).
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
       # One build: the image packs the binary built here, so the release
       # asset and the image are the same bytes.
@@ -39,24 +42,38 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: build and push the image
+        id: image
         uses: docker/build-push-action@v6
         with:
+          # SBOM and build provenance attached to the image (ADR 0131).
+          sbom: true
+          provenance: mode=max
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ghcr.io/${{ github.repository }}:latest
+            ${{ env.IMAGE }}:${{ github.ref_name }}
+            ${{ env.IMAGE }}:latest
           labels: org.opencontainers.image.version=${{ github.ref_name }}
 
       - name: binary from the image
         run: |
-          image="ghcr.io/${{ github.repository }}:${GITHUB_REF_NAME}"
+          image="$IMAGE:${GITHUB_REF_NAME}"
           name="plimsoll-server-${GITHUB_REF_NAME}-x86_64-linux-gnu"
           id=$(docker create "$image")
           docker cp "$id:/usr/local/bin/plimsoll-server" plimsoll-server
           docker rm "$id"
           tar czf "$name.tar.gz" plimsoll-server LICENSE README.md
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      # Keyless: the signature names this workflow and tag, logged in
+      # Sigstore's transparency log; no key to keep (ADR 0131).
+      - uses: sigstore/cosign-installer@v3
+      - name: sign the image and the archive
+        run: |
+          cosign sign --yes "$IMAGE@${{ steps.image.outputs.digest }}"
+          for f in plimsoll-server-*.tar.gz; do
+            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
+          done
 
       - name: GitHub release
         env:

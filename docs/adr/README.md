@@ -138,6 +138,7 @@ are allowed in place.
 | [0128](0128-tpch-on-a-cluster.md) | TPC-H on a cluster, and the three bugs it found | Accepted | 2026-11-04 | Cluster recipe over the quickstart (load into Iceberg, 22/22); environment tables create their schema; `/v1/fragment` reads its body after auth up to the broadcast limit; a shuffle's release held by its plan and its streams | 0066, 0073, 0099, 0123, 0126 |
 | [0129](0129-flight-sql-table-schemas-and-batches.md) | Flight SQL table schemas and batched updates | Accepted | 2026-11-04 | `include_schema` from one `information_schema.columns` read (types parsed back, planned when not); several parameter rows kept in the handle, run once per row for updates and summed, refused for queries | 0124, 0127 |
 | [0130](0130-merge-sources-over-the-broadcast-limit.md) | MERGE sources over the broadcast limit merge on the coordinator | Accepted | 2026-11-04 | The encoded source is checked against `PLIMSOLL_BROADCAST_MAX_BYTES` before it is attached; over it, the collected source merges here through the shared local steps | 0094, 0099, 0128 |
+| [0131](0131-signed-releases.md) | Signed releases, with SBOM and provenance | Accepted | 2026-11-04 | cosign keyless (GitHub OIDC) signs the image digest and each archive (bundle on the release); BuildKit SBOM and provenance; image name lowercased | 0011, 0125 |
 
 ## Reading order
 
@@ -147,7 +148,7 @@ are allowed in place.
 - Federation: 0005 → 0006.
 - Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074 → 0091 → 0092 → 0093 → 0094 → 0097 → 0098 → 0099 → 0101 → 0102 → 0111 → 0112 → 0115 → 0116 → 0117 → 0128.
 - Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084 → 0085 → 0086 → 0087 → 0088 → 0089 → 0090 → 0091 → 0092 → 0093 → 0094 → 0095 → 0096 → 0122 → 0130.
-- Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057 → 0100 → 0118 → 0119 → 0120 → 0121 → 0123 → 0124 → 0125 → 0126 → 0127 → 0129.
+- Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057 → 0100 → 0118 → 0119 → 0120 → 0121 → 0123 → 0124 → 0125 → 0126 → 0127 → 0129 → 0131.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046 → 0103 → 0104 → 0105 → 0106 → 0107 → 0108 → 0109 → 0110.
 
 ## Conventions

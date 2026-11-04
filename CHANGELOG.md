@@ -48,8 +48,8 @@ that fails the query, never the node.
   batched updates and column listings (ADR 0124, 0127, 0129).
 - Structured query logs, OTLP traces and metrics, `/metrics`,
   `system.runtime.queries` (ADR 0027, 0031, 0046, 0057, 0100, 0118–0121).
-- Container image and a Compose quickstart (ADR 0123); releases from a
-  tag (ADR 0125).
+- Container image and a Compose quickstart (ADR 0123); signed releases
+  from a tag, with SBOM and provenance (ADR 0125, 0131).
 - A reproducible TPC-H benchmark with checked answers: SF10 in 32 s on
   one node under a 4 GiB ceiling, and all 22 queries correct on a
   cluster over Iceberg (ADR 0126, 0128).
