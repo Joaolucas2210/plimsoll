@@ -28,7 +28,7 @@ use futures::{StreamExt, TryStreamExt};
 use plimsoll_core::memory::AccountedExec;
 
 use super::write::{IcebergSink, Written};
-use crate::remote::{RemoteReduceExec, RemoteScanExec, WriteTo};
+use crate::remote::{RemoteBroadcastExec, RemoteReduceExec, RemoteScanExec, WriteTo};
 
 /// The writing fragments or reduces, and the commit of what they wrote.
 #[derive(Debug)]
@@ -130,6 +130,10 @@ pub(super) fn distribute(
                 .map(|&i| names.get(i).cloned())
                 .collect::<Option<Vec<_>>>()?;
             Arc::new(scan.writing(to(None), columns)?)
+        } else if let Some(join) = input.as_ref().downcast_ref::<RemoteBroadcastExec>() {
+            // Joined against a broadcast build side (ADR 0122): each probe
+            // fragment writes the rows it joined.
+            Arc::new(join.writing(to(Some(picks))))
         } else {
             let reduce = input.as_ref().downcast_ref::<RemoteReduceExec>()?;
             Arc::new(reduce.writing(to(Some(picks))))

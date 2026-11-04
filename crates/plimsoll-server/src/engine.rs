@@ -1234,6 +1234,27 @@ impl QueryEngine for CoreEngine {
         // target table here; the files written go back, one JSON per row,
         // for the coordinator to commit.
         if let Some(target) = &f.write {
+            // Joined rows (ADR 0122) are written in the table's order, as
+            // the coordinator picked them; a scan's columns already are.
+            let df = match &target.picks {
+                Some(picks) => {
+                    let columns = df.schema().columns();
+                    let picked = picks
+                        .iter()
+                        .map(|&i| {
+                            columns
+                                .get(i)
+                                .cloned()
+                                .map(plimsoll_core::datafusion::prelude::Expr::Column)
+                        })
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| {
+                            EngineError::InvalidQuery("a picked column is out of range".into())
+                        })?;
+                    df.select(picked).map_err(fail)?
+                }
+                None => df,
+            };
             return write_rows(&ctx, df, target).await;
         }
         match f.bucket {

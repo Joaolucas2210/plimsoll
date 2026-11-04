@@ -1435,6 +1435,9 @@ pub struct RemoteBroadcastExec {
     /// The build side as IPC, and its memory, shared by all partitions;
     /// or the local join, when it was too large to send.
     shipped: Arc<tokio::sync::OnceCell<Result<Built, String>>>,
+    /// The joined rows written as data files of this table, where they
+    /// are joined (ADR 0122): the files written come back, one JSON each.
+    write: Option<WriteTo>,
 }
 
 /// A collected build side: sent to the workers, or too large and joined
@@ -1485,8 +1488,41 @@ impl RemoteBroadcastExec {
             join_type,
             join,
             shipped: Arc::default(),
+            write: None,
         }
     }
+
+    /// The same join, each probe fragment writing its joined rows as data
+    /// files of `target` (columns picked in the table's order) and
+    /// returning the files written (ADR 0122).
+    pub(crate) fn writing(&self, target: WriteTo) -> Self {
+        let mut probe = self.probe.with_schema(written_schema());
+        for a in &mut probe.fragments {
+            a.fragment.write = Some(target.clone());
+        }
+        Self {
+            build: self.build.clone(),
+            probe: Arc::new(probe),
+            join_type: self.join_type.clone(),
+            join: self.join.clone(),
+            shipped: Arc::default(),
+            write: Some(target),
+        }
+    }
+}
+
+/// `stream` with only the columns at `picks`, in that order (ADR 0092,
+/// 0122); all of them without.
+fn picked(
+    stream: SendableRecordBatchStream,
+    picks: Option<&[usize]>,
+) -> Result<SendableRecordBatchStream> {
+    let Some(picks) = picks.map(<[usize]>::to_vec) else {
+        return Ok(stream);
+    };
+    let schema = Arc::new(stream.schema().project(&picks)?);
+    let batches = stream.map(move |b| b.and_then(|b| Ok(b.project(&picks)?)));
+    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
 }
 
 impl DisplayAs for RemoteBroadcastExec {
@@ -1540,12 +1576,15 @@ impl ExecutionPlan for RemoteBroadcastExec {
                 "broadcast join needs its build side".into(),
             ));
         };
-        Ok(Arc::new(Self::new(
-            build,
-            self.probe.clone(),
-            self.join_type.clone(),
-            self.join.clone(),
-        )))
+        Ok(Arc::new(Self {
+            write: self.write.clone(),
+            ..Self::new(
+                build,
+                self.probe.clone(),
+                self.join_type.clone(),
+                self.join.clone(),
+            )
+        }))
     }
 
     fn execute(
@@ -1560,6 +1599,7 @@ impl ExecutionPlan for RemoteBroadcastExec {
             self.probe.clone(),
             self.join.clone(),
         );
+        let write = self.write.clone();
         let limit = self.probe.workers.broadcast_limit;
         // Cached build sides (ADR 0116), keyed by what they read.
         let cache = self.probe.workers.builds.clone();
@@ -1618,8 +1658,36 @@ impl ExecutionPlan for RemoteBroadcastExec {
                 .map_err(|e| DataFusionError::External(e.into()))?;
             Ok::<_, DataFusionError>(match built {
                 Built::Shipped { bytes, .. } => probe.fragment_stream(partition, tag, Some(bytes)),
-                // The local join, whole, as the first partition.
-                Built::Local(local) if partition == 0 => local.execute(0, task)?.boxed(),
+                // The local join, whole, as the first partition; when the
+                // rows were to be written where joined (ADR 0122), they are
+                // written here, and the files written go back as the
+                // workers' would.
+                Built::Local(local) if partition == 0 => match &write {
+                    None => local.execute(0, task)?.boxed(),
+                    Some(target) => {
+                        let rows =
+                            picked(local.execute(0, task.clone())?, target.picks.as_deref())?;
+                        let state = datafusion::execution::SessionStateBuilder::new()
+                            .with_config(task.session_config().clone())
+                            .with_runtime_env(task.runtime_env())
+                            .build();
+                        let files = crate::IcebergConnector::write_files(
+                            &target.metadata_location,
+                            target.metadata.as_ref(),
+                            rows,
+                            &state,
+                        )
+                        .await
+                        .map_err(DataFusionError::from)?;
+                        let batch = RecordBatch::try_new(
+                            written_schema(),
+                            vec![Arc::new(datafusion::arrow::array::StringArray::from(
+                                files.iter().map(|f| f.to_string()).collect::<Vec<_>>(),
+                            ))],
+                        )?;
+                        stream::iter([Ok(batch)]).boxed()
+                    }
+                },
                 Built::Local(_) => stream::empty().boxed(),
             })
         })

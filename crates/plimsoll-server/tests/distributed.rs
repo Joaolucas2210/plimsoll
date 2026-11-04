@@ -1140,6 +1140,66 @@ async fn writes_on_workers_through_the_rest_catalog() {
         text(&insert).await.contains("| 28    |"),
         "values 194..200 of each of the 4 inserts"
     );
+    // A broadcast join's probe fragments write the rows they join (ADR
+    // 0122), the build side sent with each.
+    {
+        let state = coordinator.context().state_ref();
+        let mut state = state.write();
+        let optimizer = &mut state.config_mut().options_mut().optimizer;
+        optimizer.hash_join_single_partition_threshold = 1 << 20;
+        optimizer.hash_join_single_partition_threshold_rows = 128 * 1024;
+    }
+    let broadcast = format!(
+        "INSERT INTO {dst} SELECT a.region, a.id, b.v FROM {src} a \
+         JOIN (SELECT id, v FROM {src} WHERE id < 1010) b ON a.id = b.id"
+    );
+    let plan = text(&format!("EXPLAIN {broadcast}")).await;
+    assert!(plan.contains("source=RemoteBroadcastExec"), "{plan}");
+    let before = text(&format!("SELECT count(*) AS n FROM {dst} WHERE id < 1010")).await;
+    assert!(
+        text(&broadcast).await.contains("| 9     |"),
+        "ids 1001..1009"
+    );
+    // Over the broadcast limit (ADR 0099), the join runs here, and so does
+    // the write: same rows, one commit.
+    let capped = Engine::new(
+        Arc::new(CeilingPool::new(256 << 20, 8 << 20).unwrap()),
+        None,
+    )
+    .unwrap();
+    plimsoll_server::lakehouse::register(capped.context(), catalog.clone())
+        .await
+        .unwrap();
+    coordinate(
+        &capped,
+        Workers::new(vec![worker().await, worker().await], TOKEN.into())
+            .unwrap()
+            .with_broadcast_limit(1),
+    );
+    {
+        let state = capped.context().state_ref();
+        let mut state = state.write();
+        let optimizer = &mut state.config_mut().options_mut().optimizer;
+        optimizer.hash_join_single_partition_threshold = 1 << 20;
+        optimizer.hash_join_single_partition_threshold_rows = 128 * 1024;
+    }
+    let out = pretty_format_batches(&capped.sql(&broadcast).await.unwrap().batches)
+        .unwrap()
+        .to_string();
+    assert!(out.contains("| 9     |"), "{out}");
+    let after = text(&format!(
+        "SELECT count(*) AS n, count(DISTINCT id) AS d FROM {dst} WHERE id < 1010"
+    ))
+    .await;
+    let had: usize = before
+        .lines()
+        .nth(3)
+        .and_then(|l| l.trim_matches(|c| c == '|' || c == ' ').parse().ok())
+        .unwrap_or_default();
+    assert!(
+        after.contains(&format!("| {} ", had + 18)) && after.contains("| 9 "),
+        "{before}{after}"
+    );
     // CTAS (ADR 0092): a scan's and an aggregate's rows written into the
     // staged table on the workers, one create commit each.
     let (c1, c2) = (format!("{src}_c1"), format!("{src}_c2"));
