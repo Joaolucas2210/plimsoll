@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] A batched `INSERT … VALUES` over Flight SQL as one statement and one commit (ADR 0133)
 - [x] arm64 releases: cross-compiled on the x86_64 runner, a multi-platform image packed from the release binaries, a `workflow_dispatch` dry run (ADR 0132)
 - [x] Signed releases: cosign keyless signatures of image and archives, SBOM and provenance on the image; lowercase image name (ADR 0131)
 - [x] `MERGE` sources above the broadcast limit merge on the coordinator instead of failing on workers' body limit (ADR 0130)
@@ -205,7 +206,7 @@ correctness.
 
 **Security and operations**
 - Benchmarks: SF10+ on separate hosts (ADR 0128); full result
-  comparison (ADR 0126). Releases: an arm64 smoke run (ADR 0132). Flight SQL: a parameter schema (ADR 0127), batches as one
-  commit (ADR 0129), `DoPut` ingestion, certificate reload (ADR 0124).
+  comparison (ADR 0126). Releases: an arm64 smoke run (ADR 0132). Flight SQL: a parameter schema (ADR 0127), `DoPut` ingestion
+  for bulk loads (ADR 0133), `DoPut` ingestion, certificate reload (ADR 0124).
 - Shuffle map spans (ADR 0120); per-kind fragment latencies (ADR
   0119); failed fragments' spill on the coordinator (ADR 0121).

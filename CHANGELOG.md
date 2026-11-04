@@ -45,7 +45,8 @@ that fails the query, never the node.
 - HTTP API: JSON, streamed NDJSON and Arrow results, bound parameters
   (ADR 0035, 0037, 0043).
 - Arrow Flight SQL for ADBC, JDBC and BI tools, with bound parameters,
-  batched updates and column listings (ADR 0124, 0127, 0129).
+  batched updates (inserts in one commit) and column listings (ADR 0124,
+  0127, 0129, 0133).
 - Structured query logs, OTLP traces and metrics, `/metrics`,
   `system.runtime.queries` (ADR 0027, 0031, 0046, 0057, 0100, 0118–0121).
 - Container image and a Compose quickstart (ADR 0123); signed releases

@@ -432,6 +432,56 @@ fn bound(batches: &[RecordBatch]) -> Result<Vec<Vec<Value>>, Status> {
     Ok(rows)
 }
 
+/// `INSERT INTO t [(cols)] VALUES (<one row>)` bound with `rows`, as one
+/// statement: the row repeated once per parameter row, its placeholders
+/// renumbered after the rows before it, and the parameters flattened in
+/// the same order. `None` for any other statement (ADR 0133).
+fn batched_insert(sql: &str, rows: &[Vec<Value>]) -> Option<(String, Vec<Value>)> {
+    use plimsoll_core::datafusion::sql::sqlparser::ast::{
+        Expr, SetExpr, Statement, Value as Literal, visit_expressions_mut,
+    };
+    use plimsoll_core::datafusion::sql::sqlparser::dialect::GenericDialect;
+    use plimsoll_core::datafusion::sql::sqlparser::parser::Parser;
+    let width = rows.first()?.len();
+    if width == 0 || rows.iter().any(|r| r.len() != width) {
+        return None;
+    }
+    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+    let [Statement::Insert(insert)] = statements.as_mut_slice() else {
+        return None;
+    };
+    let SetExpr::Values(values) = insert.source.as_mut()?.body.as_mut() else {
+        return None;
+    };
+    let [template] = values.rows.as_slice() else {
+        return None;
+    };
+    let template = template.clone();
+    let mut repeated = Vec::with_capacity(rows.len());
+    for i in 0..rows.len() {
+        let mut row = template.clone();
+        let mut bad = false;
+        let _ = visit_expressions_mut(&mut row, |e| {
+            if let Expr::Value(v) = e
+                && let Literal::Placeholder(p) = &mut v.value
+            {
+                match p.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) {
+                    Some(n) if (1..=width).contains(&n) => *p = format!("${}", i * width + n),
+                    _ => bad = true,
+                }
+            }
+            std::ops::ControlFlow::<()>::Continue(())
+        });
+        if bad {
+            return None;
+        }
+        repeated.push(row);
+    }
+    values.rows = repeated;
+    let sql = statements.first()?.to_string();
+    Some((sql, rows.iter().flatten().cloned().collect()))
+}
+
 /// Columns as `information_schema.columns` lists them, as Arrow fields;
 /// `None` when a type does not read back (the table is then planned).
 fn fields(columns: &[(String, String, bool)]) -> Option<Schema> {
@@ -645,8 +695,13 @@ impl FlightSqlService for Gateway {
         if p.rows.is_empty() {
             return self.update(request.metadata(), &p.sql, &p.params).await;
         }
-        // ponytail: one statement per row, in order, each its own commit
-        // (no transactions); a `VALUES` join would make it one.
+        // An `INSERT … VALUES` of one row: every row in one statement, so
+        // one commit (ADR 0133).
+        if let Some((sql, params)) = batched_insert(&p.sql, &p.rows) {
+            return self.update(request.metadata(), &sql, &params).await;
+        }
+        // Anything else, one statement per row, in order, each its own
+        // commit (no transactions).
         let mut total = 0;
         for row in &p.rows {
             total += self.update(request.metadata(), &p.sql, row).await?;
@@ -852,7 +907,11 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         let auth = Auth::from_lookup(
-            &|k| (k == "PLIMSOLL_AUTH_TOKENS").then(|| format!("ana:sha256:{hex}")),
+            &|k| match k {
+                "PLIMSOLL_AUTH_TOKENS" => Some(format!("ana:sha256:{hex}")),
+                "PLIMSOLL_AUTH_WRITE_GRANTS" => Some("ana=public".into()),
+                _ => None,
+            },
             &|g| g == "default",
         )
         .unwrap();
@@ -866,9 +925,11 @@ mod tests {
             per_user: limits,
             groups: Default::default(),
         };
+        let registry = Arc::new(QueryRegistry::new(100));
+        crate::system::register(engine.context(), registry.clone(), None).unwrap();
         let st = Arc::new(AppState {
             engine: Arc::new(crate::engine::CoreEngine(engine)),
-            admission: Admission::new(cfg, Arc::new(QueryRegistry::new(100))),
+            admission: Admission::new(cfg, registry),
             pool_stats: Arc::new(PoolStats::default),
             query_timeout: Duration::from_secs(10),
             ready: AtomicBool::new(true),
@@ -988,6 +1049,32 @@ mod tests {
     }
 
     #[test]
+    fn a_batched_insert_is_one_statement() {
+        let rows = vec![vec![json!(1), json!("x")], vec![json!(2), json!("y")]];
+        let (sql, params) =
+            batched_insert("INSERT INTO t (a, b, c) VALUES ($1, 'k', $2 || '!')", &rows).unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO t (a, b, c) VALUES ($1, 'k', $2 || '!'), ($3, 'k', $4 || '!')"
+        );
+        assert_eq!(params, [json!(1), json!("x"), json!(2), json!("y")]);
+        // Anything else runs row by row.
+        for other in [
+            "UPDATE t SET a = $1 WHERE b = $2",
+            "INSERT INTO t VALUES ($1, $2), ($1, $2)",
+            "INSERT INTO t SELECT $1, $2",
+            "INSERT INTO t VALUES ($1, $3)",
+            "not sql",
+        ] {
+            assert_eq!(batched_insert(other, &rows), None, "{other}");
+        }
+        assert_eq!(
+            batched_insert("INSERT INTO t VALUES ($1)", &[vec![json!(1)], vec![]]),
+            None
+        );
+    }
+
+    #[test]
     fn question_marks_are_numbered_outside_literals_and_comments() {
         assert_eq!(
             numbered("SELECT * FROM t WHERE a = ? AND b IN (?, ?)"),
@@ -1057,6 +1144,53 @@ mod tests {
         assert_eq!(
             code(batch.execute().await.unwrap_err()),
             tonic::Code::InvalidArgument
+        );
+        // A batched insert is one query: one commit, one entry.
+        let queries = async |client: &mut FlightSqlServiceClient<Channel>| {
+            let info = client
+                .execute(
+                    "SELECT count(*) AS n FROM system.runtime.queries WHERE sql LIKE 'INSERT%'"
+                        .into(),
+                    None,
+                )
+                .await
+                .unwrap();
+            let b = fetch(client, info).await.unwrap();
+            b[0].column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        let before = queries(&mut client).await;
+        let mut insert = client
+            .prepare("INSERT INTO trips VALUES (?, ?)".into(), None)
+            .await
+            .unwrap();
+        let three = RecordBatch::try_from_iter([
+            ("0", Arc::new(I64::from(vec![3, 4, 5])) as ArrayRef),
+            (
+                "1",
+                Arc::new(StringArray::from(vec!["faro", "braga", "evora"])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        insert.set_parameters(three).unwrap();
+        assert_eq!(insert.execute_update().await.unwrap(), 3);
+        // Three rows, one statement.
+        assert_eq!(queries(&mut client).await, before + 1);
+        let info = client
+            .execute("SELECT count(*) AS n FROM trips".into(), None)
+            .await
+            .unwrap();
+        let n = fetch(&mut client, info).await.unwrap();
+        assert_eq!(
+            n[0].column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            5
         );
         let info = two.execute().await.unwrap();
         assert_eq!(

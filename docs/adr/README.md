@@ -140,6 +140,7 @@ are allowed in place.
 | [0130](0130-merge-sources-over-the-broadcast-limit.md) | MERGE sources over the broadcast limit merge on the coordinator | Accepted | 2026-11-04 | The encoded source is checked against `PLIMSOLL_BROADCAST_MAX_BYTES` before it is attached; over it, the collected source merges here through the shared local steps | 0094, 0099, 0128 |
 | [0131](0131-signed-releases.md) | Signed releases, with SBOM and provenance | Accepted | 2026-11-04 | cosign keyless (GitHub OIDC) signs the image digest and each archive (bundle on the release); BuildKit SBOM and provenance; image name lowercased | 0011, 0125 |
 | [0132](0132-arm64-releases.md) | arm64 releases, cross-compiled | Accepted | 2026-11-04 | `gcc-aarch64-linux-gnu` on the x86_64 runner, one native-speed build per target; `Dockerfile.release` packs `dist/$TARGETARCH` for amd64+arm64 (QEMU runs only apt-get); `workflow_dispatch` dry run without publishing | 0011, 0123, 0125, 0131 |
+| [0133](0133-batched-inserts-as-one-statement.md) | Batched inserts as one statement | Accepted | 2026-11-04 | A batched `INSERT … VALUES` of one row is parsed and its row repeated per parameter row, placeholders renumbered and parameters flattened: one query, one commit; other batches stay row by row | 0043, 0076, 0127, 0129 |
 
 ## Reading order
 
@@ -148,7 +149,7 @@ are allowed in place.
 - Lakehouse path: 0007 → 0008 → 0009 → 0010 → 0014 → 0016 → 0017 → 0028 → 0029 → 0030 → 0032 → 0039 → 0040 → 0041 → 0042 → 0113 → 0114.
 - Federation: 0005 → 0006.
 - Distribution: 0002 → 0058 → 0059 → 0060 → 0061 → 0062 → 0063 → 0064 → 0065 → 0066 → 0067 → 0068 → 0069 → 0070 → 0071 → 0072 → 0073 → 0074 → 0091 → 0092 → 0093 → 0094 → 0097 → 0098 → 0099 → 0101 → 0102 → 0111 → 0112 → 0115 → 0116 → 0117 → 0128.
-- Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084 → 0085 → 0086 → 0087 → 0088 → 0089 → 0090 → 0091 → 0092 → 0093 → 0094 → 0095 → 0096 → 0122 → 0130.
+- Writes: 0024 → 0075 → 0076 → 0077 → 0078 → 0079 → 0080 → 0081 → 0082 → 0083 → 0084 → 0085 → 0086 → 0087 → 0088 → 0089 → 0090 → 0091 → 0092 → 0093 → 0094 → 0095 → 0096 → 0122 → 0130 → 0133.
 - Observability: 0013 → 0019 → 0027 → 0031 → 0046 → 0056 → 0057 → 0100 → 0118 → 0119 → 0120 → 0121 → 0123 → 0124 → 0125 → 0126 → 0127 → 0129 → 0131 → 0132.
 - Governance: 0021 → 0022 → 0023 → 0024 → 0025 → 0044 → 0045 → 0046 → 0103 → 0104 → 0105 → 0106 → 0107 → 0108 → 0109 → 0110.
 
