@@ -49,6 +49,8 @@ that fails the query, never the node.
   `system.runtime.queries` (ADR 0027, 0031, 0046, 0057, 0100, 0118–0121).
 - Container image and a Compose quickstart (ADR 0123); releases from a
   tag (ADR 0125).
+- A reproducible TPC-H benchmark with checked answers: SF10 in 32 s on
+  one node under a 4 GiB ceiling (ADR 0126).
 
 [Unreleased]: https://github.com/Joaolucas2210/plimsoll/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/Joaolucas2210/plimsoll/releases/tag/v0.1.0

@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] TPC-H benchmark: generator and oracle from DuckDB, 22/22 checked, SF1 2.4 s and SF10 32 s on one node under 4 GiB (ADR 0126)
 - [x] Releases from a `v*` tag: version and changelog checked, image on ghcr.io, checksummed binary, GitHub release (ADR 0125)
 - [x] Arrow Flight SQL front door: statements, prepared statements, catalog listings, handshake with the HTTP API's tokens, run through `/v1/sql` (ADR 0124)
 - [x] Container image (one for every role) and a Compose quickstart: REST catalog, coordinator, two workers (ADR 0123)
@@ -158,9 +159,9 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Published benchmark** — TPC-H at a fixed scale on one node and on a
-coordinator with workers, numbers and the script to reproduce them in
-the repository (the MVP's last item).
+**Bound parameters in Flight SQL prepared statements** — JDBC's `?`
+and ADBC's bind: the parameter batch becomes the statement's `params`
+(ADR 0043, 0124).
 
 ## Missing
 
@@ -195,7 +196,8 @@ the repository (the MVP's last item).
 - Spilling hash-join build sides (DataFusion upstream, ADR 0068).
 
 **Security and operations**
-- MVP release: a published benchmark (above); arm64 images and signed
+- Benchmarks: TPC-H on a cluster over Iceberg; full result comparison
+  (ADR 0126). Releases: arm64 images and signed
   releases (ADR 0125). Flight SQL: bound parameters, `include_schema` table
   listings, `DoPut` ingestion, certificate reload (ADR 0124).
 - Shuffle map spans (ADR 0120); per-kind fragment latencies (ADR

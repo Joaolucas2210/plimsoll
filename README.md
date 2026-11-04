@@ -115,6 +115,10 @@ print(cur.fetch_arrow_table())
 The same image runs any role; in production, point it at S3 (`AWS_*`)
 and a real catalog (`PLIMSOLL_CATALOG_*`), with TLS.
 
+TPC-H on one node under a 4 GiB ceiling: all 22 queries correct, SF10 in
+32 s total on a 12-thread laptop. To reproduce it, see
+[ADR 0126](docs/adr/0126-tpch-benchmark.md) and `scripts/tpch_bench.py`.
+
 Releases: `ghcr.io/joaolucas2210/plimsoll:<tag>` and checksummed Linux
 binaries on GitHub releases, from `v*` tags; see [CHANGELOG.md](CHANGELOG.md)
 (ADR 0125).
@@ -283,7 +287,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 ## Decision records
 
 Index with status, date and the one-line decision of every ADR:
-[docs/adr/README.md](docs/adr/README.md) (0001–0125; template in
+[docs/adr/README.md](docs/adr/README.md) (0001–0126; template in
 [docs/adr/0000-template.md](docs/adr/0000-template.md)).
 
 Roadmap: [ROADMAP.md](ROADMAP.md).
