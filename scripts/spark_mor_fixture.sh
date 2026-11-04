@@ -49,7 +49,10 @@ try {
     "ALTER TABLE local.db.mor CREATE BRANCH audit",
     "INSERT INTO local.db.mor.branch_audit VALUES (1000, 'audit', timestamp '2024-01-03 00:00:00')",
     "DELETE FROM local.db.mor WHERE id % 3 = 0",
-    "UPDATE local.db.mor SET name = 'updated' WHERE id = 1"
+    "UPDATE local.db.mor SET name = 'updated' WHERE id = 1",
+    // Distinct counts (ADR 0114): theta sketches in a Puffin statistics
+    // file, their estimates in the table metadata.
+    "CALL local.system.compute_table_stats(table => 'db.mor')"
   ).foreach(spark.sql)
 
   // Equality deletes (ADR 0016), as Flink upserts write them: keyed on

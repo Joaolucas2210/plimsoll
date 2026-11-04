@@ -330,6 +330,46 @@ async fn iceberg_scans_are_pinned_to_their_snapshot() {
     assert!(key.ends_with("t@1#0"), "{key:?}");
 }
 
+/// Distinct counts from a statistics file's metadata (ADR 0114) size joins
+/// on repeated keys, which DataFusion otherwise takes as unique. Only the
+/// metadata's `ndv` is read: no Puffin file needs to exist.
+#[tokio::test]
+async fn distinct_counts_size_joins_on_repeated_keys() {
+    use datafusion::common::stats::Precision;
+    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+    let dir = tmp("ndv");
+    table(&dir, Deletes::None, false);
+    let estimate = async || {
+        let ctx = SessionContext::new();
+        register(&ctx, &dir).await.unwrap();
+        let plan = ctx
+            .sql("SELECT a.id FROM t a JOIN t b ON a.city = b.city")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        StatisticsContext::new()
+            .compute(plan.as_ref(), &StatisticsArgs::new())
+            .unwrap()
+            .num_rows
+    };
+    // Three rows; a string key has no range to bound its distinct values.
+    assert_eq!(estimate().await, Precision::Inexact(3));
+    let path = dir.join("metadata/v10.metadata.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    meta["statistics"] = json!([{
+        "snapshot-id": 1, "statistics-path": "file:///nowhere.puffin",
+        "file-size-in-bytes": 1, "file-footer-size-in-bytes": 1,
+        "blob-metadata": [{"type": "apache-datasketches-theta-v1", "snapshot-id": 1,
+            "sequence-number": 1, "fields": [2], "properties": {"ndv": "1"}}],
+    }]);
+    std::fs::write(&path, meta.to_string()).unwrap();
+    // One city: every row meets every row.
+    assert_eq!(estimate().await, Precision::Inexact(9));
+}
+
 /// `count(*)` from manifest record counts (ADR 0054): no data file is
 /// read when no delete applies; with deletes or filters the scan stays.
 #[tokio::test]
@@ -1001,6 +1041,32 @@ async fn reads_a_spark_merge_on_read_table() {
             "{:?}",
             stats.column_statistics[1]
         );
+        // Distinct counts from the table's statistics file (ADR 0114),
+        // which the fixture computes (`compute_table_stats`), and the live
+        // rows (position deletes subtracted): self-joins on either column
+        // are estimated at the 32 rows they return.
+        assert!(
+            matches!(id.distinct_count, Precision::Inexact(32)),
+            "{:?}",
+            id.distinct_count
+        );
+        assert_eq!(stats.num_rows, Precision::Inexact(32));
+        for key in ["id", "name"] {
+            let join = ctx
+                .sql(&format!(
+                    "SELECT a.id FROM mor a JOIN mor b ON a.{key} = b.{key}"
+                ))
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+            let joined = StatisticsContext::new()
+                .compute(join.as_ref(), &StatisticsArgs::new())
+                .unwrap()
+                .num_rows;
+            assert_eq!(joined, Precision::Inexact(32), "{key}");
+        }
         // Filters the scan applies itself are estimated from the bounds
         // (ADR 0113): ids below 5 are a small share of [1, 47+].
         let filtered = ctx

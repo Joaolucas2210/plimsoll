@@ -496,6 +496,9 @@ struct IcebergTable {
     names: Arc<HashMap<i64, String>>,
     /// Some column was renamed or re-added in the table's history.
     renamed: bool,
+    /// Column name -> distinct values, from the statistics files of the
+    /// pinned snapshot or its nearest ancestor that has some (ADR 0114).
+    distinct: Arc<HashMap<String, u64>>,
     /// Nested columns with every nested field's id (ADR 0088).
     nested_ids: Arc<HashMap<String, datafusion::arrow::datatypes::FieldRef>>,
     /// `schema.name-mapping.default`, for files without field ids (ADR 0042).
@@ -787,6 +790,12 @@ impl IcebergTable {
             columns,
             specs,
             unpartitioned,
+            distinct: Arc::new(
+                distinct_counts(meta, snapshot_id)
+                    .into_iter()
+                    .filter_map(|(id, n)| Some((names.get(&id)?.clone(), n)))
+                    .collect(),
+            ),
             names,
             renamed,
             nested_ids,
@@ -1714,10 +1723,16 @@ impl TableProvider for IcebergTable {
         // Otherwise the manifests' record counts are an upper bound (rows
         // may be deleted or filtered): inexact, but enough for DataFusion
         // to pick the smaller join side and collect small ones (ADR 0066).
+        // Position deletes are already row selections: their files count
+        // their live rows (ADR 0114), so the count matches distinct counts,
+        // which are taken over live rows.
         let rows = exact_rows.map(Precision::Exact).or_else(|| {
             files
                 .iter()
-                .map(|f| f.rows)
+                .map(|f| match &f.selection {
+                    Some(s) => u64::try_from(s.row_count()).ok(),
+                    None => f.rows,
+                })
                 .sum::<Option<u64>>()
                 .and_then(|n| usize::try_from(n).ok())
                 .map(Precision::Inexact)
@@ -1738,6 +1753,12 @@ impl TableProvider for IcebergTable {
                 .and_then(|(id, _)| stats_columns.get(id))
             {
                 *c = b.statistics(field.data_type());
+            }
+            // Distinct values (ADR 0114): DataFusion sizes joins from them.
+            if let Some(&n) = self.distinct.get(field.name()) {
+                if let Ok(n) = usize::try_from(n) {
+                    c.distinct_count = Precision::Inexact(n);
+                }
             }
         }
         // The filters this scan applies itself (exact pushdown, ADR 0055,
@@ -2485,6 +2506,45 @@ fn avro_entries<'a>(
 }
 
 /// Iceberg `map<int, binary>` (Avro array of `{key, value}` records), e.g.
+/// Per field id, the distinct-value estimates (`ndv`) a table's statistics
+/// files record (ADR 0114), read from the metadata's `statistics` list
+/// alone: the Puffin files hold the sketches, the metadata their
+/// estimates. The pinned snapshot's, else its nearest ancestor's (stats
+/// are often computed after some commits): estimates either way.
+fn distinct_counts(meta: &Json, snapshot: Option<i64>) -> HashMap<i64, u64> {
+    let parents: HashMap<i64, Option<i64>> = meta["snapshots"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| Some((s["snapshot-id"].as_i64()?, s["parent-snapshot-id"].as_i64())))
+        .collect();
+    let statistics = meta["statistics"].as_array().map_or(&[][..], Vec::as_slice);
+    let mut at = snapshot;
+    // Bounded by the snapshot count, should parents loop.
+    for _ in 0..=parents.len() {
+        let Some(id) = at else { break };
+        if let Some(file) = statistics
+            .iter()
+            .find(|f| f["snapshot-id"].as_i64() == Some(id))
+        {
+            return file["blob-metadata"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|b| {
+                    let [field] = b["fields"].as_array()?.as_slice() else {
+                        return None;
+                    };
+                    let ndv = b["properties"]["ndv"].as_str()?.parse().ok()?;
+                    Some((field.as_i64()?, ndv))
+                })
+                .collect();
+        }
+        at = parents.get(&id).copied().flatten();
+    }
+    HashMap::new()
+}
+
 /// `lower_bounds`. Missing or malformed -> empty (no pruning).
 fn bound_map(file: &Avro, name: &str) -> HashMap<i64, Vec<u8>> {
     let Some(Avro::Array(items)) = field(file, name) else {
@@ -2563,4 +2623,41 @@ fn invalid(path: &str, e: impl ToString) -> ConnectorError {
 
 fn unsupported(path: &str, what: String) -> ConnectorError {
     ConnectorError::Unsupported(format!("iceberg {what} ({path})"))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distinct_counts_come_from_the_nearest_statistics() {
+        let blob = |field: i64, ndv: &str| {
+            serde_json::json!({"type": "apache-datasketches-theta-v1", "snapshot-id": 1,
+                "sequence-number": 1, "fields": [field], "properties": {"ndv": ndv}})
+        };
+        let meta = serde_json::json!({
+            "snapshots": [
+                {"snapshot-id": 1},
+                {"snapshot-id": 2, "parent-snapshot-id": 1},
+                {"snapshot-id": 3, "parent-snapshot-id": 2},
+                {"snapshot-id": 9},
+            ],
+            "statistics": [{
+                "snapshot-id": 2, "statistics-path": "s3://b/t/stats.puffin",
+                "file-size-in-bytes": 1, "file-footer-size-in-bytes": 1,
+                "blob-metadata": [blob(1, "32"), blob(2, "not a number"),
+                    {"type": "x", "fields": [3, 4], "properties": {"ndv": "5"}}],
+            }],
+        });
+        // Its own snapshot's, and an ancestor's for a later snapshot.
+        for at in [2, 3] {
+            assert_eq!(distinct_counts(&meta, Some(at)), HashMap::from([(1, 32)]));
+        }
+        // Not for an earlier snapshot, another branch, or no snapshot.
+        for at in [Some(1), Some(9), None] {
+            assert!(distinct_counts(&meta, at).is_empty(), "{at:?}");
+        }
+        assert!(distinct_counts(&serde_json::json!({}), Some(1)).is_empty());
+    }
 }
