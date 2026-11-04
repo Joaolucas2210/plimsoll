@@ -1,0 +1,80 @@
+# Quickstart (ADR 0123): an Iceberg REST catalog over a local warehouse
+# volume, one coordinator and two workers. Local use only: plain HTTP.
+#   export PLIMSOLL_AUTH_TOKENS=... PLIMSOLL_WORKER_TOKEN=...  (see README)
+#   docker compose up -d --build
+
+x-plimsoll: &plimsoll
+  build: .
+  image: plimsoll:local
+  volumes: [warehouse:/warehouse]
+  environment: &env
+    PLIMSOLL_AUTH_TOKENS: ${PLIMSOLL_AUTH_TOKENS:?set PLIMSOLL_AUTH_TOKENS}
+    PLIMSOLL_WORKER_TOKEN: ${PLIMSOLL_WORKER_TOKEN:?set PLIMSOLL_WORKER_TOKEN}
+    PLIMSOLL_CATALOG_URI: http://catalog:8181
+    PLIMSOLL_AUTH_WRITE_GRANTS: ana=bronze|silver|gold
+    PLIMSOLL_AUTH_DROP_GRANTS: ana=bronze|silver|gold
+    PLIMSOLL_SPILL_DIR: /tmp
+  healthcheck:
+    # No curl in the image: bash's /dev/tcp.
+    test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /readyz HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q ' 200 ' <&3"]
+    interval: 2s
+    retries: 30
+
+services:
+  # The catalog and the nodes share one uid on the warehouse volume.
+  warehouse:
+    image: apache/iceberg-rest-fixture:1.9.2
+    user: root
+    entrypoint: ["chown", "1000:1000", "/warehouse"]
+    volumes: [warehouse:/warehouse]
+
+  catalog:
+    image: apache/iceberg-rest-fixture:1.9.2
+    depends_on:
+      warehouse: { condition: service_completed_successfully }
+    environment:
+      CATALOG_WAREHOUSE: file:///warehouse
+      CATALOG_URI: jdbc:sqlite:file:/warehouse/catalog.db
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+      CATALOG_JDBC_USER: user
+      CATALOG_JDBC_PASSWORD: password
+    volumes: [warehouse:/warehouse]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8181/v1/config"]
+      interval: 2s
+      retries: 30
+
+  # Medallion namespaces; already there on a restart.
+  namespaces:
+    image: apache/iceberg-rest-fixture:1.9.2
+    depends_on:
+      catalog: { condition: service_healthy }
+    entrypoint:
+      - sh
+      - -c
+      - |
+        for ns in bronze silver gold; do
+          curl -s -o /dev/null -XPOST http://catalog:8181/v1/namespaces \
+            -H 'content-type: application/json' -d "{\"namespace\": [\"$$ns\"]}"
+          curl -sf -o /dev/null http://catalog:8181/v1/namespaces/$$ns || exit 1
+        done
+
+  worker-1: &worker
+    <<: *plimsoll
+    depends_on:
+      namespaces: { condition: service_completed_successfully }
+
+  worker-2: *worker
+
+  coordinator:
+    <<: *plimsoll
+    depends_on:
+      worker-1: { condition: service_healthy }
+      worker-2: { condition: service_healthy }
+    environment:
+      <<: *env
+      PLIMSOLL_WORKERS: http://worker-1:8080,http://worker-2:8080
+    ports: ["127.0.0.1:8080:8080"]
+
+volumes:
+  warehouse:

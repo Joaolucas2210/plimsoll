@@ -77,9 +77,33 @@ per layer (e.g. read-only `bronze` for analysts) build on it later.
 | `plimsoll-control` | control | Iceberg REST catalog client, governance (registry, admission, time limits), `system.runtime.queries` schema. No DataFusion. |
 | `plimsoll-server` | edge | HTTP binary: health, metrics, `POST /v1/sql`. |
 
+## Quickstart
+
+Docker with Compose v2. An Iceberg REST catalog, one coordinator and two
+workers, all on a local warehouse volume (ADR 0123):
+
+```bash
+TOKEN=$(openssl rand -hex 32)
+export PLIMSOLL_AUTH_TOKENS="ana:sha256:$(printf %s "$TOKEN" | sha256sum | cut -d' ' -f1)"
+export PLIMSOLL_WORKER_TOKEN=$(openssl rand -hex 16)
+docker compose up -d --build --wait   # first build: ~10 min
+
+sql() { curl -s localhost:8080/v1/sql -H 'content-type: application/json' \
+             -H "authorization: Bearer $TOKEN" -d "{\"sql\": \"$1\"}"; echo; }
+sql "CREATE TABLE bronze.trips (id BIGINT, city VARCHAR, fare DOUBLE)"
+sql "INSERT INTO bronze.trips VALUES (1, 'lisbon', 12.5), (2, 'porto', 8.0), (3, 'lisbon', 20.0)"
+sql "SELECT city, count(*) AS trips, sum(fare) AS fares FROM bronze.trips GROUP BY city"
+
+docker compose down -v   # -v also drops the warehouse
+```
+
+`ana` may create, write and drop tables in `bronze`, `silver` and `gold`.
+The same image runs any role; in production, point it at S3 (`AWS_*`)
+and a real catalog (`PLIMSOLL_CATALOG_*`), with TLS.
+
 ## Running
 
-Requires a stable Rust toolchain (edition 2024, rust ≥ 1.85).
+Requires a stable Rust toolchain (edition 2024, rust ≥ 1.94).
 
 ```bash
 # Tokens are configured as SHA-256 digests; the server never sees them raw.
@@ -240,7 +264,7 @@ scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
 ## Decision records
 
 Index with status, date and the one-line decision of every ADR:
-[docs/adr/README.md](docs/adr/README.md) (0001–0122; template in
+[docs/adr/README.md](docs/adr/README.md) (0001–0123; template in
 [docs/adr/0000-template.md](docs/adr/0000-template.md)).
 
 Roadmap: [ROADMAP.md](ROADMAP.md).

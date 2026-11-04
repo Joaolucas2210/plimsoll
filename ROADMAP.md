@@ -48,6 +48,7 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 - [x] Expose `system.runtime.queries` as a DataFusion table (server)
 - [x] Metrics: pool used/limit, spill bytes, running/queued, totals by state
 - [x] Concurrent manifest / delete-file / DV fetches during planning (`meta_fetch_concurrency`), 4.3× faster planning at 50 ms/GET (ADR 0020)
+- [x] Container image (one for every role) and a Compose quickstart: REST catalog, coordinator, two workers (ADR 0123)
 - [x] Broadcast-join rows written on the workers (`INSERT … SELECT`, CTAS), the coordinator writing them only over the broadcast limit (ADR 0122)
 - [x] Workers' spill on the coordinator: fragments end their stream with a spill trailer when asked, maps credit theirs once, reduces pass their maps' on (ADR 0121)
 - [x] Shuffle map runs logged with their query (`shuffle_map`, `shuffle_spill`), and map operators' spill counted in the node's total (ADR 0120)
@@ -155,14 +156,14 @@ Each phase ends with `scripts/gates.sh` green and the invariant intact:
 
 ## Next obvious PR
 
-**Shuffled MERGE** — a `MERGE` whose source is larger than a node is
-shuffled with the target's files by the merge keys, instead of being
-collected and attached to every fragment (ADR 0094).
+**Flight SQL endpoint** — a standard client protocol, so JDBC/ADBC
+drivers and BI tools connect without the HTTP API (MVP, after the
+container image and quickstart of ADR 0123).
 
 ## Missing
 
 **Lakehouse writes**
-- A shuffled `MERGE` (above), and a spilled source; gathered joins'
+- A shuffled `MERGE` for sources larger than a node, and a spilled source; gathered joins'
   rows written on workers (ADR 0122).
 - Several deletion vectors per Puffin file; v3 compaction of files with
   equality deletes; decimal partition values; vectorized partition
@@ -192,5 +193,7 @@ collected and attached to every fragment (ADR 0094).
 - Spilling hash-join build sides (DataFusion upstream, ADR 0068).
 
 **Security and operations**
+- MVP release: Flight SQL (above), a release job (tag, binaries, the
+  image on a registry), a changelog, a published benchmark.
 - Shuffle map spans (ADR 0120); per-kind fragment latencies (ADR
   0119); failed fragments' spill on the coordinator (ADR 0121).
