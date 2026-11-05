@@ -8,12 +8,12 @@ variables; each such change is listed here. Decisions are in
 
 ## [Unreleased]
 
+## [0.2.0]
+
 ### Added
 - A web console at `/ui` on every node: catalog tree with columns,
   SQL editor, results grid, cancel; signs in with a token and goes
   through `/v1/sql` (ADR 0135).
-- Flight SQL batched inserts as one statement and one commit (ADR 0133).
-- A build cache for releases (ADR 0134).
 
 ### Changed
 - The quickstart pulls the released image, building it only when it
@@ -67,5 +67,6 @@ that fails the query, never the node.
   one node under a 4 GiB ceiling, and all 22 queries correct on a
   cluster over Iceberg (ADR 0126, 0128).
 
-[Unreleased]: https://github.com/Joaolucas2210/plimsoll/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Joaolucas2210/plimsoll/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Joaolucas2210/plimsoll/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Joaolucas2210/plimsoll/releases/tag/v0.1.0
