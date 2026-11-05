@@ -42,6 +42,15 @@ The name is the load line on a ship's hull: cargo past the line is refused, and 
 
 `make demo` starts one local node with a 64 MiB ceiling, one running slot, no queue and a 2 s deadline, then overloads it on purpose. No Docker, no catalog, no data: every query reads DataFusion's `range()` function. It needs `cargo`, `curl` and `python3`; the first run builds the server in debug (about a minute).
 
+<p align="center">
+  <img src="docs/assets/plimsoll-demo.gif" alt="Terminal recording of make demo on one local node: a count over 10 million rows returns 200; a GROUP BY over 5 million keys crosses the 64 MiB ceiling and gets 422 memory_limit_exceeded while the node stays ready with the pool back at 0 bytes; a second query gets 429 queue_full; a 10 billion row scan gets 504 query_timeout; the next query returns 200" width="900">
+  <br>
+  <sub>Real output of <code>scripts/demo.sh</code>, paced for reading; regenerate with <code>python3 docs/assets/make-demo-gif.py</code>.</sub>
+</p>
+
+<details>
+<summary>The same run as text</summary>
+
 ```text
 node on http://127.0.0.1:46883 · ceiling 64 MiB · 1 running slot, no queue · 2 s deadline
 
@@ -56,7 +65,9 @@ node on http://127.0.0.1:46883 · ceiling 64 MiB · 1 running slot, no queue · 
 demo passed
 ```
 
-Every line is asserted, not just printed: the script exits non-zero if a status, an error code, readiness or the pool's return to 0 bytes differs. CI runs it on every push ([`scripts/demo.sh`](scripts/demo.sh)).
+</details>
+
+Every line is asserted, not just printed: the script exits non-zero if a status, an error code, readiness or the pool's return to 0 bytes differs. CI runs it on every code change ([`scripts/demo.sh`](scripts/demo.sh)).
 
 ## Quickstart
 

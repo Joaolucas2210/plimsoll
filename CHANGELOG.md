@@ -8,6 +8,10 @@ variables; each such change is listed here. Decisions are in
 
 ## [Unreleased]
 
+### Added
+- A demo GIF in the README (`docs/assets/plimsoll-demo.gif`), rendered from a real `scripts/demo.sh` run by
+  `docs/assets/make-demo-gif.py`; the text output stays in a collapsible block.
+
 ### Security
 - Ready to open the repository (ADR 0136): CI runs with read-only credentials, every action is pinned to a commit
   SHA, gitleaks scans the full history on every push and pull request, and `SECURITY.md` defines the private
