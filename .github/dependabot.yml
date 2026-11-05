@@ -1,0 +1,22 @@
+# Weekly, grouped, few open PRs (ADR 0011: CI minutes are a budget). Actions are pinned by SHA (ADR 0136);
+# Dependabot keeps the pins and their version comments current. DataFusion majors are planned upgrades
+# (rust-version moves with them, ADR 0001), so cargo majors arrive as their own PRs.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule: {interval: weekly}
+    open-pull-requests-limit: 3
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: weekly}
+    open-pull-requests-limit: 3
+    groups:
+      actions: {patterns: ["*"]}
+  - package-ecosystem: docker
+    directory: /
+    schedule: {interval: weekly}
+    open-pull-requests-limit: 2

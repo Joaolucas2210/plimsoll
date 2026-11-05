@@ -136,6 +136,6 @@ cargo run -p plimsoll-server   # with PLIMSOLL_AUTH_TOKENS set, or PLIMSOLL_AUTH
 
 Configuration is environment-only, and invalid values abort startup: [every variable, the SQL API and table maintenance](docs/reference.md). Besides the gates and the demo, CI runs live tests against Postgres, S3 (SeaweedFS) and an Iceberg REST catalog, plus a weekly interoperability run against tables written by Spark and Iceberg Java.
 
-Each decision has an ADR with its context, options, consequences and accepted debt — [0001 to 0135](docs/adr/README.md), with a suggested reading order. Releases come from `v*` tags: [CHANGELOG](CHANGELOG.md).
+Each decision has an ADR with its context, options, consequences and accepted debt — [0001 to 0136](docs/adr/README.md), with a suggested reading order. Releases come from `v*` tags: [CHANGELOG](CHANGELOG.md).
 
-Licensed under [Apache-2.0](LICENSE).
+Contributions: [CONTRIBUTING](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md). Vulnerabilities go through the private route in [SECURITY](SECURITY.md), never a public issue. Licensed under [Apache-2.0](LICENSE).

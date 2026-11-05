@@ -143,6 +143,7 @@ are allowed in place.
 | [0133](0133-batched-inserts-as-one-statement.md) | Batched inserts as one statement | Accepted | 2026-11-04 | A batched `INSERT … VALUES` of one row is parsed and its row repeated per parameter row, placeholders renumbered and parameters flattened: one query, one commit; other batches stay row by row | 0043, 0076, 0127, 0129 |
 | [0134](0134-release-build-cache.md) | A build cache for releases | Accepted | 2026-11-04 | `Swatinem/rust-cache` in the release job (`shared-key: release`), saved only from `main` (the dry run) since tags read the default branch's caches but not each other's | 0011, 0125, 0132 |
 | [0135](0135-web-console.md) | A web console in the server | Accepted | 2026-11-04 | Three static files compiled in, at `/ui`: token sign-in, `information_schema` tree, SQL over NDJSON stopping at 1,000 rows, cancel; strict CSP, text-only rendering; quickstart pulls the released image, builds as fallback | 0021, 0034, 0035, 0043, 0123 |
+| [0136](0136-public-repository.md) | Opening the repository: branch rules, required checks, pinned actions | Accepted | 2026-11-05 | Read-only CI for fork PRs; SHA-pinned actions; `main` ruleset (PR, squash, linear, checks `gates + live integration` and `secret scan`) with a `changes` job so docs-only PRs pass; `v*` tags admin-only | 0011, 0125, 0131 |
 
 ## Reading order
 

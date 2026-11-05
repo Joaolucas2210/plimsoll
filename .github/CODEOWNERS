@@ -1,0 +1,8 @@
+# Every change is reviewed by the maintainer. The invariant (memory, admission), governance and CI get explicit
+# lines on purpose, so a future second owner can be added where it matters most.
+*                                   @Joaolucas2210
+/crates/plimsoll-core/src/memory/   @Joaolucas2210
+/crates/plimsoll-control/           @Joaolucas2210
+/crates/plimsoll-server/src/auth*   @Joaolucas2210
+/.github/                           @Joaolucas2210
+/docs/adr/                          @Joaolucas2210

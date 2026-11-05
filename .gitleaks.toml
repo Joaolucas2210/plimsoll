@@ -1,0 +1,12 @@
+# gitleaks: the default rules, plus one allowlisted test literal. Nothing else is allowlisted.
+# The value below is a fixture in crates/plimsoll-server/src/flight.rs, inside #[cfg(test)]
+# (basic_credentials_with_or_without_padding): 64 hex characters chosen so that "ana:" + token needs base64
+# padding. It authenticates nothing anywhere; the generic-api-key rule matches it because of the name "token".
+title = "Plimsoll gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Flight SQL basic-credentials padding test fixture"
+regexes = ['''^ee07b204ff0db13ee312a85922f1d1ee8dcfa26b827ca7f20c936aac92635ba9$''']

@@ -136,6 +136,6 @@ cargo run -p plimsoll-server   # com PLIMSOLL_AUTH_TOKENS definido, ou PLIMSOLL_
 
 A configuração é só por variáveis de ambiente, e valores inválidos abortam a inicialização: [todas as variáveis, a API SQL e a manutenção de tabelas](docs/reference.md) (em inglês). Além dos gates e da demo, o CI roda testes reais contra Postgres, S3 (SeaweedFS) e um catálogo Iceberg REST, e uma execução semanal de interoperabilidade contra tabelas escritas pelo Spark e pelo Iceberg Java.
 
-Cada decisão tem um ADR com contexto, opções, consequências e débito aceito — [0001 a 0135](docs/adr/README.md), com uma ordem de leitura sugerida. Os releases saem de tags `v*`: [CHANGELOG](CHANGELOG.md).
+Cada decisão tem um ADR com contexto, opções, consequências e débito aceito — [0001 a 0136](docs/adr/README.md), com uma ordem de leitura sugerida. Os releases saem de tags `v*`: [CHANGELOG](CHANGELOG.md).
 
-Licenciado sob [Apache-2.0](LICENSE).
+Contribuições: [CONTRIBUTING](CONTRIBUTING.pt-BR.md) e o [Código de Conduta](CODE_OF_CONDUCT.pt-BR.md). Vulnerabilidades seguem o caminho privado do [SECURITY](SECURITY.pt-BR.md), nunca uma issue pública. Licenciado sob [Apache-2.0](LICENSE).
