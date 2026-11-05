@@ -42,6 +42,15 @@ O nome vem da linha de carga no casco de um navio: carga acima da linha é recus
 
 `make demo` sobe um nó local com teto de 64 MiB, uma vaga de execução, sem fila e deadline de 2 s, e o sobrecarrega de propósito. Sem Docker, sem catálogo, sem dados: toda query lê a função `range()` do DataFusion. Precisa de `cargo`, `curl` e `python3`; a primeira execução compila o servidor em debug (cerca de um minuto).
 
+<p align="center">
+  <img src="docs/assets/plimsoll-demo.gif" alt="Gravação de terminal do make demo num nó local: uma contagem de 10 milhões de linhas responde 200; um GROUP BY com 5 milhões de chaves cruza o teto de 64 MiB e recebe 422 memory_limit_exceeded, enquanto o nó continua pronto e o pool volta a 0 bytes; uma segunda query recebe 429 queue_full; um scan de 10 bilhões de linhas recebe 504 query_timeout; a query seguinte responde 200" width="900">
+  <br>
+  <sub>Saída real do <code>scripts/demo.sh</code>, em ritmo de leitura; para regenerar: <code>python3 docs/assets/make-demo-gif.py</code>.</sub>
+</p>
+
+<details>
+<summary>A mesma execução em texto</summary>
+
 ```text
 node on http://127.0.0.1:46883 · ceiling 64 MiB · 1 running slot, no queue · 2 s deadline
 
@@ -56,7 +65,9 @@ node on http://127.0.0.1:46883 · ceiling 64 MiB · 1 running slot, no queue · 
 demo passed
 ```
 
-Cada linha é verificada, não só impressa: o script sai com erro se um status, um código de erro, a prontidão ou a volta do pool a 0 bytes não baterem. O CI roda a demo a cada push ([`scripts/demo.sh`](scripts/demo.sh)).
+</details>
+
+Cada linha é verificada, não só impressa: o script sai com erro se um status, um código de erro, a prontidão ou a volta do pool a 0 bytes não baterem. O CI roda a demo a cada mudança de código ([`scripts/demo.sh`](scripts/demo.sh)).
 
 ## Início rápido
 
