@@ -19,6 +19,12 @@
   <sub>experimental <code>0.x</code>, construído para aprender — veja o <a href="CHANGELOG.md">CHANGELOG</a></sub>
 </p>
 
+<p align="center">
+  <a href="https://github.com/Joaolucas2210/plimsoll/actions/workflows/ci.yml"><img src="https://github.com/Joaolucas2210/plimsoll/actions/workflows/ci.yml/badge.svg?branch=main&event=push" alt="Status do workflow de CI na main"></a>
+  <a href="https://github.com/Joaolucas2210/plimsoll/releases"><img src="https://img.shields.io/github/v/release/Joaolucas2210/plimsoll" alt="Último release no GitHub"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-0E1A2B" alt="Licença Apache-2.0"></a>
+</p>
+
 Um motor de consultas que fica sem memória costuma derrubar todas as outras queries junto. O Plimsoll trata sobrecarga como **um resultado por query**: um teto de memória para o processo inteiro, limites de admissão e um deadline transformam uma query descontrolada em um erro tipado (`422`, `429`, `504`) enquanto o nó continua atendendo. Em volta dessa regra, ele implementa o núcleo de uma plataforma lakehouse — leitura e escrita Iceberg por catálogos REST, governança, execução distribuída — só com formatos abertos.
 
 O nome vem da linha de carga no casco de um navio: carga acima da linha é recusada, e o navio zarpa.
@@ -71,7 +77,7 @@ sql "SELECT city, count(*) AS trips, sum(fare) AS fares FROM bronze.trips GROUP 
 make down                 # docker compose down -v: também apaga o warehouse
 ```
 
-A imagem `ghcr.io/joaolucas2210/plimsoll` é privada: depois de `docker login ghcr.io` com um token `read:packages`, ela é baixada; sem login, o Compose a compila localmente (cerca de 10 minutos). Os tokens são configurados como digests SHA-256, então o servidor nunca os guarda em claro ([ADR 0021](docs/adr/0021-bearer-token-authentication.md)).
+O Compose baixa a imagem pública e assinada `ghcr.io/joaolucas2210/plimsoll` (`latest`, ou um release como `v0.2.0` com `PLIMSOLL_VERSION=v0.2.0`); `docker compose build` a compila a partir deste checkout (cerca de 10 minutos). Os tokens são configurados como digests SHA-256, então o servidor nunca os guarda em claro ([ADR 0021](docs/adr/0021-bearer-token-authentication.md)).
 
 - **Console web:** http://localhost:8080, com login por `$TOKEN`: árvore do catálogo, editor SQL (Ctrl+Enter), resultados, cancelamento ([ADR 0135](docs/adr/0135-web-console.md)).
 - **Arrow Flight SQL** na porta 32010, usuário `ana`, senha `$TOKEN`: ADBC, o driver JDBC do Flight SQL, DBeaver ([ADR 0124](docs/adr/0124-flight-sql.md)).

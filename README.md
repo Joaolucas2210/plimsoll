@@ -19,6 +19,12 @@
   <sub>experimental <code>0.x</code>, build-to-learn — see <a href="CHANGELOG.md">CHANGELOG</a></sub>
 </p>
 
+<p align="center">
+  <a href="https://github.com/Joaolucas2210/plimsoll/actions/workflows/ci.yml"><img src="https://github.com/Joaolucas2210/plimsoll/actions/workflows/ci.yml/badge.svg?branch=main&event=push" alt="CI workflow status on main"></a>
+  <a href="https://github.com/Joaolucas2210/plimsoll/releases"><img src="https://img.shields.io/github/v/release/Joaolucas2210/plimsoll" alt="Latest GitHub release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-0E1A2B" alt="Apache-2.0 license"></a>
+</p>
+
 A query engine that runs out of memory usually takes every other query down with it. Plimsoll treats overload as **a per-query outcome**: one process-wide memory ceiling, admission limits and one deadline turn a runaway query into a typed error (`422`, `429`, `504`) while the node keeps serving. Around that rule it implements the core of a lakehouse platform — Iceberg reads and writes through REST catalogs, governance, distributed execution — on open formats only.
 
 The name is the load line on a ship's hull: cargo past the line is refused, and the ship sails.
@@ -71,7 +77,7 @@ sql "SELECT city, count(*) AS trips, sum(fare) AS fares FROM bronze.trips GROUP 
 make down                 # docker compose down -v: also drops the warehouse
 ```
 
-The image `ghcr.io/joaolucas2210/plimsoll` is private: after `docker login ghcr.io` with a `read:packages` token it is pulled; without a login, Compose builds it locally (about 10 minutes). Tokens are configured as SHA-256 digests, so the server never stores them raw ([ADR 0021](docs/adr/0021-bearer-token-authentication.md)).
+Compose pulls the public, signed image `ghcr.io/joaolucas2210/plimsoll` (`latest`, or a release such as `v0.2.0` with `PLIMSOLL_VERSION=v0.2.0`); `docker compose build` builds it from this checkout instead (about 10 minutes). Tokens are configured as SHA-256 digests, so the server never stores them raw ([ADR 0021](docs/adr/0021-bearer-token-authentication.md)).
 
 - **Web console:** http://localhost:8080, signed in with `$TOKEN`: catalog tree, SQL editor (Ctrl+Enter), results, cancel ([ADR 0135](docs/adr/0135-web-console.md)).
 - **Arrow Flight SQL** on port 32010, user `ana`, password `$TOKEN`: ADBC, the Flight SQL JDBC driver, DBeaver ([ADR 0124](docs/adr/0124-flight-sql.md)).
