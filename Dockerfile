@@ -1,5 +1,5 @@
 # One image for every role: coordinator, worker, or both (ADR 0123).
-FROM rust:1.94-bookworm AS build
+FROM rust:1.98-bookworm AS build
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
