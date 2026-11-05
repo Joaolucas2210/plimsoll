@@ -1,0 +1,19 @@
+name: Feature or change
+description: A capability, an endpoint, a SQL shape or a setting. Larger changes need an ADR.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What you are trying to do and what stops you today. Link the ROADMAP item if there is one.
+    validations: {required: true}
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: The smallest change that solves it, and how it stays under the memory ceiling and the grants.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

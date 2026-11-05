@@ -8,6 +8,12 @@ variables; each such change is listed here. Decisions are in
 
 ## [Unreleased]
 
+### Security
+- Ready to open the repository (ADR 0136): CI runs with read-only credentials, every action is pinned to a commit
+  SHA, gitleaks scans the full history on every push and pull request, and `SECURITY.md` defines the private
+  reporting route. `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, CODEOWNERS, issue and PR templates and Dependabot
+  are added.
+
 ### Added
 - `make demo` (`scripts/demo.sh`): one local node, no Docker, overloaded on purpose — a query over the memory
   ceiling fails alone (422), a second query is rejected (429), a scan past its deadline is cancelled (504), and

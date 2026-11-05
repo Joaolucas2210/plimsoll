@@ -1,13 +1,17 @@
 name: ci
 
-# ADR 0011: one job, one build, one cache. Docs-only changes don't run CI.
+# ADR 0011: one job, one build, one cache. Docs-only pushes don't run CI.
+# ADR 0136: on pull requests the workflow always runs, because `gates + live integration` is a required
+# check on main; for a docs-only change the heavy job is skipped, which GitHub counts as passing.
 on:
   push:
     branches: [main]
     paths-ignore: ["**/*.md", "docs/**", "LICENSE"]
   pull_request:
-    paths-ignore: ["**/*.md", "docs/**", "LICENSE"]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -21,8 +25,49 @@ env:
   CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT" != pull_request ]; then echo code=true >> "$GITHUB_OUTPUT"; exit 0; fi
+          if git diff --name-only "$BASE" HEAD | grep -qvE '\.md$|^docs/|^LICENSE$'; then
+            echo code=true >> "$GITHUB_OUTPUT"
+          else
+            echo "docs-only change: the gates job is skipped"; echo code=false >> "$GITHUB_OUTPUT"
+          fi
+
+  secret-scan:
+    # gitleaks over the full history with .gitleaks.toml (one allowlisted test literal); image pinned by digest.
+    name: secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: gitleaks (redacted)
+        run: >-
+          docker run --rm -v "$PWD:/repo"
+          zricethezav/gitleaks:v8.18.4@sha256:75bdb2b2f4db213cde0b8295f13a88d6b333091bbfbf3012a4e083d00d31caba
+          detect --source /repo --config /repo/.gitleaks.toml --log-opts=--all --redact --no-banner
+
   ci:
     name: gates + live integration
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     services:
@@ -36,7 +81,9 @@ jobs:
           --health-cmd pg_isready --health-interval 5s
           --health-timeout 5s --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       # Started first so the JVM and S3 warm up while Rust compiles.
       - name: start S3 (SeaweedFS) and Iceberg REST catalog
@@ -62,15 +109,16 @@ jobs:
             -e CATALOG_S3_ENDPOINT=http://s3:8333 -e CATALOG_S3_PATH__STYLE__ACCESS=true \
             apache/iceberg-rest-fixture
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: plimsoll
           # PRs restore main's cache but never write their own.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           enable-cache: true
 
