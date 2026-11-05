@@ -35,7 +35,7 @@ rustls-pki-types = { version = "1", features = ["std"] }
 arrow-flight = { version = "59.3.2", default-features = false, features = ["flight-sql"] }
 tonic = { version = "0.14", default-features = false, features = ["server", "router", "tls-ring"] }
 prost = "0.14"
-base64 = "0.22"
+base64 = "0.23"
 tower = { version = "0.5", default-features = false, features = ["util"] }
 
 [dev-dependencies]
