@@ -2,8 +2,8 @@
 # volume, one coordinator and two workers. Local use only: plain HTTP.
 #   export PLIMSOLL_AUTH_TOKENS=... PLIMSOLL_WORKER_TOKEN=...  (see README)
 #   docker compose up -d --wait
-# The released image is pulled (`docker login ghcr.io` first, the package
-# is private); without it, or with `--build`, it is built here (ADR 0135).
+# The released image is pulled (public, signed; PLIMSOLL_VERSION=v0.2.0 pins a
+# release); with `--build`, or if the pull fails, it is built here (ADR 0135).
 
 x-plimsoll: &plimsoll
   image: ghcr.io/joaolucas2210/plimsoll:${PLIMSOLL_VERSION:-latest}
