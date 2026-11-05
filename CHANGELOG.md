@@ -8,6 +8,17 @@ variables; each such change is listed here. Decisions are in
 
 ## [Unreleased]
 
+### Added
+- `make demo` (`scripts/demo.sh`): one local node, no Docker, overloaded on purpose — a query over the memory
+  ceiling fails alone (422), a second query is rejected (429), a scan past its deadline is cancelled (504), and
+  the pool returns to 0 bytes while the node keeps serving. Every step is asserted; CI runs it on every push.
+- A `Makefile` with the entry points (`help`, `demo`, `gates`, `test`, `build`, `up`, `down`).
+- `README.pt-BR.md`, the Plimsoll mark and a diagram of where overload becomes a typed error.
+
+### Changed
+- The README leads with what Plimsoll is and is not, the demo, the quickstart and the architecture; the
+  environment variables, SQL API, maintenance endpoints and probes moved verbatim to `docs/reference.md`.
+
 ## [0.2.0]
 
 ### Added
