@@ -1,6 +1,5 @@
 # Weekly, grouped, few open PRs (ADR 0011: CI minutes are a budget). Actions are pinned by SHA (ADR 0136);
-# Dependabot keeps the pins and their version comments current. DataFusion majors are planned upgrades
-# (rust-version moves with them, ADR 0001), so cargo majors arrive as their own PRs.
+# Dependabot keeps the pins and their version comments current.
 version: 2
 updates:
   - package-ecosystem: cargo
@@ -10,12 +9,31 @@ updates:
     groups:
       cargo-minor-patch:
         update-types: [minor, patch]
+    ignore:
+      # These move in lockstep with DataFusion (ADR 0001): DataFusion 55 pins object_store 0.13 and arrow 59,
+      # and arrow-flight 59 pins tonic/prost 0.14. Bumping one alone leaves two versions in Cargo.lock
+      # (two incompatible ObjectStore traits, two HTTP/TLS stacks, ADR 0015). Upgraded together, by hand.
+      - dependency-name: "datafusion*"
+        update-types: [version-update:semver-major]
+      - dependency-name: "arrow*"
+        update-types: [version-update:semver-major]
+      - dependency-name: "parquet"
+        update-types: [version-update:semver-major]
+      - dependency-name: "object_store"
+        update-types: [version-update:semver-major, version-update:semver-minor]
+      - dependency-name: "tonic*"
+        update-types: [version-update:semver-major, version-update:semver-minor]
+      - dependency-name: "prost*"
+        update-types: [version-update:semver-major, version-update:semver-minor]
   - package-ecosystem: github-actions
     directory: /
     schedule: {interval: weekly}
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 5
     groups:
-      actions: {patterns: ["*"]}
+      # Minor and patch together; a major arrives as its own PR, because release-path actions (docker/*,
+      # cosign) only run on a tag and need a release dry run before merging.
+      actions-minor-patch:
+        update-types: [minor, patch]
   - package-ecosystem: docker
     directory: /
     schedule: {interval: weekly}
