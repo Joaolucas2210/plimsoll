@@ -77,6 +77,9 @@ jobs:
       # Builds every test binary once; the live tests below reuse them
       # (always `--workspace`, so feature resolution and artifacts match).
       - run: scripts/gates.sh
+      # The README's demo: overload fails one query (422/429/504), the node keeps serving. Reuses the debug build.
+      - name: demo (the load line, live)
+        run: scripts/demo.sh
 
       - name: wait for S3 bucket and REST catalog
         run: |

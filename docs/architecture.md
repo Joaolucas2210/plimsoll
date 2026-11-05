@@ -157,7 +157,7 @@ DNS (`dns+http://…`, re-resolved every 5 s), and health-checked.
 ## Configuration
 
 Environment only. Invalid values abort startup, and secrets are never
-logged. The full table is in the [README](../README.md#running).
+logged. The full table is in the [reference](reference.md#configuration-and-running).
 
 ## Decisions
 

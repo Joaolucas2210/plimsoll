@@ -1,95 +1,66 @@
-# Plimsoll
+<a id="top"></a>
 
-> **The query fails. The node doesn't.**
+**English** · [Português (Brasil)](README.pt-BR.md)
 
-Plimsoll is an open lakehouse query platform written in Rust on top of
-[Apache DataFusion](https://datafusion.apache.org/). It is a build-to-learn
-project that takes the core ideas of commercial lakehouse platforms (open
-table formats, a catalog-centric control plane, federated queries, governed
-multi-tenant execution) and reimplements them from first principles, with
-resource safety as the non-negotiable property.
+<p align="center">
+  <img src="docs/assets/plimsoll-mark.svg" alt="Plimsoll mark: a ring crossed by a horizontal load line on a dark tile" width="72" height="72">
+</p>
 
-## The load line
+<h1 align="center">Plimsoll</h1>
 
-The Plimsoll line is the mark on a ship's hull showing how deep it may sit in
-the water. Load past the line and the ship is not allowed to sail; the cargo is
-refused, the ship survives.
+<p align="center">
+  <b>The query fails. The node doesn't.</b><br>
+  An open lakehouse SQL engine in Rust, on Apache DataFusion and Iceberg, where overload ends one query — never the process.
+</p>
 
-Plimsoll applies the same rule to queries:
+<p align="center">
+  <a href="#see-it-work">Demo</a> · <a href="#quickstart">Quickstart</a> · <a href="#how-it-works">Architecture</a> · <a href="docs/reference.md">Reference</a> · <a href="docs/adr/README.md">Decisions</a>
+  <br>
+  <sub>experimental <code>0.x</code>, build-to-learn — see <a href="CHANGELOG.md">CHANGELOG</a></sub>
+</p>
 
-- A process-wide **memory ceiling** (`CeilingPool`, ADR 0003) caps every byte
-  operators reserve. A query that crosses the line gets a
-  `memory_limit_exceeded` error; every other query keeps running.
-- **Admission control** caps how many queries run and wait, globally, per
-  resource group and per user. Excess load is rejected with `429 queue_full`
-  instead of thrashing the node.
-- **Time limits** bound queue wait + execution. A runaway query is cancelled
-  and marked `failed`; its slot and memory are released.
+A query engine that runs out of memory usually takes every other query down with it. Plimsoll treats overload as **a per-query outcome**: one process-wide memory ceiling, admission limits and one deadline turn a runaway query into a typed error (`422`, `429`, `504`) while the node keeps serving. Around that rule it implements the core of a lakehouse platform — Iceberg reads and writes through REST catalogs, governance, distributed execution — on open formats only.
 
-Overload is a per-query outcome, never a crashed process.
+The name is the load line on a ship's hull: cargo past the line is refused, and the ship sails.
 
-## Architecture
+## What it is — and what it isn't
+
+| It is | It is not |
+| --- | --- |
+| A SQL engine over **Apache Iceberg** (v1–v3) in object storage, through **Iceberg REST** catalogs (Polaris-compatible), plus Parquet and federated Postgres | A Databricks or Spark clone: no notebooks, no Spark API, no proprietary formats |
+| A **governed** service: bearer tokens, per-schema read/write/drop grants, column denies, row filters, an audit trail of reads | A boundary for hostile tenants: authentication is bearer tokens, and TLS has no client certificates |
+| **One binary** for every role: single node, coordinator with workers, several coordinators | A production system with an SLA: it is a build-to-learn project at `0.x`, and the HTTP API may change between minors |
+| **Resource-safe by construction**: every operator reserves from one `CeilingPool`; spill first, fail the query second | A promise that nothing can exhaust the host: untracked allocation paths are listed as debt in [ADR 0003](docs/adr/0003-memory-ceiling.md), and a container limit stays as defence in depth |
+
+## See it work
+
+`make demo` starts one local node with a 64 MiB ceiling, one running slot, no queue and a 2 s deadline, then overloads it on purpose. No Docker, no catalog, no data: every query reads DataFusion's `range()` function. It needs `cargo`, `curl` and `python3`; the first run builds the server in debug (about a minute).
 
 ```text
-              ┌──────────────── plimsoll-server (HTTP, axum) ────────────────┐
-  client ───► │ /v1/sql  /healthz /livez /readyz /metrics                     │
-              └───────┬──────────────────────────────────────┬────────────────┘
-                      │ admit / register / time-limit         │ execute
-           ┌──────────▼──────────┐                 ┌──────────▼──────────────┐
-           │  CONTROL PLANE      │                 │  COMPUTE PLANE          │
-           │  plimsoll-control   │                 │  plimsoll-core          │
-           │  - Iceberg REST     │  table metadata │  - DataFusion engine    │
-           │    catalog client   ├────────────────►│  - CeilingPool          │
-           │  - admission/queues │                 │  - federation policy    │
-           │  - query registry   │  system tables  │  plimsoll-connectors    │
-           │  - system.runtime.* ├────────────────►│  - Parquet/Iceberg, PG  │
-           └─────────────────────┘                 └─────────────────────────┘
+node on http://127.0.0.1:46883 · ceiling 64 MiB · 1 running slot, no queue · 2 s deadline
+
+  ✓ count 10M rows                           200   rows=10000000
+  ✓ group by 5M keys (crosses the line)      422   memory_limit_exceeded, this query only
+  ✓ node after the breach                    200   ready, pool back to 0 bytes
+  ✓ second query while the slot is taken     429   queue_full, rejected instead of queued
+  ✓ 10^10-row scan past its 2 s deadline     504   query_timeout, cancelled
+  ✓ query after all of that                  200   slot and memory released
+
+  /metrics: finished=2 failed=3 cancelled=0 · one process the whole time (pid 3819912)
+demo passed
 ```
 
-- **Control plane** decides *whether and where* a query runs. The catalog
-  (Iceberg REST, Polaris-compatible) is control plane: it knows table identity
-  and metadata locations, never data.
-- **Compute plane** decides *how* a query runs, inside the memory ceiling.
-
-Details: [docs/architecture.md](docs/architecture.md), [ADR 0002](docs/adr/0002-platform-planes.md).
-
-## Medallion namespace convention
-
-Iceberg namespaces follow the medallion layering; the first namespace level
-names the layer:
-
-| Namespace | Contents | Typical writer |
-|---|---|---|
-| `bronze` | Raw ingested data, source schema, append-only | ingestion jobs |
-| `silver` | Cleaned, conformed, deduplicated entities | transformation jobs |
-| `gold`   | Business-level aggregates and marts | analytics models |
-
-Example: `gold.finance.revenue_daily` is namespace `["gold", "finance"]`,
-table `revenue_daily`. The convention is documentation today; governance rules
-per layer (e.g. read-only `bronze` for analysts) build on it later.
-
-## Crate map
-
-| Crate | Plane | Role |
-|---|---|---|
-| `plimsoll-core` | compute | Engine façade, `CeilingPool` memory ceiling, federation policy. Never depends on connectors. |
-| `plimsoll-connectors` | compute | Concrete sources (Parquet/Iceberg, Postgres) implementing core's contracts. |
-| `plimsoll-control` | control | Iceberg REST catalog client, governance (registry, admission, time limits), `system.runtime.queries` schema. No DataFusion. |
-| `plimsoll-server` | edge | HTTP binary: health, metrics, `POST /v1/sql`. |
+Every line is asserted, not just printed: the script exits non-zero if a status, an error code, readiness or the pool's return to 0 bytes differs. CI runs it on every push ([`scripts/demo.sh`](scripts/demo.sh)).
 
 ## Quickstart
 
-Docker with Compose v2. An Iceberg REST catalog, one coordinator and two
-workers, all on a local warehouse volume (ADR 0123):
+An Iceberg REST catalog, one coordinator and two workers on a local warehouse volume ([ADR 0123](docs/adr/0123-container-image-and-quickstart.md)). Docker with Compose v2.
 
 ```bash
 TOKEN=$(openssl rand -hex 32)
 export PLIMSOLL_AUTH_TOKENS="ana:sha256:$(printf %s "$TOKEN" | sha256sum | cut -d' ' -f1)"
 export PLIMSOLL_WORKER_TOKEN=$(openssl rand -hex 16)
-# The released image: log in once (a token with read:packages); without
-# it, compose builds the image here instead (~10 min).
-echo "$GITHUB_TOKEN" | docker login ghcr.io -u <github-user> --password-stdin
-docker compose up -d --wait
+make up                   # docker compose up -d --wait
 
 sql() { curl -s localhost:8080/v1/sql -H 'content-type: application/json' \
              -H "authorization: Bearer $TOKEN" -d "{\"sql\": \"$1\"}"; echo; }
@@ -97,228 +68,74 @@ sql "CREATE TABLE bronze.trips (id BIGINT, city VARCHAR, fare DOUBLE)"
 sql "INSERT INTO bronze.trips VALUES (1, 'lisbon', 12.5), (2, 'porto', 8.0), (3, 'lisbon', 20.0)"
 sql "SELECT city, count(*) AS trips, sum(fare) AS fares FROM bronze.trips GROUP BY city"
 
-docker compose down -v   # -v also drops the warehouse
+make down                 # docker compose down -v: also drops the warehouse
 ```
 
-**Web console:** open http://localhost:8080 and sign in with `$TOKEN`.
-It lists the catalogs, schemas, tables and columns `ana` may read (click a
-table for its columns, double-click to query it). It runs SQL with
-Ctrl+Enter, shows up to 1,000 rows and can cancel a query (ADR 0135).
-It is part of the server, on every node's HTTP port.
+The image `ghcr.io/joaolucas2210/plimsoll` is private: after `docker login ghcr.io` with a `read:packages` token it is pulled; without a login, Compose builds it locally (about 10 minutes). Tokens are configured as SHA-256 digests, so the server never stores them raw ([ADR 0021](docs/adr/0021-bearer-token-authentication.md)).
 
-Any Arrow Flight SQL client connects on port 32010 (ADR 0124), with
-`ana` as the username and the token as the password: ADBC
-(`pip install adbc-driver-flightsql pyarrow`), the Flight SQL JDBC
-driver, DBeaver, or anything built on them.
+- **Web console:** http://localhost:8080, signed in with `$TOKEN`: catalog tree, SQL editor (Ctrl+Enter), results, cancel ([ADR 0135](docs/adr/0135-web-console.md)).
+- **Arrow Flight SQL** on port 32010, user `ana`, password `$TOKEN`: ADBC, the Flight SQL JDBC driver, DBeaver ([ADR 0124](docs/adr/0124-flight-sql.md)).
 
 ```python
-import adbc_driver_flightsql.dbapi as flightsql
-conn = flightsql.connect("grpc://localhost:32010",
-                         db_kwargs={"username": "ana", "password": TOKEN})
+import adbc_driver_flightsql.dbapi as flightsql   # pip install adbc-driver-flightsql pyarrow
+conn = flightsql.connect("grpc://localhost:32010", db_kwargs={"username": "ana", "password": TOKEN})
 cur = conn.cursor()
 cur.execute("SELECT city, count(*) FROM bronze.trips GROUP BY city")
 print(cur.fetch_arrow_table())
 ```
 
-`ana` may create, write and drop tables in `bronze`, `silver` and `gold`.
-The same image runs any role; in production, point it at S3 (`AWS_*`)
-and a real catalog (`PLIMSOLL_CATALOG_*`), with TLS.
+## How it works
 
-TPC-H on one node under a 4 GiB ceiling: all 22 queries correct, SF10 in
-32 s total on a 12-thread laptop. All 22 queries are also correct over
-Iceberg on the quickstart's coordinator and two workers. To reproduce
-them, see [ADR 0126](docs/adr/0126-tpch-benchmark.md),
-[ADR 0128](docs/adr/0128-tpch-on-a-cluster.md) and `scripts/tpch_bench.py`.
+![A query's path: SQL request, admission in the control plane (429 queue_full), plan, execute under the memory ceiling in the compute plane (422 memory_limit_exceeded), result; one deadline across queue and execution ends with 504 query_timeout](docs/assets/plimsoll-load-line.svg)
 
-Releases: `ghcr.io/joaolucas2210/plimsoll:<tag>` (amd64 and arm64) and
-checksummed Linux binaries (x86_64, aarch64) on GitHub releases, from `v*` tags, signed with Sigstore (keyless)
-and with an SBOM; see [CHANGELOG.md](CHANGELOG.md) (ADR 0125, 0131).
+The system is split into two planes ([ADR 0002](docs/adr/0002-platform-planes.md)):
 
-## Running
+- The **control plane** decides *whether and where* a query runs: admission (global, per resource group, per user), the query registry, deadlines and the Iceberg REST catalog client. It knows table identity and metadata locations, never data, and never depends on DataFusion.
+- The **compute plane** decides *how*: DataFusion plans and executes, and every operator reserves memory from one process-wide `CeilingPool` ([ADR 0003](docs/adr/0003-memory-ceiling.md)), which refuses a reservation past the line and keeps a slice for results, so a query that produced rows can ship them.
 
-Requires a stable Rust toolchain (edition 2024, rust ≥ 1.94).
+| Crate | Plane | Role |
+| --- | --- | --- |
+| `plimsoll-core` | compute | Engine façade, `CeilingPool`, federation policy and filter guard; never depends on connectors |
+| `plimsoll-connectors` | compute | Iceberg read, write and maintenance, Parquet, Postgres, distributed fragments and shuffles |
+| `plimsoll-control` | control | Admission, registry, Iceberg REST client, `system.runtime.queries`; no DataFusion |
+| `plimsoll-server` | edge | The one binary: HTTP (axum), Flight SQL (tonic), auth, TLS, config, observability |
 
-```bash
-# Tokens are configured as SHA-256 digests; the server never sees them raw.
-TOKEN=$(openssl rand -hex 32)
-export PLIMSOLL_AUTH_TOKENS="ana:sha256:$(printf %s "$TOKEN" | sha256sum | cut -d' ' -f1)"
-cargo run -p plimsoll-server
-curl -s localhost:8080/healthz
-curl -s -XPOST localhost:8080/v1/sql -H 'content-type: application/json' \
-     -H "authorization: Bearer $TOKEN" -d '{"sql": "select 1"}'
-curl -s localhost:8080/metrics
-```
+`scripts/gates.sh` fails the build if a dependency crosses a plane. A query's whole life, distribution and the lakehouse path: [docs/architecture.md](docs/architecture.md).
 
-Time travel on catalog tables: `SELECT * FROM bronze."trips@<snapshot-id>"`
-or `bronze."trips@2024-05-01T00:00:00Z"` (ADR 0028), or a branch/tag:
-`bronze."trips@audit"` (ADR 0029). To find ids, instants and refs:
-`bronze."trips$snapshots"`, `"trips$history"`, `"trips$refs"` (ADR 0030). Files and
-manifests of the current snapshot: `"trips$files"`, `"trips$manifests"` (ADR 0032),
-and per-partition totals: `"trips$partitions"` (ADR 0047).
+## What it supports
 
-Local experiments without tokens: `PLIMSOLL_AUTH=disabled` (then `user` is
-read from the request body and trusted as sent).
+| Area | Implemented | Decisions |
+| --- | --- | --- |
+| Iceberg reads | merge-on-read position and equality deletes, v3 deletion vectors, time travel by snapshot, instant, branch or tag, metadata tables (`$snapshots`, `$files`, `$partitions`…), schema evolution by field id, partition and statistics pruning | [0007](docs/adr/0007-iceberg-read-path.md)–[0017](docs/adr/0017-format-v3-deletion-vectors.md), [0028](docs/adr/0028-iceberg-time-travel.md)–[0032](docs/adr/0032-iceberg-file-metadata-tables.md) |
+| Iceberg writes | `CREATE [AS SELECT]`, `ALTER`, `DROP`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, one snapshot commit per statement; compaction, snapshot expiration and orphan removal | [0075](docs/adr/0075-insert-into-iceberg.md)–[0090](docs/adr/0090-create-table-as-select.md) |
+| Governance | tokens as SHA-256 digests, read/write/drop grants per schema, column denies and row filters on every scan after optimization, resource groups with memory shares | [0021](docs/adr/0021-bearer-token-authentication.md)–[0025](docs/adr/0025-schema-grants.md), [0044](docs/adr/0044-column-deny.md)–[0046](docs/adr/0046-audit-trail.md) |
+| Distribution | coordinator and workers: remote scans, partial aggregation, shuffles, broadcast and shuffled joins with skew splitting, writes on workers; several coordinators with shared or leader-elected admission | [0058](docs/adr/0058-scan-fragments-on-workers.md)–[0074](docs/adr/0074-shuffle-maps-expire-with-their-query.md), [0101](docs/adr/0101-several-coordinators.md)–[0110](docs/adr/0110-back-off-fast-rounds.md) |
+| Interfaces | HTTP `/v1/sql` (JSON, streamed NDJSON or Arrow IPC, bound parameters, cancel), Arrow Flight SQL, web console | [0035](docs/adr/0035-streamed-results.md), [0037](docs/adr/0037-arrow-ipc-results.md), [0043](docs/adr/0043-query-parameters.md), [0124](docs/adr/0124-flight-sql.md) |
+| Operations | JSON logs, slow-query log, OTLP traces and metrics, Prometheus `/metrics`, drain on SIGTERM, in-process TLS; signed amd64/arm64 releases with an SBOM | [0026](docs/adr/0026-shutdown-drain.md), [0031](docs/adr/0031-query-traces.md), [0099](docs/adr/0099-tls-and-broadcast-limit.md), [0131](docs/adr/0131-signed-releases.md) |
 
-Configuration is environment-only; invalid values abort startup.
+**TPC-H.** On one node under a 4 GiB ceiling, 22/22 queries pass the check — SF1 in 2.4 s and SF10 in 32 s on a 12-thread laptop. On the quickstart's coordinator and two workers over Iceberg, 22/22 pass too. The check compares each query's row count and first row with DuckDB's answer, not the full result. The cluster run measures correctness, not speed-up: every node shared one machine ([ADR 0126](docs/adr/0126-tpch-benchmark.md), [ADR 0128](docs/adr/0128-tpch-on-a-cluster.md)).
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `PLIMSOLL_BIND` | `127.0.0.1:8080` | Listen address |
-| `PLIMSOLL_AUTH_TOKENS` | required | `ana:sha256:<hex>,etl:sha256:<hex>`: SHA-256 of each bearer token and its user (ADR 0021) |
-| `PLIMSOLL_AUTH_OPERATORS` | unset | Users (from the tokens) who see every query in `system.runtime.queries`; others see their own (ADR 0022) |
-| `PLIMSOLL_RESOURCE_GROUPS` | unset | `interactive=4/16,batch=2/64/40%`: per group, max running / max queued (ADR 0023), and optionally a share of the memory ceiling that the group's queries together may hold (ADR 0036); `default` always exists with the global limits |
-| `PLIMSOLL_AUTH_GROUPS` | unset | `etl=batch,ana=interactive\|batch`: groups each user may use, first = their default; unlisted users get `default` (ADR 0023) |
-| `PLIMSOLL_AUTH_GRANTS` | unset | `ana=gold\|silver,etl=*`: schemas each user may read; once set, unlisted users read no data (system tables stay scoped per user) (ADR 0025) |
-| `PLIMSOLL_AUTH_WRITE_GRANTS` | unset | `etl=bronze\|silver`: schemas each user may `CREATE TABLE`, `ALTER TABLE`, `INSERT INTO`, `UPDATE`, `DELETE FROM` and `MERGE INTO` (ADR 0077, 0081–0084; `MERGE` also needs a read grant on the target and no row filter on it) (appends to v2 Iceberg tables served by the REST catalog, partitioned or not, with column statistics; ADR 0076); unset = no writes; reads of the source still need read grants (ADR 0075) |
-| `PLIMSOLL_AUTH_DROP_GRANTS` | unset | `etl=bronze`: schemas whose tables each user may `DROP TABLE [PURGE]`; a write grant does not include it; unset = no drops (ADR 0089) |
-| `PLIMSOLL_AUTH_COLUMN_DENY` | unset | `ana=gold.users.email\|gold.users.ssn`: columns a user may not read, checked on what each scan reads after optimization, filters and subqueries included; `403 forbidden` (ADR 0044) |
-| `PLIMSOLL_AUTH_ROW_FILTERS` | unset | `{"ana": {"gold.orders": "region = 'eu'"}}`: a SQL predicate every row a user reads from a table must satisfy, applied to every scan (joins, subqueries, time travel); the table's `$` metadata tables are denied to that user (ADR 0045) |
-| `PLIMSOLL_AUTH` | `required` | `disabled` = no authentication, `user` trusted from the body (development only) |
-| `PLIMSOLL_FLIGHT_BIND` | unset (off) | Arrow Flight SQL listener (e.g. `0.0.0.0:32010`): statements, prepared statements (with `?` or `$n` parameters, batched updates, a batched `INSERT … VALUES` as one statement and commit; ADR 0127, 0129, 0133), catalog/schema/table listings (with column schemas) and server info, authenticated by bearer token or a `user:token` handshake, run through `/v1/sql` with the same grants, admission and logs; TLS with `PLIMSOLL_TLS_*` (read at boot) (ADR 0124) |
-| `PLIMSOLL_MEMORY_LIMIT_BYTES` | `1073741824` | Memory ceiling (the load line) |
-| `PLIMSOLL_MAX_RUNNING` | `8` | Max concurrently running queries |
-| `PLIMSOLL_MAX_QUEUED` | `64` | Max queued queries (0 = reject when busy) |
-| `PLIMSOLL_MAX_RUNNING_PER_USER` | `PLIMSOLL_MAX_RUNNING` | Per-user running limit |
-| `PLIMSOLL_QUERY_TIMEOUT_MS` | `30000` | Deadline for queue wait + execution |
-| `PLIMSOLL_DRAIN_DELAY_MS` | `5000` | After SIGTERM: `/readyz` is 503 but queries are still served for this long, then the listener closes (ctrl-c skips it) (ADR 0026) |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP/HTTP collector base URL (e.g. `http://collector:4318`); spans go to `/v1/traces` as JSON. Unset = trace context is still propagated, nothing exported (ADR 0031) |
-| `OTEL_EXPORTER_OTLP_HEADERS` | unset | `x-api-key=...,x-tenant=...` sent with every export (secret, env only, never logged) |
-| `OTEL_SERVICE_NAME` | `plimsoll` | `service.name` of exported spans and metrics |
-| `OTEL_METRIC_EXPORT_INTERVAL` | `60000` | With an OTLP endpoint: every this many ms, the `/metrics` series are pushed to `/v1/metrics` as JSON (gauges, cumulative sums, histograms), and once more on shutdown (ADR 0100) |
-| `OTEL_METRICS_EXPORTER` | `otlp` | `none` keeps trace export and turns metric export off |
-| `PLIMSOLL_RESULT_CACHE_BYTES` | `0` (off) | Result cache for repeated queries over Iceberg snapshots, reserved in the memory pool, at most half the ceiling; keyed by SQL + every table's snapshot id, so a new commit is a miss (ADR 0038) |
-| `PLIMSOLL_SLOW_QUERY_MS` | unset (off) | Queries at least this long also log a `slow_query` warn line: timings, `reads`, and each planning event (catalog loads; Iceberg files/manifests/deletes/cache hits). Never SQL text (ADR 0057) |
-| `PLIMSOLL_WORKER_TOKEN` | unset | Shared secret (≥ 16 chars, env only) between coordinator and workers; on a worker it enables `POST /v1/fragment` (ADR 0058) |
-| `PLIMSOLL_COORDINATORS` | unset | The other coordinators (URLs or `dns+http(s)://name:port`, may include this node; needs `PLIMSOLL_WORKER_TOKEN`): `system.runtime.queries` lists every coordinator's queries and `DELETE /v1/queries/{id}` reaches them (ADR 0102); checked every 5 s, every 1 s while one is down, backing off to 5 s while the same ones stay down (ADR 0109, 0110) |
-| `PLIMSOLL_ADMISSION_SCOPE` | `node` | `cluster`: the admission limits are the cluster's; each coordinator enforces `ceil(limit / live coordinators)`, recounted every 5 s (ADR 0103). `exact`: the live coordinator with the lowest node id admits for all, slots held while its response streams; its peers fall back to `cluster` parts while it is unreachable (ADR 0104), and re-home their running queries to a new leader (ADR 0105), which starts nothing new after taking over or booting until every peer follows it, at most 10 s, and again briefly for each peer it sees later (ADR 0106–0108). Both need `PLIMSOLL_COORDINATORS` |
-| `PLIMSOLL_WORKERS` | unset | `http://w1:8080,http://w2:8080`: this node coordinates; Iceberg scans fan out to the workers whose `/readyz` answers (checked every 5 s; none healthy = local scan); tables with vended credentials stay local (ADR 0058, 0059). An entry `dns+http://workers.ns.svc:8080` makes every address that name resolves to (e.g. a Kubernetes headless service) a worker, re-resolved every 5 s so workers join and leave without a restart (ADR 0070). On workers, a `fragments` resource group (`PLIMSOLL_RESOURCE_GROUPS=fragments=8/16/50%`) bounds fragment concurrency and memory |
-| `PLIMSOLL_SPILL_DIR` | unset | Spill directory; unset = no spill, pressure fails the query |
-| `PLIMSOLL_PARQUET_TABLES` | unset | `bronze.trips=/data/trips/,gold.daily=/data/d.parquet` |
-| `PLIMSOLL_ICEBERG_TABLES` | unset | `bronze.trips=/wh/bronze/trips` (table dir or `*.metadata.json`) |
-| `PLIMSOLL_PG_TABLES` | unset | `silver.users=public.users` (needs `PLIMSOLL_PG_URL`) |
-| `PLIMSOLL_PG_URL` | unset | Postgres connection string (secret, env only) |
-| `AWS_ENDPOINT`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, ... | unset | S3 / S3-compatible storage for `s3://` tables (standard AWS env; `AWS_ALLOW_HTTP=true` for plain HTTP) |
-| `PLIMSOLL_CATALOG_URI` | unset | Iceberg REST base URI (e.g. Polaris `http://host:8181/api/catalog`) |
-| `PLIMSOLL_CATALOG_WAREHOUSE` | unset | Sent to `/v1/config` (Polaris: catalog name) |
-| `PLIMSOLL_CATALOG_TOKEN` | unset | Bearer token. Secrets come from env only and are never logged. |
-| `PLIMSOLL_CATALOG_CREDENTIAL` | unset | OAuth2 `client_id:client_secret` (Polaris); exclusive with the token |
-| `PLIMSOLL_CATALOG_SCOPE` | `PRINCIPAL_ROLE:ALL` | OAuth2 scope |
-| `PLIMSOLL_CATALOG_VENDED_CREDENTIALS` | `false` | `true` asks the catalog for per-table storage credentials (Polaris credential vending) |
-| `PLIMSOLL_CATALOG_REFRESH_MS` | `60000` | How often `SHOW TABLES` / `information_schema` re-list the catalog (new tables and namespaces); `0` = boot only. Queries always resolve tables live (ADR 0033) |
-| `PLIMSOLL_MAINTENANCE_INTERVAL_MS` | `0` (off) | Between scheduled maintenance passes: tables with `plimsoll.maintenance.enabled = 'true'` are compacted, have snapshots expired (Iceberg's `history.expire.*` properties) and, with `plimsoll.maintenance.remove-orphans`, orphan files removed; queued under admission as `plimsoll-maintenance`; run it on one coordinator (ADR 0086); with several coordinators, each table is claimed per interval by one of them (a lease object in the table's location, ADR 0101) |
-| `PLIMSOLL_TLS_CERT` / `PLIMSOLL_TLS_KEY` | unset | PEM certificate chain and key: the node serves TLS (1.2/1.3) on its listener (API, metrics, worker fragments); the files are reloaded when they change on disk; both or neither (ADR 0099) |
-| `PLIMSOLL_TLS_CA` | unset | PEM bundle trusted (besides system roots) for `https://` workers, e.g. a private CA (ADR 0099) |
-| `PLIMSOLL_BROADCAST_MAX_BYTES` | `67108864` | Largest build side a broadcast join sends to workers (Arrow IPC bytes); a larger one is joined on the coordinator; `0` = no broadcasts (ADR 0099). Workers read fragment bodies up to it plus 16 MiB, once authenticated: set it alike on every node (ADR 0128). A `MERGE` source above it merges on the coordinator (ADR 0130) |
-| `PLIMSOLL_BROADCAST_CACHE_BYTES` | `0` (off) | Collected broadcast build sides that read only pinned Iceberg snapshots kept (under the memory ceiling) and sent again instead of collected again; least recently used first out (ADR 0116) |
-| `PLIMSOLL_SKEW_BYTES` | `67108864` | A shuffled join's bucket over this many bytes (and four times its side's median) is split across reducers, its other side read by each part; `0` never splits (ADR 0117) |
+## Limits and what is next
 
-### SQL API
+- `MERGE` sources above the broadcast limit merge on the coordinator: correct, but it does not scale ([ADR 0130](docs/adr/0130-merge-sources-over-the-broadcast-limit.md)).
+- Federated Postgres scans stay on the coordinator. Postgres receives only the filters whose semantics are proven identical, and every other filter is re-applied locally ([ADR 0005](docs/adr/0005-federation-correctness.md)).
+- Hash-join build sides do not spill (a DataFusion upstream limit), and some allocation paths are accounted but not refused ([ADR 0003](docs/adr/0003-memory-ceiling.md), debt list).
+- Authentication is bearer tokens only: no client certificates, no external identity provider.
 
-`POST /v1/sql` with `{"sql": "...", "user": "...", "resource_group": "..."?, "format": "json"|"ndjson"|"arrow"?, "params": [...]?}`.
+Everything done and missing, by area: [ROADMAP.md](ROADMAP.md).
 
-- `"params"` binds `$1`, `$2`, ... as values (ADR 0043): JSON scalars,
-  cast to the type each placeholder needs (`"2024-05-01"` for a `DATE`),
-  never spliced into the SQL, so client values cannot inject SQL and do
-  not appear in logs or `system.runtime.queries`. Counts must match.
+## Develop
 
-- `200` → `{"query_id": 1, "columns": [...], "rows": [[...]]}`
-- `"format": "ndjson"` streams `application/x-ndjson` (ADR 0035): a header
-  line `{"query_id", "columns"}`, one JSON array per row, then
-  `{"done": true, "rows": N}`, or an `{"error": {...}}` line if the query
-  fails mid-stream. Results of any size stream under the memory ceiling;
-  errors before the header keep their HTTP status. Closing the connection
-  cancels the query.
-- `"format": "arrow"` streams `application/vnd.apache.arrow.stream` (ADR
-  0037): typed, columnar, read directly by pyarrow (`pa.ipc.open_stream`),
-  polars and DuckDB. The query id is in `x-plimsoll-query-id`. A failure
-  after the first batch aborts the body, so the stream lacks its
-  end-of-stream marker and readers raise instead of returning short data.
-- error → `{"error": {"code": "...", "message": "...", "query_id": 1|null}}`
-
-| Code | HTTP | Meaning |
-|---|---|---|
-| `invalid_request` | 400 | Malformed body, empty `sql`/`user` |
-| `invalid_query` | 400 | Parse/plan error |
-| `memory_limit_exceeded` | 422 | Query crossed the load line; node unaffected |
-| `queue_full` | 429 | Admission queue full (global, group or user) |
-| `engine_not_wired` | 501 | Compute plane not connected yet |
-| `not_ready` | 503 | Starting or draining |
-| `query_timeout` | 504 | Deadline exceeded; query cancelled |
-| `query_cancelled` | 409 | Stopped by `DELETE /v1/queries/{id}` (ADR 0034) |
-
-`DELETE /v1/queries/{id}` stops a queued or running query and releases its
-memory and admission slot. Owners cancel their own queries,
-`PLIMSOLL_AUTH_OPERATORS` any. `202` → `{"query_id": 1, "state": "cancelling"}`;
-`404 query_not_found` for unknown ids and for other users' queries;
-`409 query_not_running` once it has finished. Ids are in every response,
-log line and `system.runtime.queries`.
-
-### Compaction
-
-`POST /v1/maintenance/compact` with `{"table": "bronze.events"}` rewrites
-a catalog-served Iceberg table's small files and files carrying deletes
-into fresh ones, partition by partition, as one `replace` snapshot; the
-rows do not change and time travel to earlier snapshots still works.
-Needs read and write grants on the table, holds an admission slot, and
-answers `{"partitions", "files_rewritten", "files_written", "rows"}`
-(ADR 0078).
-
-`POST /v1/maintenance/expire-snapshots` with `{"table": "bronze.events",
-"older_than_ms": 1730000000000, "retain_last": 1}` (defaults: 5 days ago,
-1) drops snapshots committed before the cutoff, keeping every branch and
-tag head and the last `retain_last` of each branch, then deletes the
-files only they reached (ADR 0079).
-
-`POST /v1/maintenance/remove-orphans` with `{"table": "bronze.events",
-"dry_run": true}` lists (or, without `dry_run`, deletes) files under the
-table location that no snapshot or metadata references and that were
-last modified before `older_than_ms` (default 3 days ago; anything later
-than 1 hour ago is refused, as a write in flight may still commit them)
-(ADR 0080).
-
-### Probes
-
-- `/livez` — process alive (never checks dependencies).
-- `/readyz` — `503` while starting or draining after SIGTERM.
-- `/healthz` — JSON summary (readiness, uptime, running/queued, pool usage).
-- `/metrics` — Prometheus text: `plimsoll_pool_used_bytes`,
-  `plimsoll_pool_limit_bytes`, `plimsoll_spill_bytes_total`,
-  `plimsoll_queries_running`, `plimsoll_queries_queued`,
-  `plimsoll_queries_total{state}`; on workers,
-  `plimsoll_fragments_total{kind,outcome}` and rows and bytes per kind
-  (ADR 0119).
-
-### Tests and gates
+Rust ≥ 1.94 (edition 2024). `make help` lists the entry points.
 
 ```bash
-cargo test --workspace
-scripts/gates.sh   # fmt, clippy -D warnings, tests, architecture invariants
+make demo                      # the load line, live, on one node
+make gates                     # fmt, clippy -D warnings, cargo test --workspace, plane invariants
+cargo run -p plimsoll-server   # with PLIMSOLL_AUTH_TOKENS set, or PLIMSOLL_AUTH=disabled for local experiments
 ```
 
-## Decision records
+Configuration is environment-only, and invalid values abort startup: [every variable, the SQL API and table maintenance](docs/reference.md). Besides the gates and the demo, CI runs live tests against Postgres, S3 (SeaweedFS) and an Iceberg REST catalog, plus a weekly interoperability run against tables written by Spark and Iceberg Java.
 
-Index with status, date and the one-line decision of every ADR:
-[docs/adr/README.md](docs/adr/README.md) (0001–0135; template in
-[docs/adr/0000-template.md](docs/adr/0000-template.md)).
+Each decision has an ADR with its context, options, consequences and accepted debt — [0001 to 0135](docs/adr/README.md), with a suggested reading order. Releases come from `v*` tags: [CHANGELOG](CHANGELOG.md).
 
-Roadmap: [ROADMAP.md](ROADMAP.md).
-
-## Non-goals
-
-- Not a Databricks/Spark clone: no notebooks, no Spark API, no proprietary
-  formats. Open formats (Parquet, Iceberg) and open catalogs only.
-- TLS is in-process (ADR 0099) but without client certificates;
-  authentication is bearer tokens (ADR 0021).
-- Several coordinators can share workers and the catalog behind a load
-  balancer (ADR 0101), list and cancel each other's queries (ADR 0102)
-  and share admission limits (ADR 0103), exactly through an elected
-  leader if asked (ADR 0104).
-- Writes are `CREATE` (with `AS SELECT`, ADR 0090), `ALTER` (columns,
-  nested fields, properties and partition fields) and `DROP TABLE`, `INSERT INTO`, `UPDATE`, `DELETE
-  FROM`, `MERGE INTO` and table maintenance (compaction, snapshot
-  expiration, orphan removal; ADR 0075–0089). See
-  [ROADMAP.md](ROADMAP.md).
-
-## License
-
-Apache-2.0. See [LICENSE](LICENSE).
+Licensed under [Apache-2.0](LICENSE).
