@@ -114,7 +114,7 @@ jobs:
 
       # Keyless: the signature names this workflow and tag, logged in
       # Sigstore's transparency log; no key to keep (ADR 0131).
-      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         if: env.PUBLISH == 'true'
       - name: sign the image and the archives
         if: env.PUBLISH == 'true'
